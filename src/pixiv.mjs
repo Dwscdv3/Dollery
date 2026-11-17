@@ -207,6 +207,21 @@ function extractItems(body) {
 const ILLUST_TYPE_LABEL = { 0: 'illust', 1: 'manga', 2: 'ugoira' };
 
 /**
+ * 标签在不同接口里形状不一致：收藏列表给字符串数组，作品详情给 { tag, translatedName }
+ * 对象数组。两种都要能接住，否则遇到第二种就会把 "[object Object]" 写进备份。
+ */
+function extractTags(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  return list
+    .map((tag) => {
+      if (typeof tag === 'string') return tag;
+      if (tag && typeof tag === 'object') return tag.tag ?? tag.name ?? '';
+      return String(tag ?? '');
+    })
+    .filter((tag) => tag !== '');
+}
+
+/**
  * 把接口原始对象归一化成内部记录。字段缺失时宁可为空，也不要编造。
  */
 export function normalizeIllust(raw, bookmark, firstSeen) {
@@ -222,7 +237,7 @@ export function normalizeIllust(raw, bookmark, firstSeen) {
     account: raw.userAccount ?? '',
     published: raw.uploadDate ?? raw.createDate ?? '',
     pages: raw.pageCount ?? '',
-    tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
+    tags: extractTags(raw.tags),
     x_restrict: raw.xRestrict ?? 0,
     ai_type: raw.aiType ?? '',
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
@@ -244,8 +259,9 @@ export function normalizeNovel(raw, bookmark, firstSeen) {
     account: raw.userAccount ?? '',
     published: raw.uploadDate ?? raw.createDate ?? '',
     pages: raw.pageCount ?? '',
-    text_length: raw.textCount ?? raw.characterCount ?? '',
-    tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
+    // 小说字数在不同接口里叫 textCount / textLength / characterCount，都试一遍。
+    text_length: raw.textCount ?? raw.textLength ?? raw.characterCount ?? '',
+    tags: extractTags(raw.tags),
     x_restrict: raw.xRestrict ?? 0,
     ai_type: raw.aiType ?? '',
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
