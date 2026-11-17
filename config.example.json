@@ -1,0 +1,29 @@
+{
+  "_说明": "复制此文件为 config.json 后填写。config.json 已被 .gitignore 忽略，不会进入仓库。",
+
+  "proxy": "http://127.0.0.1:7897",
+  "intervalMs": 2000,
+
+  "cookie": "",
+  "cookieFile": ".secrets/cookies.txt",
+  "userId": "",
+
+  "includeNovels": true,
+  "includePrivateBookmarks": true,
+
+  "pageSize": {
+    "illust": 48,
+    "novel": 24
+  },
+
+  "maxPagesPerRun": 0,
+  "includeVolatileStats": false,
+
+  "output": {
+    "illust": "data/bookmarks-illust.txt",
+    "novel": "data/bookmarks-novel.txt"
+  },
+
+  "downloadImages": false,
+  "imagesDir": "images"
+}

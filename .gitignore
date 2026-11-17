@@ -1,0 +1,13 @@
+# 认证信息绝不入库
+config.json
+.secrets/
+cookies.txt
+*.cookie
+
+# 依赖与运行产物
+node_modules/
+.last-sync.json
+*.log
+
+# 预留：图片下载目录（功能尚未实现，先占位避免误提交）
+images/

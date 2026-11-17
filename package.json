@@ -1,0 +1,19 @@
+{
+  "name": "pixiv-export",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "增量备份 Pixiv 账号收藏元数据到本地纯文本，便于 Git 追踪",
+  "bin": {
+    "pixiv-export": "./src/cli.mjs"
+  },
+  "scripts": {
+    "sync": "node src/cli.mjs sync",
+    "sync:full": "node src/cli.mjs sync --full",
+    "status": "node src/cli.mjs status",
+    "selftest": "node src/selftest.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
