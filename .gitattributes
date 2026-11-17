@@ -7,3 +7,6 @@ data/*.txt text eol=lf
 *.mjs text eol=lf
 *.json text eol=lf
 *.md text eol=lf
+
+# 批处理反过来必须 CRLF —— cmd 解析 LF 换行的 .bat 在 goto 跳转上会出问题
+*.bat text eol=crlf
