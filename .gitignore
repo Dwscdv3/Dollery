@@ -4,6 +4,9 @@ config.json
 cookies.txt
 *.cookie
 
+# 收藏标签映射缓存（可重建，不入库）
+.cache/
+
 # 依赖与运行产物
 node_modules/
 .last-sync.json

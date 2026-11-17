@@ -3,7 +3,8 @@
 * text=auto eol=lf
 
 # 这几个是核心：必须严格纯 LF
-data/*.txt text eol=lf
+data/*.json text eol=lf
+data/*.json indent=2
 *.mjs text eol=lf
 *.json text eol=lf
 *.md text eol=lf

@@ -16,6 +16,7 @@ import { PixivClient, PixivError } from './pixiv.mjs';
 import { readRecords } from './store.mjs';
 import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
 import { downloadRecords, formatBytes } from './download.mjs';
+import { updateBookmarkTagMap, applyBookmarkTags } from './bookmark-tags.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
@@ -29,19 +30,24 @@ const DEFAULT_CONFIG = {
   userId: '',
   includeNovels: true,
   includePrivateBookmarks: true,
-  pageSize: { illust: 48, novel: 24 },
+  pageSize: { illust: 100, novel: 100 },
   maxPagesPerRun: 0,
   output: {
-    illustPublic: 'data/bookmarks-illust.txt',
-    illustPrivate: 'data/bookmarks-illust-private.txt',
-    novelPublic: 'data/bookmarks-novel.txt',
-    novelPrivate: 'data/bookmarks-novel-private.txt',
+    illustPublic: 'data/bookmarks-illust.json',
+    illustPrivate: 'data/bookmarks-illust-private.json',
+    novelPublic: 'data/bookmarks-novel.json',
+    novelPrivate: 'data/bookmarks-novel-private.json',
   },
   download: {
     dir: 'images',
     avifQuality: 50,
     imageIntervalMs: 1000,
     keepOriginal: false,
+  },
+
+  bookmarkTags: {
+    enabled: true,
+    cacheDir: '.cache',
   },
 };
 
@@ -90,6 +96,7 @@ async function loadConfig() {
     ...raw,
     pageSize: { ...DEFAULT_CONFIG.pageSize, ...(raw.pageSize ?? {}) },
     download: { ...DEFAULT_CONFIG.download, ...(raw.download ?? {}) },
+    bookmarkTags: { ...DEFAULT_CONFIG.bookmarkTags, ...(raw.bookmarkTags ?? {}) },
     // 兼容旧版配置：以前只有 illust / novel 两个输出路径，全部对应到公开收藏。
     output: {
       ...DEFAULT_CONFIG.output,
@@ -140,6 +147,8 @@ function printHelp() {
     '  --public-only        只同步公开收藏',
     '  --private-only       只同步私密收藏',
     '  --max-pages N        本次每条通道最多抓 N 页',
+    '  --skip-tags          本次不更新收藏标签',
+    '  --rebuild-tags       强制重建收藏标签映射（首次约 30 分钟）',
     '  --interval MS        覆盖请求间隔（默认 2000，不建议低于 2000）',
     '',
     'download 选项:',
@@ -320,6 +329,56 @@ function printSummary(result) {
   console.log(out.join('\n'));
 }
 
+/**
+ * 同步一条通道的收藏标签。
+ *
+ * 标签和元数据分两步走：元数据靠翻收藏列表，标签只能靠「逐标签反查」，
+ * 两者成本差一个数量级，所以有缓存、有单独的开关。
+ */
+async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal }) {
+  const cacheDir = path.resolve(PROJECT_ROOT, config.bookmarkTags.cacheDir);
+
+  const { map, stats } = await updateBookmarkTagMap(client, {
+    kind: entry.kind,
+    visibility: entry.visibility,
+    cacheDir,
+    limit: Number(config.pageSize[entry.kind] ?? 100),
+    force: Boolean(flags['rebuild-tags']),
+    onProgress: (event) => {
+      // 868 个标签逐个打印太吵，每 20 个报一次进度
+      if (event.index % 20 === 0 || event.index === event.total) {
+        console.log(
+          `    标签扫描 ${event.index}/${event.total}（当前「${event.tag}」）已映射 ${event.mapped} 个作品`,
+        );
+      }
+    },
+  });
+
+  if (stats.truncated) {
+    console.log('    注意：Pixiv 标记了 tooManyBookmarkTags，可能有标签没返回。');
+  }
+
+  if (stats.reused) {
+    console.log(`    收藏标签：缓存有效（${stats.tags} 个标签），未产生额外请求`);
+  } else {
+    console.log(
+      `    收藏标签：扫描 ${stats.scannedTags} 个标签 / ${stats.requests} 次请求，映射 ${stats.mapped} 个作品`,
+    );
+  }
+
+  const changed = await applyBookmarkTags(filePath, map, {
+    kindLabel: entry.label,
+    lastSync: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    sourceTotal: sourceTotal || undefined,
+  });
+
+  if (changed > 0) {
+    console.log(`    收藏标签：${changed} 条记录已更新`);
+  }
+
+  return { changed, stats };
+}
+
 async function commandSync(flags) {
   const config = await loadConfig();
   const { client, intervalMs } = await buildClient(config, flags);
@@ -342,19 +401,32 @@ async function commandSync(flags) {
   console.log('');
 
   const results = [];
+  const wantTags = Boolean(config.bookmarkTags.enabled) && !flags['skip-tags'] && !dryRun;
+
   for (const entry of channels) {
+    const filePath = path.resolve(PROJECT_ROOT, entry.file);
     const result = await syncKind(client, {
       kind: entry.kind,
       visibility: entry.visibility,
       label: entry.label,
-      filePath: path.resolve(PROJECT_ROOT, entry.file),
-      limit: Number(config.pageSize[entry.kind] ?? (entry.kind === 'novel' ? 24 : 48)),
+      filePath,
+      limit: Number(config.pageSize[entry.kind] ?? 100),
       full,
       dryRun,
       maxPages: Number(flags['max-pages'] ?? config.maxPagesPerRun ?? 0),
       onProgress: printProgress,
     });
     results.push(result);
+
+    if (wantTags) {
+      await syncTagsForChannel(client, {
+        entry,
+        config,
+        filePath,
+        flags,
+        sourceTotal: result.total,
+      });
+    }
   }
 
   for (const result of results) printSummary(result);

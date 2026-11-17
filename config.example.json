@@ -11,17 +11,17 @@
   "includeNovels": true,
 
   "pageSize": {
-    "illust": 48,
-    "novel": 24
+    "illust": 100,
+    "novel": 100
   },
 
   "maxPagesPerRun": 0,
 
   "output": {
-    "illustPublic": "data/bookmarks-illust.txt",
-    "illustPrivate": "data/bookmarks-illust-private.txt",
-    "novelPublic": "data/bookmarks-novel.txt",
-    "novelPrivate": "data/bookmarks-novel-private.txt"
+    "illustPublic": "data/bookmarks-illust.json",
+    "illustPrivate": "data/bookmarks-illust-private.json",
+    "novelPublic": "data/bookmarks-novel.json",
+    "novelPrivate": "data/bookmarks-novel-private.json"
   },
 
   "download": {
@@ -29,5 +29,10 @@
     "avifQuality": 50,
     "imageIntervalMs": 1000,
     "keepOriginal": false
+  },
+
+  "bookmarkTags": {
+    "enabled": true,
+    "cacheDir": ".cache"
   }
 }

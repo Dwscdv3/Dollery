@@ -176,12 +176,12 @@ export class PixivClient {
    * 也就是说 rest 表达的是「这条收藏是否对他人可见」。两者是**互斥的两个列表**，
    * 各自有独立的 total，必须分别翻页，不存在「show 能一次拿全」的捷径。
    */
-  async fetchBookmarkPage(kind, offset, { limit, visibility = 'public' } = {}) {
+  async fetchBookmarkPage(kind, offset, { limit, visibility = 'public', tag = '' } = {}) {
     const segment = kind === 'novel' ? 'novels' : 'illusts';
     const uid = await this.resolveUserId();
     const rest = visibility === 'private' ? 'hide' : 'show';
     const body = await this.ajax(`/ajax/user/${uid}/${segment}/bookmarks`, {
-      tag: '',
+      tag,
       offset,
       limit,
       rest,
@@ -189,6 +189,24 @@ export class PixivClient {
     });
 
     return { total: Number(body?.total ?? 0), items: extractItems(body) };
+  }
+
+  /**
+   * 取当前账号用过的收藏标签，按可见性分成两组。
+   * 返回 [{ tag, cnt }]，cnt 是该标签下的作品数。
+   *
+   * 注意 rest 参数在这个接口上无效 —— 它总是同时返回 public 和 private 两组，
+   * 由调用方自己选。
+   */
+  async fetchBookmarkTags(kind) {
+    const segment = kind === 'novel' ? 'novels' : 'illusts';
+    const uid = await this.resolveUserId();
+    const body = await this.ajax(`/ajax/user/${uid}/${segment}/bookmark/tags`, { lang: 'zh' });
+    return {
+      public: Array.isArray(body?.public) ? body.public : [],
+      private: Array.isArray(body?.private) ? body.private : [],
+      truncated: Boolean(body?.tooManyBookmarkTags),
+    };
   }
 }
 
