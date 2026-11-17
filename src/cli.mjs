@@ -15,6 +15,7 @@ import { RateLimiter } from './http.mjs';
 import { PixivClient, PixivError } from './pixiv.mjs';
 import { readRecords } from './store.mjs';
 import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
+import { downloadRecords, formatBytes } from './download.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
@@ -36,8 +37,12 @@ const DEFAULT_CONFIG = {
     novelPublic: 'data/bookmarks-novel.txt',
     novelPrivate: 'data/bookmarks-novel-private.txt',
   },
-  downloadImages: false,
-  imagesDir: 'images',
+  download: {
+    dir: 'images',
+    avifQuality: 50,
+    imageIntervalMs: 1000,
+    keepOriginal: false,
+  },
 };
 
 function parseArgs(argv) {
@@ -84,6 +89,7 @@ async function loadConfig() {
     ...DEFAULT_CONFIG,
     ...raw,
     pageSize: { ...DEFAULT_CONFIG.pageSize, ...(raw.pageSize ?? {}) },
+    download: { ...DEFAULT_CONFIG.download, ...(raw.download ?? {}) },
     // 兼容旧版配置：以前只有 illust / novel 两个输出路径，全部对应到公开收藏。
     output: {
       ...DEFAULT_CONFIG.output,
@@ -121,9 +127,10 @@ function printHelp() {
     'pixiv-export — 增量备份 Pixiv 收藏元数据',
     '',
     '用法:',
-    '  node src/cli.mjs sync [选项]     同步收藏（默认增量）',
-    '  node src/cli.mjs status          查看本地备份概况',
-    '  node src/cli.mjs check           检查代理与 cookie 是否可用',
+    '  node src/cli.mjs sync [选项]          同步收藏（默认增量）',
+    '  node src/cli.mjs download --id 1-5    下载指定序号的作品',
+    '  node src/cli.mjs status               查看本地备份概况',
+    '  node src/cli.mjs check                检查代理与 cookie 是否可用',
     '',
     'sync 选项:',
     '  --full               全量同步：翻完所有页，能发现取消收藏与字段变更',
@@ -134,7 +141,17 @@ function printHelp() {
     '  --private-only       只同步私密收藏',
     '  --max-pages N        本次每条通道最多抓 N 页',
     '  --interval MS        覆盖请求间隔（默认 2000，不建议低于 2000）',
-    '  --download           下载作品图片（尚未实现，仅占位）',
+    '',
+    'download 选项:',
+    '  --id RANGE           必填，收藏序号：1-5 / 1,3,7 / 1-10,20',
+    '  --novel              下载小说正文（默认下插画）',
+    '  --public-only        只下公开收藏',
+    '  --private-only       只下私密收藏',
+    '  --quality N          AVIF 质量，默认 50',
+    '  --keep-original      保留原始图片（默认转换后删除）',
+    '  --image-interval MS  图片下载间隔，默认 1000',
+    '  --out DIR            输出目录，默认 images',
+    '  --dry-run            只列出要下什么，不实际下载',
     '',
     '认证:',
     '  把浏览器登录 pixiv 后的 cookie 写入 .secrets/cookies.txt，',
@@ -276,7 +293,7 @@ function printSummary(result) {
   if (result.added.length > 0) {
     out.push('  新增预览:');
     for (const record of result.added.slice(0, 8)) {
-      out.push(`    + ${record.id} 《${record.title || '(无题)'}》 — ${record.author || '未知作者'}`);
+      out.push(`    + #${record.id} ${record.pid} 《${record.title || '(无题)'}》 — ${record.author || '未知作者'}`);
     }
     if (result.added.length > 8) out.push(`    … 另有 ${result.added.length - 8} 条`);
   }
@@ -284,7 +301,7 @@ function printSummary(result) {
   if (result.removed.length > 0) {
     out.push('  本次新标记为已移除:');
     for (const record of result.removed.slice(0, 8)) {
-      out.push(`    - ${record.id} 《${record.title || '(无题)'}》`);
+      out.push(`    - #${record.id} ${record.pid} 《${record.title || '(无题)'}》`);
     }
     if (result.removed.length > 8) out.push(`    … 另有 ${result.removed.length - 8} 条`);
   }
@@ -295,7 +312,7 @@ function printSummary(result) {
       const detail = item.fields
         .map((f) => `${f.key}: ${JSON.stringify(f.from)} → ${JSON.stringify(f.to)}`)
         .join('; ');
-      out.push(`    ~ ${item.id} ${detail}`);
+      out.push(`    ~ #${item.id} ${item.pid} ${detail}`);
     }
     if (result.changed.length > 5) out.push(`    … 另有 ${result.changed.length - 5} 条`);
   }
@@ -304,10 +321,6 @@ function printSummary(result) {
 }
 
 async function commandSync(flags) {
-  if (flags.download) {
-    console.log('提示：--download 仅作占位，图片下载功能尚未实现。本次只同步元数据。\n');
-  }
-
   const config = await loadConfig();
   const { client, intervalMs } = await buildClient(config, flags);
   const full = Boolean(flags.full);
@@ -363,6 +376,174 @@ async function commandSync(flags) {
   return 0;
 }
 
+/**
+ * 解析 --id 参数：支持 1-5、1,3,7、1-10,20,30-40 这几种写法。
+ */
+function parseIdRanges(text) {
+  const ids = new Set();
+
+  for (const raw of String(text).split(',')) {
+    const part = raw.trim();
+    if (!part) continue;
+
+    const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (range) {
+      const lo = Math.min(Number(range[1]), Number(range[2]));
+      const hi = Math.max(Number(range[1]), Number(range[2]));
+      if (hi - lo > 20000) {
+        throw new ConfigError(`范围 ${lo}-${hi} 太大了（超过 20000 条），请拆成几段跑。`);
+      }
+      for (let i = lo; i <= hi; i += 1) ids.add(i);
+      continue;
+    }
+
+    if (/^\d+$/.test(part)) ids.add(Number(part));
+  }
+
+  return ids;
+}
+
+const DOWNLOAD_TARGETS = {
+  'illust:public': { key: 'illustPublic', label: '插画/漫画·公开' },
+  'illust:private': { key: 'illustPrivate', label: '插画/漫画·私密' },
+  'novel:public': { key: 'novelPublic', label: '小说·公开' },
+  'novel:private': { key: 'novelPrivate', label: '小说·私密' },
+};
+
+async function commandDownload(flags) {
+  const config = await loadConfig();
+  const { client } = await buildClient(config, flags);
+
+  const idText = flags.id;
+  if (!idText || idText === true) {
+    throw new ConfigError(
+      [
+        '需要用 --id 指定收藏序号，例如：',
+        '  --id 1-5       第 1 到第 5 条',
+        '  --id 1,3,7     只下这三条',
+        '  --id 1-10,20   组合写法',
+        '',
+        '序号就是数据文件里的 id 字段（1 = 最早收藏）。',
+      ].join('\n'),
+    );
+  }
+
+  const wanted = parseIdRanges(String(idText));
+  if (wanted.size === 0) {
+    throw new ConfigError(`--id "${idText}" 解析不出任何序号。`);
+  }
+
+  const kind = flags.novel ? 'novel' : 'illust';
+  const visibilities = [];
+  if (!flags['private-only']) visibilities.push('public');
+  if (!flags['public-only']) visibilities.push('private');
+
+  const selected = [];
+  for (const visibility of visibilities) {
+    const entry = DOWNLOAD_TARGETS[`${kind}:${visibility}`];
+    const records = await readRecords(path.resolve(PROJECT_ROOT, config.output[entry.key]));
+    for (const record of records) {
+      if (wanted.has(Number(record.id))) {
+        selected.push({ ...record, sourceLabel: entry.label });
+      }
+    }
+  }
+
+  if (selected.length === 0) {
+    console.log(`在${kind === 'novel' ? '小说' : '插画'}收藏里，没有 id 落在范围内的记录。`);
+    console.log('提示：公开和私密的 id 是各自独立编号的，可用 --public-only / --private-only 限定。');
+    return 0;
+  }
+
+  // 已取消收藏、作品本身已失效的，图片大概率也取不到，直接跳过并说明原因
+  const usable = [];
+  const skippedRemoved = [];
+  const skippedUnavailable = [];
+  for (const record of selected) {
+    if (record.removed) skippedRemoved.push(record);
+    else if (record.status === 'unavailable') skippedUnavailable.push(record);
+    else usable.push(record);
+  }
+
+  const outDir = path.resolve(PROJECT_ROOT, flags.out ?? config.download.dir);
+  const quality = Number(flags.quality ?? config.download.avifQuality ?? 50);
+  const imageInterval = Number(flags['image-interval'] ?? config.download.imageIntervalMs ?? 1000);
+  const keepOriginal = Boolean(flags['keep-original'] ?? config.download.keepOriginal);
+  const dryRun = Boolean(flags['dry-run']);
+
+  console.log(`输出目录: ${relativeToRoot(outDir)}`);
+  console.log(`命中 ${selected.length} 条，可下载 ${usable.length} 条`);
+  if (skippedRemoved.length > 0) console.log(`  跳过 ${skippedRemoved.length} 条：已取消收藏`);
+  if (skippedUnavailable.length > 0) console.log(`  跳过 ${skippedUnavailable.length} 条：作品已失效`);
+  if (kind === 'novel') {
+    console.log(`正文存为 .txt${dryRun ? '   [演练模式]' : ''}`);
+  } else {
+    console.log(
+      `AVIF 质量 ${quality}   图片间隔 ${imageInterval}ms   ${keepOriginal ? '保留原图' : '转换后删除原图'}${dryRun ? '   [演练模式]' : ''}`,
+    );
+  }
+  console.log('');
+
+  if (usable.length === 0) return 0;
+
+  const imageLimiter = new RateLimiter(imageInterval);
+  const startedAt = Date.now();
+
+  const summary = await downloadRecords(client, {
+    records: usable,
+    outDir,
+    quality,
+    keepOriginal,
+    dryRun,
+    imageLimiter,
+    proxy: config.proxy,
+    onProgress: (event) => {
+      const title = event.record.title || '无题';
+      if (event.phase === 'start') {
+        process.stdout.write(`  [${event.index + 1}/${event.total}] ${event.label} 《${title}》 … `);
+        return;
+      }
+      if (event.phase === 'done') {
+        const { result } = event;
+        if (dryRun) console.log('演练');
+        else if (result.skipped > 0 && result.files.length === 0) console.log(`已存在，跳过 ${result.skipped} 个文件`);
+        else console.log(`完成 ${result.files.length} 个文件`);
+        return;
+      }
+      if (event.phase === 'fail') {
+        console.log(`失败：${event.message}`);
+      }
+    },
+  });
+
+  console.log('');
+  console.log('── 下载结果 ──');
+  console.log(`  成功 ${summary.ok} 条 · 跳过已有文件 ${summary.skipped} 个 · 失败 ${summary.failed} 条`);
+
+  if (summary.files > 0) {
+    console.log(`  产出 ${summary.files} 个文件，耗时 ${formatDurationMs(Date.now() - startedAt)}`);
+    if (kind === 'novel') {
+      console.log(`  写入 ${formatBytes(summary.finalBytes)} 文本`);
+    } else if (summary.originalBytes > 0) {
+      const saved = summary.originalBytes - summary.finalBytes;
+      const ratio = (saved / summary.originalBytes) * 100;
+      console.log(
+        `  原始 ${formatBytes(summary.originalBytes)} → 成品 ${formatBytes(summary.finalBytes)}（省下 ${ratio.toFixed(1)}%）`,
+      );
+    }
+  }
+
+  if (summary.errors.length > 0) {
+    console.log('  失败明细:');
+    for (const item of summary.errors.slice(0, 8)) {
+      console.log(`    #${item.record.id} pid=${item.record.pid}：《${item.record.title || '无题'}》 ${item.message}`);
+    }
+    if (summary.errors.length > 8) console.log(`    … 另有 ${summary.errors.length - 8} 条`);
+  }
+
+  return summary.failed > 0 ? 1 : 0;
+}
+
 async function commandStatus() {
   const config = await loadConfig();
   const channels = buildChannels(config, {});
@@ -393,19 +574,19 @@ async function commandStatus() {
     }
     console.log(statLine);
 
-    const withSeq = records.filter((r) => Number(r.seq) > 0);
+    const withSeq = records.filter((r) => Number(r.id) > 0);
     if (withSeq.length > 0) {
       let min = Infinity;
       let max = 0;
       let oldest = withSeq[0];
       for (const record of withSeq) {
-        const seq = Number(record.seq);
+        const seq = Number(record.id);
         if (seq < min) min = seq;
         if (seq > max) max = seq;
-        if (seq < Number(oldest.seq)) oldest = record;
+        if (seq < Number(oldest.id)) oldest = record;
       }
       console.log(`  收藏序号: ${min} ~ ${max}（共 ${withSeq.length} 条有序号）`);
-      console.log(`  最早收藏: #${oldest.seq} ${oldest.id} 《${oldest.title || '(无题)'}》`);
+      console.log(`  最早收藏: #${oldest.id} pid=${oldest.pid} 《${oldest.title || '(无题)'}》`);
     }
 
     const seenDates = records.map((r) => r.first_seen).filter(Boolean).sort();
@@ -462,6 +643,8 @@ async function main() {
   switch (command) {
     case 'sync':
       return commandSync(flags);
+    case 'download':
+      return commandDownload(flags);
     case 'status':
       return commandStatus();
     case 'check':

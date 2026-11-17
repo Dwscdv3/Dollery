@@ -16,7 +16,7 @@
  * 两个必须存在的安全阀：
  *   1. 全量模式如果绝大多数记录都没在服务端出现（典型场景是 cookie 失效、接口返回
  *      空列表），绝不写入。宁可不更新，也不能把整个收藏夹误标成「已移除」。
- *   2. 旧版本数据没有 seq 字段时拒绝增量同步 —— 否则新记录带序号、旧记录没有，
+ *   2. 旧版本数据没有 id（收藏序号）时拒绝增量同步 —— 否则新记录带序号、旧记录没有，
  *      排序会彻底错乱。必须先跑一次全量完成迁移。
  */
 import { normalizeIllust, normalizeNovel } from './pixiv.mjs';
@@ -63,14 +63,14 @@ export async function syncKind(client, options) {
   } = options;
 
   const existing = await readRecords(filePath);
-  const knownIds = new Set(existing.map((r) => String(r.id)));
-  const existingById = new Map(existing.map((r) => [String(r.id), r]));
+  const knownIds = new Set(existing.map((r) => String(r.pid)));
+  const existingById = new Map(existing.map((r) => [String(r.pid), r]));
 
-  // 旧数据迁移保护：没有 seq 就建立不起收藏顺序，增量会写出乱序文件。
-  const missingSeq = existing.filter((r) => !(Number(r.seq) > 0)).length;
+  // 旧数据迁移保护：没有 id（收藏序号）就建立不起收藏顺序，增量会写出乱序文件。
+  const missingSeq = existing.filter((r) => !(Number(r.id) > 0)).length;
   if (missingSeq > 0 && !full) {
     throw new SyncAbort(
-      `${label}：本地有 ${missingSeq} 条记录还没有 seq（收藏顺序号），属于旧版本数据。` +
+      `${label}：本地有 ${missingSeq} 条记录还没有 id（收藏顺序号），属于旧版本数据。` +
         `请先运行一次  node src/cli.mjs sync --full  完成迁移，之后再回到增量模式。`,
     );
   }
@@ -114,15 +114,15 @@ export async function syncKind(client, options) {
           : normalizeIllust(item, bookmark, today);
       if (!record) continue;
 
-      const id = record.id;
-      if (fetchedIds.has(id)) continue;
-      fetchedIds.add(id);
+      const pid = record.pid;
+      if (fetchedIds.has(pid)) continue;
+      fetchedIds.add(pid);
 
       // first_seen 一旦写过就不该变。
-      const previous = existingById.get(id);
+      const previous = existingById.get(pid);
       if (previous?.first_seen) record.first_seen = previous.first_seen;
 
-      if (!knownIds.has(id)) newInPage += 1;
+      if (!knownIds.has(pid)) newInPage += 1;
       fetched.push(record);
     }
 
@@ -160,7 +160,7 @@ export async function syncKind(client, options) {
     }
   }
 
-  // ---- 分配收藏顺序号 ----
+  // ---- 分配收藏顺序号（id）----
   //
   // fetched 是按收藏时间**倒序**的（index 0 最新）。要让最早的收藏拿到最小序号，
   // 必须从数组末尾往前遍历赋值。序号一旦分配就不再重排 —— 取消收藏只留空洞，
@@ -168,15 +168,15 @@ export async function syncKind(client, options) {
   //
   // 顺带处理「重新收藏」：本地标了 removed 却又出现在列表里的记录，视为一次新收藏，
   // 重新编号而不是保留旧序号，这符合「它现在是最新加进去的」这一事实。
-  const maxSeq = existing.reduce((max, r) => Math.max(max, Number(r.seq) || 0), 0);
-  let nextSeq = maxSeq + 1;
+  const maxId = existing.reduce((max, r) => Math.max(max, Number(r.id) || 0), 0);
+  let nextId = maxId + 1;
 
   for (let i = fetched.length - 1; i >= 0; i -= 1) {
     const record = fetched[i];
-    const previous = existingById.get(String(record.id));
-    const reusable = previous && Number(previous.seq) > 0 && !previous.removed;
-    record.seq = reusable ? Number(previous.seq) : nextSeq;
-    if (!reusable) nextSeq += 1;
+    const previous = existingById.get(String(record.pid));
+    const reusable = previous && Number(previous.id) > 0 && !previous.removed;
+    record.id = reusable ? Number(previous.id) : nextId;
+    if (!reusable) nextId += 1;
   }
 
   // ---- 合并 ----
@@ -187,7 +187,7 @@ export async function syncKind(client, options) {
     // 全量：以服务端为准，但**不删除**本地记录 —— 服务端没出现的只打 removed 标记，
     // 内容原样留在文件里，改动就是多出一行 `removed: yes`。
     for (const record of existing) {
-      if (fetchedIds.has(String(record.id))) continue;
+      if (fetchedIds.has(String(record.pid))) continue;
       kept.push(record.removed ? record : { ...record, removed: 'yes' });
     }
     merged = [...fetched, ...kept];
@@ -196,11 +196,11 @@ export async function syncKind(client, options) {
     // 而且接口返回的 tags 顺序并不稳定，拿它覆盖旧值只会制造假 diff）。
     // 例外是「重新收藏」的记录，需要替换掉原来那条带 removed 标记的旧记录。
     const revived = new Set(
-      fetched.filter((r) => existingById.get(String(r.id))?.removed).map((r) => String(r.id)),
+      fetched.filter((r) => existingById.get(String(r.pid))?.removed).map((r) => String(r.pid)),
     );
-    merged = existing.filter((r) => !revived.has(String(r.id)));
+    merged = existing.filter((r) => !revived.has(String(r.pid)));
     for (const record of fetched) {
-      const previous = existingById.get(String(record.id));
+      const previous = existingById.get(String(record.pid));
       if (!previous || previous.removed) merged.push(record);
     }
   }

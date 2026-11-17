@@ -23,8 +23,8 @@ import path from 'node:path';
  * 有价值的变更（新增收藏、标题改动）淹掉。何况插画侧的收藏接口根本不返回这些数。
  */
 export const FIELD_ORDER = [
-  'seq',
   'id',
+  'pid',
   'type',
   'title',
   'author',
@@ -147,7 +147,7 @@ export function serialize(records, meta = {}) {
   lines.push(`${HEADER_PREFIX} pixiv-export 收藏元数据备份`);
   lines.push(`${HEADER_PREFIX} 格式：每条记录为多行 key: value，记录之间用空行分隔`);
   lines.push(`${HEADER_PREFIX} 由程序自动生成，手工编辑会在下次同步时被覆盖`);
-  lines.push(`${HEADER_PREFIX} 按 seq 升序排列，seq=1 是最早收藏的作品`);
+  lines.push(`${HEADER_PREFIX} 按 id 升序排列，id=1 是最早收藏的作品`);
   lines.push(`${HEADER_PREFIX} first_seen 表示本程序首次发现该收藏的日期`);
   lines.push(`${HEADER_PREFIX} removed: yes 表示该作品已不在收藏夹中，记录仅为留存历史`);
   lines.push(`${HEADER_PREFIX} 记录数: ${records.length}`);
@@ -216,7 +216,7 @@ export function parse(text) {
 
   // 数字类字段还原成数字，方便后续比较和展示。
   for (const record of records) {
-    for (const key of ['seq', 'pages', 'width', 'height', 'text_length', 'x_restrict', 'ai_type']) {
+    for (const key of ['id', 'pages', 'width', 'height', 'text_length', 'x_restrict', 'ai_type']) {
       if (record[key] === undefined || record[key] === '') continue;
       const num = Number(record[key]);
       if (!Number.isNaN(num)) record[key] = num;
@@ -227,25 +227,25 @@ export function parse(text) {
 }
 
 /**
- * 按收藏顺序排列：seq 升序，最早收藏的排在最前面。
+ * 按收藏顺序排列：id 升序，最早收藏的排在最前面。
  *
- * seq 是「收藏顺序号」，不是作品 id。它一经分配就不再重排 —— 哪怕中间取消了收藏
- * 也不会让后面的记录往前挪，否则取消一条就会导致几千行一起位移，diff 彻底失效。
- * 取消只留空洞，靠 removed 字段标记。
+ * id 是「收藏顺序号」，不是作品 id（那是 pid）。它一经分配就不再重排 —— 哪怕中间
+ * 取消了收藏也不会让后面的记录往前挪，否则取消一条就会导致几千行一起位移，
+ * diff 彻底失效。取消只留空洞，靠 removed 字段标记。
  *
- * 没有 seq 的记录（首次迁移前的旧数据）排在最后；两者都没有时退化为 id 降序，
+ * 没有 id 的记录（首次迁移前的旧数据）排在最后；两者都没有时退化为 pid 降序，
  * 保证输出结果稳定可复现。
  */
 export function sortRecords(records) {
   return [...records].sort((a, b) => {
-    const seqA = Number(a.seq);
-    const seqB = Number(b.seq);
+    const seqA = Number(a.id);
+    const seqB = Number(b.id);
     const hasA = Number.isFinite(seqA) && seqA > 0;
     const hasB = Number.isFinite(seqB) && seqB > 0;
 
     if (hasA && hasB && seqA !== seqB) return seqA - seqB;
     if (hasA !== hasB) return hasA ? -1 : 1;
-    return String(b.id).localeCompare(String(a.id));
+    return String(b.pid).localeCompare(String(a.pid));
   });
 }
 
@@ -265,32 +265,36 @@ function normalizeForCompare(value) {
 /**
  * 字段级差分。返回新增 / 消失 / 变更三类，变更里带上具体字段，
  * 这样同步结束后能直接告诉用户「改了什么」，而不只是「变了 N 条」。
+ *
+ * 匹配键用 pid（作品 id）而不是 id（收藏序号）—— id 会随取消收藏产生空洞，
+ * 但作品身份是稳定的。用 pid 匹配，收藏序号变化才会被当成一次「字段变更」。
  */
 export function diffRecords(before, after) {
-  const beforeMap = new Map(before.map((r) => [String(r.id), r]));
-  const afterMap = new Map(after.map((r) => [String(r.id), r]));
+  const keyOf = (record) => String(record.pid ?? record.id);
+  const beforeMap = new Map(before.map((r) => [keyOf(r), r]));
+  const afterMap = new Map(after.map((r) => [keyOf(r), r]));
 
   const added = [];
   const removed = [];
   const changed = [];
 
-  for (const [id, record] of afterMap) {
-    const old = beforeMap.get(id);
+  for (const [key, record] of afterMap) {
+    const old = beforeMap.get(key);
     if (!old) {
       added.push(record);
       continue;
     }
     const fields = [];
-    for (const key of FIELD_ORDER) {
-      const a = JSON.stringify(normalizeForCompare(old[key]));
-      const b = JSON.stringify(normalizeForCompare(record[key]));
-      if (a !== b) fields.push({ key, from: old[key], to: record[key] });
+    for (const field of FIELD_ORDER) {
+      const a = JSON.stringify(normalizeForCompare(old[field]));
+      const b = JSON.stringify(normalizeForCompare(record[field]));
+      if (a !== b) fields.push({ key: field, from: old[field], to: record[field] });
     }
-    if (fields.length > 0) changed.push({ id, record, fields });
+    if (fields.length > 0) changed.push({ pid: key, id: record.id, record, fields });
   }
 
-  for (const id of beforeMap.keys()) {
-    if (!afterMap.has(id)) removed.push(beforeMap.get(id));
+  for (const [key, record] of beforeMap) {
+    if (!afterMap.has(key)) removed.push(record);
   }
 
   return { added, removed, changed };

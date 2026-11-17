@@ -248,11 +248,12 @@ function isUnavailable(raw) {
  * 所以这里统一按收藏接口的真实形状取值，只保留稳定字段。
  */
 export function normalizeIllust(raw, bookmark, firstSeen) {
-  const id = String(raw.id ?? raw.illustId ?? bookmark?.id ?? '');
-  if (!id) return null;
+  const pid = String(raw.id ?? raw.illustId ?? bookmark?.id ?? '');
+  if (!pid) return null;
 
   return {
-    id,
+    // id（收藏顺序号）由同步层分配，这里只带作品号。
+    pid,
     type: ILLUST_TYPE_LABEL[raw.illustType] ?? 'illust',
     title: raw.title ?? raw.illustTitle ?? '',
     author: raw.userName ?? '',
@@ -267,7 +268,7 @@ export function normalizeIllust(raw, bookmark, firstSeen) {
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
     status: isUnavailable(raw) ? 'unavailable' : '',
     first_seen: firstSeen,
-    url: `${ORIGIN}/artworks/${id}`,
+    url: `${ORIGIN}/artworks/${pid}`,
   };
 }
 
@@ -276,11 +277,11 @@ export function normalizeIllust(raw, bookmark, firstSeen) {
  * 也没有 width/height。语言字段 language 对区分中/日/英文小说很有用。
  */
 export function normalizeNovel(raw, bookmark, firstSeen) {
-  const id = String(raw.id ?? bookmark?.id ?? '');
-  if (!id) return null;
+  const pid = String(raw.id ?? bookmark?.id ?? '');
+  if (!pid) return null;
 
   return {
-    id,
+    pid,
     type: 'novel',
     title: raw.title ?? '',
     author: raw.userName ?? '',
@@ -294,6 +295,6 @@ export function normalizeNovel(raw, bookmark, firstSeen) {
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
     status: isUnavailable(raw) ? 'unavailable' : '',
     first_seen: firstSeen,
-    url: `${ORIGIN}/novel/show.php?id=${id}`,
+    url: `${ORIGIN}/novel/show.php?id=${pid}`,
   };
 }

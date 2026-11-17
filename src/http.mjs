@@ -108,14 +108,15 @@ async function openTlsOverTunnel(proxyUrl, host, port, timeoutMs) {
 }
 
 /**
- * 发起一次 GET 请求，返回 { status, headers, body }。
- * 传了 proxy 就走隧道；不传则直连（仅在本机自测时使用）。
+ * 发起一次 GET 请求。
  *
- * 这里有个坑值得记一笔：不能指望 `agent: false` 配合 `options.createConnection`
- * 来注入已握手的 TLS socket —— https 会用内部的 agent 重建连接，把 socket 丢掉，
- * 表现为一个 message 为空的诡异错误。必须显式构造 agent 并覆盖它的 createConnection。
+ * 默认把响应按 UTF-8 解成 `body` 字符串（接口都是 JSON）。
+ * 传 `binary: true` 则只给 `buffer` —— 图片、zip 走这条路，按字符串解会损坏文件。
  */
-export async function httpsGet(url, { headers = {}, proxy = null, timeoutMs = 30000 } = {}) {
+export async function httpsGet(
+  url,
+  { headers = {}, proxy = null, timeoutMs = 60000, binary = false } = {},
+) {
   const target = new URL(url);
   const port = target.port ? Number(target.port) : 443;
   const path = target.pathname + target.search;
@@ -146,10 +147,13 @@ export async function httpsGet(url, { headers = {}, proxy = null, timeoutMs = 30
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        const collected = Buffer.concat(chunks);
         resolve({
           status: res.statusCode,
           headers: res.headers,
-          body: Buffer.concat(chunks).toString('utf8'),
+          buffer: binary ? collected : undefined,
+          body: binary ? undefined : collected.toString('utf8'),
+          bytes: collected.length,
         });
       });
       res.once('error', reject);

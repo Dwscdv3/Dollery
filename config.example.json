@@ -24,6 +24,10 @@
     "novelPrivate": "data/bookmarks-novel-private.txt"
   },
 
-  "downloadImages": false,
-  "imagesDir": "images"
+  "download": {
+    "dir": "images",
+    "avifQuality": 50,
+    "imageIntervalMs": 1000,
+    "keepOriginal": false
+  }
 }
