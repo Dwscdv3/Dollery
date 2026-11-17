@@ -52,7 +52,6 @@ export async function syncKind(client, options) {
     dryRun = false,
     maxPages = 0,
     includePrivate = true,
-    includeVolatileStats = false,
     onProgress,
     label,
   } = options;
@@ -108,12 +107,6 @@ export async function syncKind(client, options) {
       const previous = existingById.get(id);
       if (previous?.first_seen) record.first_seen = previous.first_seen;
 
-      if (includeVolatileStats) {
-        record.bookmark_count = item.bookmarkCount ?? previous?.bookmark_count;
-        record.like_count = item.likeCount ?? previous?.like_count;
-        record.view_count = item.viewCount ?? previous?.view_count;
-      }
-
       if (!knownIds.has(id)) newInPage += 1;
       fetched.push(record);
     }
@@ -141,8 +134,14 @@ export async function syncKind(client, options) {
       break;
     }
 
-    // 追平判断：连续两页全已知才停，单页全已知可能是分页位移造成的错觉。
-    if (!full && consecutiveKnownPages >= 2) {
+    // 追平判断要同时满足两个条件才成立：
+    //   a) 连续两页全已知 —— 单页全已知可能是分页位移造成的错觉；
+    //   b) 本地记录数已经接近服务端总数 —— 否则说明上次同步是被 --max-pages
+    //      截断的半截数据，此时前几页必然"全已知"，若就此停止将永远补不齐后面的记录。
+    //      用 90% 而不是 100%，是为了容下「刚新增了几条」这种正常情形：
+    //      那时 local 比 total 少一点点，不该被迫翻完全部页面。
+    const coverage = total > 0 ? existing.length / total : 1;
+    if (!full && consecutiveKnownPages >= 2 && coverage >= 0.9) {
       stoppedReason = '连续两页均为已知收藏，判定已追平';
       break;
     }
@@ -153,9 +152,10 @@ export async function syncKind(client, options) {
   if (full) {
     merged = fetched;
   } else {
-    // 增量模式：以本地为准，只把新抓到的合进去；已有记录的字段不回退覆盖。
-    const fetchedMap = new Map(fetched.map((r) => [String(r.id), r]));
-    merged = existing.map((r) => fetchedMap.get(String(r.id)) ?? r);
+    // 增量模式只追加本地没有的新记录，已有记录原样保留。
+    // 理由：增量只翻头部几页，本来就没有完整的更新视野；而且接口返回的 tags
+    // 顺序并不稳定，拿它覆盖旧值只会制造假 diff。元数据刷新交给 --full。
+    merged = [...existing];
     for (const record of fetched) {
       if (!existingById.has(String(record.id))) merged.push(record);
     }
@@ -196,6 +196,7 @@ export async function syncKind(client, options) {
     fetchedCount: fetched.length,
     localBefore: existing.length,
     localAfter: merged.length,
+    unavailableCount: merged.filter((r) => r.status === 'unavailable').length,
     added: diff.added,
     removed: removedApplied,
     changed: diff.changed,

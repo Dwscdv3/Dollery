@@ -15,27 +15,33 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-/** 字段顺序即文件中的书写顺序。改动这里等于改变整个文件的形状，慎动。 */
+/**
+ * 字段顺序即文件中的书写顺序。改动这里等于改变整个文件的形状，慎动。
+ *
+ * 只收「稳定字段」：作品固有属性或收藏关系本身。点赞数、收藏数、浏览数这类
+ * 每天都变的数字刻意不记 —— 它们会让每次同步产生几千行噪声 diff，把真正
+ * 有价值的变更（新增收藏、标题改动）淹掉。何况插画侧的收藏接口根本不返回这些数。
+ */
 export const FIELD_ORDER = [
   'id',
   'type',
   'title',
   'author',
   'author_id',
-  'account',
   'published',
   'pages',
+  'width',
+  'height',
   'text_length',
+  'language',
   'tags',
   'x_restrict',
   'ai_type',
   'private_bookmark',
+  'status',
   'first_seen',
   'url',
 ];
-
-/** 易变计数单独成组，默认不写，避免每次同步都制造大面积 diff。 */
-export const VOLATILE_FIELDS = ['bookmark_count', 'like_count', 'view_count'];
 
 const HEADER_PREFIX = '#';
 
@@ -155,11 +161,6 @@ export function serialize(records, meta = {}) {
       if (Array.isArray(value) && value.length === 0) continue;
       lines.push(`${key}: ${formatValue(key, value)}`);
     }
-    for (const key of VOLATILE_FIELDS) {
-      const value = record[key];
-      if (value === undefined || value === null || value === '') continue;
-      lines.push(`${key}: ${escapeScalar(value)}`);
-    }
     lines.push('');
   }
 
@@ -176,7 +177,10 @@ export function parse(text) {
   let current = null;
 
   for (const rawLine of String(text).split(/\r?\n/)) {
-    const line = rawLine.trimEnd();
+    // 只去掉行尾的 \r，不能顺手 trimEnd()。有些作品标题真的以全角空格（U+3000）
+    // 结尾，而 trimEnd 会把它一起吃掉 —— 于是文件里的值和内存里的值对不上，
+    // 每次全量同步都会把这些记录误报成「标题变更」。实测 4859 条里有 8 条中招。
+    const line = rawLine.replace(/\r$/, '');
 
     if (line === '') {
       if (current && Object.keys(current).length > 0) {
@@ -208,7 +212,7 @@ export function parse(text) {
 
   // 数字类字段还原成数字，方便后续比较和展示。
   for (const record of records) {
-    for (const key of ['pages', 'text_length', 'x_restrict', 'ai_type', 'bookmark_count', 'like_count', 'view_count']) {
+    for (const key of ['pages', 'width', 'height', 'text_length', 'x_restrict', 'ai_type']) {
       if (record[key] === undefined || record[key] === '') continue;
       const num = Number(record[key]);
       if (!Number.isNaN(num)) record[key] = num;
@@ -225,6 +229,19 @@ export function sortRecords(records) {
     if (Number.isFinite(ida) && Number.isFinite(idb) && ida !== idb) return idb - ida;
     return String(b.id).localeCompare(String(a.id));
   });
+}
+
+/**
+ * 差分比较前先把「等价于空」的值归一化。
+ *
+ * 序列化时 undefined / null / '' / [] 都不会写出任何行，也就是在文件里完全一样。
+ * 如果比较时不归一化，`undefined → ''` 这种看不见的变化会被报成「字段变更」，
+ * 一次就会刷出几千条假 diff。
+ */
+function normalizeForCompare(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (Array.isArray(value) && value.length === 0) return null;
+  return value;
 }
 
 /**
@@ -246,9 +263,9 @@ export function diffRecords(before, after) {
       continue;
     }
     const fields = [];
-    for (const key of [...FIELD_ORDER, ...VOLATILE_FIELDS]) {
-      const a = JSON.stringify(old[key] ?? null);
-      const b = JSON.stringify(record[key] ?? null);
+    for (const key of FIELD_ORDER) {
+      const a = JSON.stringify(normalizeForCompare(old[key]));
+      const b = JSON.stringify(normalizeForCompare(record[key]));
       if (a !== b) fields.push({ key, from: old[key], to: record[key] });
     }
     if (fields.length > 0) changed.push({ id, record, fields });

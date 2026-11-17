@@ -37,9 +37,10 @@ const sample = [
     title: '标题里带冒号: 和反斜杠 \\ 还有引号 "x"',
     author: '作者名',
     author_id: '100',
-    account: 'account',
     published: '2024-05-01T12:00:00+09:00',
     pages: 3,
+    width: 1200,
+    height: 1697,
     tags: ['原创', 'a,b', 'say "hi"', 'back\\slash'],
     x_restrict: 1,
     ai_type: 0,
@@ -132,6 +133,19 @@ await test('标签里的逗号、引号、反斜杠能正确还原', () => {
   assert.deepEqual(parse(serialize(tricky))[0].tags, tricky[0].tags);
 });
 
+await test('标题末尾的全角空格不会被吞掉', () => {
+  // 真实数据里存在以 U+3000 结尾的标题。若解析时 trimEnd，会把它吃掉，
+  // 导致「文件里的值」和「接口返回的值」永远对不上，每次全量都误报变更。
+  const tricky = [{ ...sample[1], title: 'クロリンデの小さな悩み\u3000' }];
+  assert.equal(parse(serialize(tricky))[0].title, 'クロリンデの小さな悩み\u3000');
+});
+
+await test('带尾随空格的标题不会产生假 diff', () => {
+  const stored = parse(serialize([{ id: '1', title: '雨晴\u3000' }]));
+  const fromApi = [{ id: '1', title: '雨晴\u3000' }];
+  assert.equal(diffRecords(stored, fromApi).changed.length, 0);
+});
+
 await test('空标签列表不写 tags 行', () => {
   assert.ok(!serialize([{ ...sample[1], tags: [] }]).includes('tags:'));
 });
@@ -158,6 +172,26 @@ await test('差分能识别新增、移除、字段变更', () => {
   assert.equal(diff.removed.length, 1);
   assert.equal(diff.changed.length, 1);
   assert.equal(diff.changed[0].fields[0].key, 'title');
+});
+
+await test('没有变化时差分为空', () => {
+  const diff = diffRecords(sample, structuredClone(sample));
+  assert.equal(diff.added.length + diff.removed.length + diff.changed.length, 0);
+});
+
+await test('undefined、空字符串、空数组之间不算字段变更', () => {
+  // 这几种值在文件里都不写出任何行，等同于同一个状态。
+  // 不做归一化的话，新增一个字段就会刷出几千条假 diff（实测踩过）。
+  const before = [{ id: '1', title: 'A', status: undefined, tags: [] }];
+  const after = [{ id: '1', title: 'A', status: '', tags: [] }];
+  const diff = diffRecords(before, after);
+  assert.equal(diff.changed.length, 0, `不该报变更，实际报了 ${JSON.stringify(diff.changed)}`);
+});
+
+await test('真实字段变化仍然能被检出', () => {
+  const diff = diffRecords([{ id: '1', status: '' }], [{ id: '1', status: 'unavailable' }]);
+  assert.equal(diff.changed.length, 1);
+  assert.equal(diff.changed[0].fields[0].key, 'status');
 });
 
 console.log('\nsync —— 增量与安全阀\n');
@@ -232,6 +266,20 @@ await test('dry-run 不写入文件', async () => {
   await syncKind(unchanged, { ...baseOptions, filePath: tempFile, full: true, dryRun: true });
   const after = await readRecords(tempFile);
   assert.deepEqual(after, before);
+});
+
+await test('本地被 --max-pages 截断后，增量能自愈补全而不是误判追平', async () => {
+  const partialFile = path.join(tempRoot, 'partial.txt');
+
+  // 第一次只同步 1 页，模拟被 maxPages 截断
+  await syncKind(makeFakeServer(serverIds), { ...baseOptions, filePath: partialFile, maxPages: 1 });
+  assert.equal((await readRecords(partialFile)).length, 20);
+
+  // 再跑完整增量：前两页全已知，但覆盖率只有 20%，必须继续翻到底
+  const srv = makeFakeServer(serverIds);
+  const result = await syncKind(srv, { ...baseOptions, filePath: partialFile });
+  assert.equal(result.localAfter, 100, '应该补齐到 100 条');
+  assert.equal(srv.calls, 5, `应该翻 5 页，实际 ${srv.calls} 页`);
 });
 
 await fs.rm(tempRoot, { recursive: true, force: true });

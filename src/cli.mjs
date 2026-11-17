@@ -30,7 +30,6 @@ const DEFAULT_CONFIG = {
   includePrivateBookmarks: true,
   pageSize: { illust: 48, novel: 24 },
   maxPagesPerRun: 0,
-  includeVolatileStats: false,
   output: {
     illust: 'data/bookmarks-illust.txt',
     novel: 'data/bookmarks-novel.txt',
@@ -125,7 +124,6 @@ function printHelp() {
     '  --novel-only         只同步小说',
     '  --max-pages N        本次每类最多抓 N 页',
     '  --interval MS        覆盖请求间隔（默认 2000，不建议低于 2000）',
-    '  --stats              连带记录收藏数/点赞数等易变字段（会让 diff 变吵）',
     '  --download           下载作品图片（尚未实现，仅占位）',
     '',
     '认证:',
@@ -200,6 +198,9 @@ function printSummary(result) {
   out.push(`  本次请求页数   : ${result.pages}（间隔限速下共 ${formatDurationMs(result.elapsedMs)}）`);
   out.push(`  停止原因       : ${result.stoppedReason}`);
   out.push(`  本地记录       : ${result.localBefore} → ${result.localAfter}`);
+  if (result.unavailableCount > 0) {
+    out.push(`  其中已失效     : ${result.unavailableCount} 条（作品被删除或转为不可见，已标记 status: unavailable）`);
+  }
   out.push(
     `  新增 ${result.added.length} 条 · 取消 ${result.removed.length} 条 · 字段变更 ${result.changed.length} 条`,
   );
@@ -223,8 +224,10 @@ function printSummary(result) {
   if (result.changed.length > 0) {
     out.push('  字段变更:');
     for (const item of result.changed.slice(0, 5)) {
-      const keys = item.fields.map((f) => f.key).join(', ');
-      out.push(`    ~ ${item.id} (${keys})`);
+      const detail = item.fields
+        .map((f) => `${f.key}: ${JSON.stringify(f.from)} → ${JSON.stringify(f.to)}`)
+        .join('; ');
+      out.push(`    ~ ${item.id} ${detail}`);
     }
     if (result.changed.length > 5) out.push(`    … 另有 ${result.changed.length - 5} 条`);
   }
@@ -271,7 +274,6 @@ async function commandSync(flags) {
       dryRun,
       maxPages: Number(flags['max-pages'] ?? config.maxPagesPerRun ?? 0),
       includePrivate: Boolean(config.includePrivateBookmarks),
-      includeVolatileStats: Boolean(flags.stats ?? config.includeVolatileStats),
       onProgress: printProgress,
     });
     results.push(result);

@@ -101,34 +101,54 @@ node src/cli.mjs sync --interval 3000
 # 按作品 id 降序排列；first_seen 表示本程序首次发现该收藏的日期
 # 记录数: 2
 
-id: 120000003
-type: manga
-title: 标题
-author: 作者名
-author_id: 100
-account: account_name
-published: 2024-05-01T12:00:00+09:00
-pages: 3
-tags: 原创, 风景
-x_restrict: 1
+id: 151677913
+type: illust
+title: ヒフミ(レーシング)
+author: 遥風ぎあ
+author_id: 25432432
+published: 2026-11-04T19:20:00+09:00
+pages: 1
+width: 2584
+height: 4170
+tags: BlueArchive, ブルーアーカイブ, ブルアカ
+x_restrict: 0
 ai_type: 0
 private_bookmark: no
 first_seen: 2026-11-17
-url: https://www.pixiv.net/artworks/120000003
+url: https://www.pixiv.net/artworks/151677913
 
-id: 120000001
-...
+id: 139007867
+type: illust
+title: -----
+author: -----
+author_id: 0
+published: 1970-01-01T00:00:00+09:00
+pages: 1
+width: 100
+height: 100
+x_restrict: 0
+ai_type: 0
+private_bookmark: no
+status: unavailable
+first_seen: 2026-11-17
+url: https://www.pixiv.net/artworks/139007867
 ```
+
+第二条就是「作品已失效」的样子 —— 字段还在，但内容是 Pixiv 编造的占位值，
+靠 `status: unavailable` 区分。
 
 字段说明：
 
 | 字段 | 含义 |
 | --- | --- |
 | `type` | `illust` / `manga` / `ugoira` / `novel` |
-| `pages` | 插画的页数，小说的章节数 |
+| `pages` | 插画页数（仅插画；收藏接口不返回小说章节数） |
+| `width` / `height` | 原图尺寸（仅插画，可用于筛竖图/横图） |
 | `text_length` | 小说字数（仅小说） |
+| `language` | 小说语言，如 `zh-cn` / `ja`（仅小说） |
 | `x_restrict` | 0 全年龄 / 1 R-18 / 2 R-18G |
 | `private_bookmark` | 是否为非公开收藏 |
+| `status` | 只在作品已失效时出现，值为 `unavailable` |
 | `first_seen` | 本程序首次发现这条收藏的本地日期，不会随同步更新 |
 
 想按标签、作者、日期筛选，直接用 Unix 工具就行：
@@ -138,11 +158,29 @@ grep -B4 'tags:.*原创' data/bookmarks-illust.txt
 awk -F': ' '/^first_seen: 2026-11-17$/{print prev} {prev=$0}' data/bookmarks-illust.txt
 ```
 
-### 关于收藏数/点赞数
+### 已失效的作品会被标记出来
 
-`bookmark_count`、`like_count`、`view_count` 默认**不记录**。这些数字每天都在变，
-记进来会让每次全量同步产生几千行噪声 diff，把真正有价值的变更（新收藏、标题改动）
-淹没掉。真需要时加 `--stats`，或者配置 `includeVolatileStats: true`。
+收藏夹里有一部分作品后来被作者删除或转为不可见，Pixiv 仍会为它们占位，但返回的
+是编造的数据：标题和作者都成了 `-----`、`author_id: 0`、发布日期 `1970-01-01`、
+尺寸固定 100×100。实测一个 4859 条的收藏夹里有 297 条属于这种。
+
+程序会给这类记录加上 `status: unavailable`，其余字段保持接口原样（不编造）。想看看
+哪些收藏已经失效：
+
+```bash
+grep -B10 '^status: unavailable$' data/bookmarks-illust.txt | grep '^url:'
+```
+
+### 关于收藏数、点赞数、浏览数
+
+**不记录**，这是有意的，而且有两个理由：
+
+1. 插画侧的收藏接口根本不返回这些数字（小说侧只有 `bookmarkCount`，形状还不一致）。
+2. 就算拿得到，这些数每天都在变，记进来会让每次全量同步产生几千行噪声 diff，
+   把真正有价值的变更（新收藏、标题改动、作品失效）彻底淹掉。
+
+备份的意义是记录"我收藏了什么"，不是"它现在多少赞"。
+
 
 ## 配置项
 

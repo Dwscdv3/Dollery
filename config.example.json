@@ -17,7 +17,6 @@
   },
 
   "maxPagesPerRun": 0,
-  "includeVolatileStats": false,
 
   "output": {
     "illust": "data/bookmarks-illust.txt",

@@ -222,30 +222,54 @@ function extractTags(raw) {
 }
 
 /**
+ * 识别「作品已删除或已不可见」的哨兵记录。
+ *
+ * 实测发现 Pixiv 对这类作品仍然占位返回，但内容是编造的：
+ *   title: -----  author: -----  userId: 0  createDate: 1970-01-01  width/height: 100
+ * 一个真实账号的 4859 条收藏里有 297 条属于这种，占比不小。不打标记的话，
+ * 备份里会混进一堆看不出所以然的 "-----"，按作者统计时还会被 author_id=0 污染。
+ */
+function isUnavailable(raw) {
+  return String(raw.userId ?? '') === '0';
+}
+
+/**
  * 把接口原始对象归一化成内部记录。字段缺失时宁可为空，也不要编造。
+ *
+ * 注意：网页收藏接口的实际返回字段和「作品详情接口」并不一致 ——
+ *   · 没有 userAccount（账号 handle 拿不到，只有 userId 和显示名）
+ *   · 没有 bookmarkCount / likeCount / viewCount（插画侧完全不返回计数）
+ *   · 标题在 title 而非 illustTitle，日期在 createDate 而非 uploadDate
+ * 所以这里统一按收藏接口的真实形状取值，只保留稳定字段。
  */
 export function normalizeIllust(raw, bookmark, firstSeen) {
-  const id = String(raw.illustId ?? raw.id ?? bookmark?.id ?? '');
+  const id = String(raw.id ?? raw.illustId ?? bookmark?.id ?? '');
   if (!id) return null;
 
   return {
     id,
     type: ILLUST_TYPE_LABEL[raw.illustType] ?? 'illust',
-    title: raw.illustTitle ?? raw.title ?? '',
+    title: raw.title ?? raw.illustTitle ?? '',
     author: raw.userName ?? '',
     author_id: String(raw.userId ?? ''),
-    account: raw.userAccount ?? '',
-    published: raw.uploadDate ?? raw.createDate ?? '',
+    published: raw.createDate ?? raw.uploadDate ?? '',
     pages: raw.pageCount ?? '',
+    width: raw.width ?? '',
+    height: raw.height ?? '',
     tags: extractTags(raw.tags),
     x_restrict: raw.xRestrict ?? 0,
     ai_type: raw.aiType ?? '',
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
+    status: isUnavailable(raw) ? 'unavailable' : '',
     first_seen: firstSeen,
     url: `${ORIGIN}/artworks/${id}`,
   };
 }
 
+/**
+ * 小说侧的形状又不一样：有 textCount（字数）和 bookmarkCount，但没有 pageCount，
+ * 也没有 width/height。语言字段 language 对区分中/日/英文小说很有用。
+ */
 export function normalizeNovel(raw, bookmark, firstSeen) {
   const id = String(raw.id ?? bookmark?.id ?? '');
   if (!id) return null;
@@ -256,15 +280,14 @@ export function normalizeNovel(raw, bookmark, firstSeen) {
     title: raw.title ?? '',
     author: raw.userName ?? '',
     author_id: String(raw.userId ?? ''),
-    account: raw.userAccount ?? '',
-    published: raw.uploadDate ?? raw.createDate ?? '',
-    pages: raw.pageCount ?? '',
-    // 小说字数在不同接口里叫 textCount / textLength / characterCount，都试一遍。
-    text_length: raw.textCount ?? raw.textLength ?? raw.characterCount ?? '',
+    published: raw.createDate ?? raw.uploadDate ?? '',
+    text_length: raw.textCount ?? raw.wordCount ?? '',
+    language: raw.language ?? '',
     tags: extractTags(raw.tags),
     x_restrict: raw.xRestrict ?? 0,
     ai_type: raw.aiType ?? '',
     private_bookmark: bookmark?.private === true ? 'yes' : 'no',
+    status: isUnavailable(raw) ? 'unavailable' : '',
     first_seen: firstSeen,
     url: `${ORIGIN}/novel/show.php?id=${id}`,
   };
