@@ -31,8 +31,10 @@ const DEFAULT_CONFIG = {
   pageSize: { illust: 48, novel: 24 },
   maxPagesPerRun: 0,
   output: {
-    illust: 'data/bookmarks-illust.txt',
-    novel: 'data/bookmarks-novel.txt',
+    illustPublic: 'data/bookmarks-illust.txt',
+    illustPrivate: 'data/bookmarks-illust-private.txt',
+    novelPublic: 'data/bookmarks-novel.txt',
+    novelPrivate: 'data/bookmarks-novel-private.txt',
   },
   downloadImages: false,
   imagesDir: 'images',
@@ -82,7 +84,13 @@ async function loadConfig() {
     ...DEFAULT_CONFIG,
     ...raw,
     pageSize: { ...DEFAULT_CONFIG.pageSize, ...(raw.pageSize ?? {}) },
-    output: { ...DEFAULT_CONFIG.output, ...(raw.output ?? {}) },
+    // 兼容旧版配置：以前只有 illust / novel 两个输出路径，全部对应到公开收藏。
+    output: {
+      ...DEFAULT_CONFIG.output,
+      ...(raw.output?.illust ? { illustPublic: raw.output.illust } : {}),
+      ...(raw.output?.novel ? { novelPublic: raw.output.novel } : {}),
+      ...(raw.output ?? {}),
+    },
   };
 }
 
@@ -122,7 +130,9 @@ function printHelp() {
     '  --dry-run            只抓取并报告差异，不写入文件',
     '  --illust-only        只同步插画/漫画',
     '  --novel-only         只同步小说',
-    '  --max-pages N        本次每类最多抓 N 页',
+    '  --public-only        只同步公开收藏',
+    '  --private-only       只同步私密收藏',
+    '  --max-pages N        本次每条通道最多抓 N 页',
     '  --interval MS        覆盖请求间隔（默认 2000，不建议低于 2000）',
     '  --download           下载作品图片（尚未实现，仅占位）',
     '',
@@ -178,6 +188,61 @@ async function buildClient(config, flags) {
   return { client, limiter, intervalMs };
 }
 
+/**
+ * 待同步的通道列表。
+ *
+ * 公开和私密是服务端两个独立的收藏列表（rest=show / rest=hide），各有自己的
+ * 总数和分页，只能分别翻页、分别落盘。所以「插画」实际上对应两条通道。
+ */
+function buildChannels(config, flags) {
+  const wantIllust = !flags['novel-only'];
+  const wantNovel = config.includeNovels && !flags['illust-only'];
+  const wantPublic = !flags['private-only'];
+  const wantPrivate = !flags['public-only'];
+
+  const channels = [];
+
+  if (wantIllust) {
+    if (wantPublic) {
+      channels.push({
+        kind: 'illust',
+        visibility: 'public',
+        label: '插画/漫画·公开',
+        file: config.output.illustPublic,
+      });
+    }
+    if (wantPrivate) {
+      channels.push({
+        kind: 'illust',
+        visibility: 'private',
+        label: '插画/漫画·私密',
+        file: config.output.illustPrivate,
+      });
+    }
+  }
+
+  if (wantNovel) {
+    if (wantPublic) {
+      channels.push({
+        kind: 'novel',
+        visibility: 'public',
+        label: '小说·公开',
+        file: config.output.novelPublic,
+      });
+    }
+    if (wantPrivate) {
+      channels.push({
+        kind: 'novel',
+        visibility: 'private',
+        label: '小说·私密',
+        file: config.output.novelPrivate,
+      });
+    }
+  }
+
+  return channels.filter((channel) => Boolean(channel.file));
+}
+
 function printProgress(event) {
   const eta =
     event.serverTotal > 0
@@ -201,8 +266,11 @@ function printSummary(result) {
   if (result.unavailableCount > 0) {
     out.push(`  其中已失效     : ${result.unavailableCount} 条（作品被删除或转为不可见，已标记 status: unavailable）`);
   }
+  if (result.removedCount > 0) {
+    out.push(`  累计已移除     : ${result.removedCount} 条（记录保留在文件里，标记 removed: yes）`);
+  }
   out.push(
-    `  新增 ${result.added.length} 条 · 取消 ${result.removed.length} 条 · 字段变更 ${result.changed.length} 条`,
+    `  新增 ${result.added.length} 条 · 本次标记移除 ${result.removed.length} 条 · 字段变更 ${result.changed.length} 条`,
   );
 
   if (result.added.length > 0) {
@@ -214,7 +282,7 @@ function printSummary(result) {
   }
 
   if (result.removed.length > 0) {
-    out.push('  已取消收藏:');
+    out.push('  本次新标记为已移除:');
     for (const record of result.removed.slice(0, 8)) {
       out.push(`    - ${record.id} 《${record.title || '(无题)'}》`);
     }
@@ -250,30 +318,27 @@ async function commandSync(flags) {
   const userId = await client.resolveUserId();
   console.log(`账号 userId: ${userId}\n`);
 
-  const kinds = [];
-  if (!flags['novel-only']) {
-    kinds.push({ kind: 'illust', label: '插画/漫画', file: config.output.illust });
-  }
-  if (config.includeNovels && !flags['illust-only']) {
-    kinds.push({ kind: 'novel', label: '小说', file: config.output.novel });
-  }
+  const channels = buildChannels(config, flags);
 
-  if (kinds.length === 0) {
+  if (channels.length === 0) {
     console.log('没有需要同步的收藏类型。');
     return 0;
   }
 
+  // 先算一遍总页数，好在开始前就把预计耗时告诉用户 —— 四条通道加起来可能要十几分钟。
+  console.log('');
+
   const results = [];
-  for (const entry of kinds) {
+  for (const entry of channels) {
     const result = await syncKind(client, {
       kind: entry.kind,
+      visibility: entry.visibility,
       label: entry.label,
       filePath: path.resolve(PROJECT_ROOT, entry.file),
       limit: Number(config.pageSize[entry.kind] ?? (entry.kind === 'novel' ? 24 : 48)),
       full,
       dryRun,
       maxPages: Number(flags['max-pages'] ?? config.maxPagesPerRun ?? 0),
-      includePrivate: Boolean(config.includePrivateBookmarks),
       onProgress: printProgress,
     });
     results.push(result);
@@ -300,43 +365,57 @@ async function commandSync(flags) {
 
 async function commandStatus() {
   const config = await loadConfig();
-  const entries = [
-    { label: '插画/漫画', file: config.output.illust },
-    { label: '小说', file: config.output.novel },
-  ];
+  const channels = buildChannels(config, {});
 
   console.log('本地备份概况\n');
-  let total = 0;
+  let grandTotal = 0;
 
-  for (const entry of entries) {
+  for (const entry of channels) {
     const absolute = path.resolve(PROJECT_ROOT, entry.file);
     const records = await readRecords(absolute);
-    total += records.length;
+    grandTotal += records.length;
 
-    let statLine = '';
+    const removedCount = records.filter((r) => r.removed).length;
+    const unavailableCount = records.filter((r) => r.status === 'unavailable').length;
+
+    console.log(`── ${entry.label} ──`);
+    console.log(
+      `  记录数: ${records.length}（在册 ${records.length - removedCount}，已移除 ${removedCount}）`,
+    );
+    if (unavailableCount > 0) console.log(`  其中作品已失效: ${unavailableCount}`);
+
+    let statLine;
     try {
       const stat = await fs.stat(absolute);
       statLine = `  文件: ${relativeToRoot(absolute)}（${(stat.size / 1024).toFixed(1)} KB，更新于 ${stat.mtime.toLocaleString()}）`;
     } catch {
       statLine = '  文件: 尚未生成';
     }
-
-    console.log(`── ${entry.label} ──`);
-    console.log(`  记录数: ${records.length}`);
     console.log(statLine);
 
-    if (records.length > 0) {
-      const newest = records.reduce((a, b) => (Number(a.id) > Number(b.id) ? a : b));
-      console.log(`  最新作品: ${newest.id} 《${newest.title || '(无题)'}》`);
-      const seenDates = records.map((r) => r.first_seen).filter(Boolean).sort();
-      if (seenDates.length > 0) {
-        console.log(`  记录跨度: ${seenDates[0]} ~ ${seenDates[seenDates.length - 1]}`);
+    const withSeq = records.filter((r) => Number(r.seq) > 0);
+    if (withSeq.length > 0) {
+      let min = Infinity;
+      let max = 0;
+      let oldest = withSeq[0];
+      for (const record of withSeq) {
+        const seq = Number(record.seq);
+        if (seq < min) min = seq;
+        if (seq > max) max = seq;
+        if (seq < Number(oldest.seq)) oldest = record;
       }
+      console.log(`  收藏序号: ${min} ~ ${max}（共 ${withSeq.length} 条有序号）`);
+      console.log(`  最早收藏: #${oldest.seq} ${oldest.id} 《${oldest.title || '(无题)'}》`);
+    }
+
+    const seenDates = records.map((r) => r.first_seen).filter(Boolean).sort();
+    if (seenDates.length > 0) {
+      console.log(`  记录跨度: ${seenDates[0]} ~ ${seenDates[seenDates.length - 1]}`);
     }
     console.log('');
   }
 
-  console.log(`合计 ${total} 条记录。`);
+  console.log(`合计 ${grandTotal} 条记录。`);
   return 0;
 }
 
@@ -349,11 +428,11 @@ async function commandCheck(flags) {
   const userId = await client.resolveUserId();
   console.log(`2. 代理与 cookie 可用，账号 userId = ${userId}`);
 
-  const page = await client.fetchBookmarkPage('illust', 0, {
-    limit: 1,
-    includePrivate: Boolean(config.includePrivateBookmarks),
-  });
-  console.log(`3. 收藏接口可达，服务端插画收藏总数 = ${page.total}`);
+  const publicPage = await client.fetchBookmarkPage('illust', 0, { limit: 1, visibility: 'public' });
+  const privatePage = await client.fetchBookmarkPage('illust', 0, { limit: 1, visibility: 'private' });
+  console.log(
+    `3. 收藏接口可达：插画公开 ${publicPage.total} 条，插画私密 ${privatePage.total} 条`,
+  );
 
   console.log('\n一切就绪，可以运行 npm run sync。');
   return 0;

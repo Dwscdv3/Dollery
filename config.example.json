@@ -9,7 +9,6 @@
   "userId": "",
 
   "includeNovels": true,
-  "includePrivateBookmarks": true,
 
   "pageSize": {
     "illust": 48,
@@ -19,8 +18,10 @@
   "maxPagesPerRun": 0,
 
   "output": {
-    "illust": "data/bookmarks-illust.txt",
-    "novel": "data/bookmarks-novel.txt"
+    "illustPublic": "data/bookmarks-illust.txt",
+    "illustPrivate": "data/bookmarks-illust-private.txt",
+    "novelPublic": "data/bookmarks-novel.txt",
+    "novelPrivate": "data/bookmarks-novel-private.txt"
   },
 
   "downloadImages": false,

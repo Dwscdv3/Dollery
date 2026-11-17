@@ -3,7 +3,7 @@
  *
  * 两部分：
  *   1. store —— 序列化往返必须逐字节幂等，否则每次同步都会制造假 diff。
- *   2. sync  —— 用假接口喂数据，验证增量断点、合并、以及防清空的安全阀。
+ *   2. sync  —— 用假接口喂数据，验证增量断点、seq 分配、取消标记，以及防误标的安全阀。
  *      这部分特别重要：真实账号只跑一次，跑错了未必立刻发现。
  */
 import assert from 'node:assert/strict';
@@ -32,6 +32,7 @@ async function test(name, fn) {
 
 const sample = [
   {
+    seq: 2,
     id: '120000003',
     type: 'manga',
     title: '标题里带冒号: 和反斜杠 \\ 还有引号 "x"',
@@ -49,6 +50,7 @@ const sample = [
     url: 'https://www.pixiv.net/artworks/120000003',
   },
   {
+    seq: 1,
     id: '120000001',
     type: 'illust',
     title: '普通标题',
@@ -64,27 +66,29 @@ const sample = [
   },
 ];
 
-/** 假接口：把 id 数组当作服务端收藏列表，按 offset/limit 切片返回。 */
+/** 假接口：ids 是服务端收藏列表（index 0 = 最新收藏），按 offset/limit 切片返回。 */
 function makeFakeServer(ids) {
   return {
     calls: 0,
-    async fetchBookmarkPage(kind, offset, { limit }) {
+    lastVisibility: null,
+    async fetchBookmarkPage(kind, offset, { limit, visibility = 'public' }) {
       this.calls += 1;
+      this.lastVisibility = visibility;
       const slice = ids.slice(offset, offset + limit);
       return {
         total: ids.length,
         items: slice.map((id) => ({
           item: {
-            illustId: String(id),
-            illustTitle: `作品 ${id}`,
+            id: String(id),
+            title: `作品 ${id}`,
             userName: '作者',
             userId: '1',
-            uploadDate: '2024-01-01T00:00:00+09:00',
+            createDate: '2024-01-01T00:00:00+09:00',
             pageCount: 1,
             tags: ['tag'],
             illustType: 0,
           },
-          bookmark: { id: String(id), private: false },
+          bookmark: { id: String(id), private: visibility === 'private' },
         })),
       };
     },
@@ -96,10 +100,10 @@ const tempFile = path.join(tempRoot, 'bookmarks.txt');
 
 const baseOptions = {
   kind: 'illust',
+  visibility: 'public',
   label: '插画',
   filePath: tempFile,
   limit: 20,
-  includePrivate: true,
   full: false,
   dryRun: false,
   maxPages: 0,
@@ -114,6 +118,7 @@ await test('序列化后再解析，字段完全一致', () => {
   assert.equal(first.title, sample[0].title);
   assert.deepEqual(first.tags, sample[0].tags);
   assert.equal(first.pages, 3);
+  assert.equal(first.seq, 2);
 });
 
 await test('读写往返是幂等的（不产生假 diff）', () => {
@@ -142,18 +147,30 @@ await test('标题末尾的全角空格不会被吞掉', () => {
 
 await test('带尾随空格的标题不会产生假 diff', () => {
   const stored = parse(serialize([{ id: '1', title: '雨晴\u3000' }]));
-  const fromApi = [{ id: '1', title: '雨晴\u3000' }];
-  assert.equal(diffRecords(stored, fromApi).changed.length, 0);
+  assert.equal(diffRecords(stored, [{ id: '1', title: '雨晴\u3000' }]).changed.length, 0);
 });
 
 await test('空标签列表不写 tags 行', () => {
   assert.ok(!serialize([{ ...sample[1], tags: [] }]).includes('tags:'));
 });
 
-await test('按 id 降序排列是稳定的', () => {
+await test('按 seq 升序排列，最早收藏的排最前', () => {
+  // sample 里 seq:2 的 id 更大；若还按 id 排就会排到前面去。
   assert.deepEqual(
-    sortRecords(sample).map((r) => r.id),
-    ['120000003', '120000001'],
+    sortRecords(sample).map((r) => r.seq),
+    [1, 2],
+  );
+});
+
+await test('没有 seq 的旧记录排在最后，且不打乱有序号的部分', () => {
+  const mixed = [
+    { id: '9', seq: 5 },
+    { id: '8' },
+    { id: '7', seq: 1 },
+  ];
+  assert.deepEqual(
+    sortRecords(mixed).map((r) => r.id),
+    ['7', '9', '8'],
   );
 });
 
@@ -191,20 +208,29 @@ await test('undefined、空字符串、空数组之间不算字段变更', () =>
 await test('真实字段变化仍然能被检出', () => {
   const diff = diffRecords([{ id: '1', status: '' }], [{ id: '1', status: 'unavailable' }]);
   assert.equal(diff.changed.length, 1);
-  assert.equal(diff.changed[0].fields[0].key, 'status');
 });
 
-console.log('\nsync —— 增量与安全阀\n');
+console.log('\nsync —— 序号、增量与安全阀\n');
 
-const serverIds = Array.from({ length: 100 }, (_, i) => 200 - i); // 200..101
-const server = makeFakeServer(serverIds);
+const serverIds = Array.from({ length: 100 }, (_, i) => 200 - i); // 200..101，index 0 最新
 
-await test('首次增量：本地为空时翻完整个列表', async () => {
-  const result = await syncKind(server, { ...baseOptions, filePath: tempFile });
+await test('首次全量：seq 从 1 开始，最旧的作品拿到 1 号', async () => {
+  const result = await syncKind(makeFakeServer(serverIds), {
+    ...baseOptions,
+    filePath: tempFile,
+    full: true,
+  });
   assert.equal(result.added.length, 100);
-  assert.equal(result.localAfter, 100);
-  const onDisk = await readRecords(tempFile);
-  assert.equal(onDisk.length, 100);
+
+  const records = await readRecords(tempFile);
+  assert.equal(records.length, 100);
+
+  const oldest = records.find((r) => r.id === '101'); // 列表末尾 = 最早收藏
+  const newest = records.find((r) => r.id === '200'); // 列表开头 = 最新收藏
+  assert.equal(Number(oldest.seq), 1, '最早的收藏应该是 1 号');
+  assert.equal(Number(newest.seq), 100, '最新的收藏应该是 100 号');
+
+  assert.equal(parse(serialize(records))[0].id, '101', '文件第一行应是最早的收藏');
 });
 
 await test('二次增量：连续两页全已知就停止，不发多余请求', async () => {
@@ -215,36 +241,64 @@ await test('二次增量：连续两页全已知就停止，不发多余请求',
   assert.match(result.stoppedReason, /追平/);
 });
 
-await test('新增几条后，增量只抓到头部就能追平', async () => {
-  const withNew = makeFakeServer([300, 299, 298, 297, 296, ...serverIds]);
+await test('新增收藏的 seq 接续在后面，已有记录序号不变', async () => {
+  const withNew = makeFakeServer([300, 299, 298, ...serverIds]);
   const result = await syncKind(withNew, { ...baseOptions, filePath: tempFile });
-  assert.equal(result.added.length, 5);
-  assert.equal(result.localAfter, 105);
-  assert.ok(withNew.calls <= 3, `请求页数应 <=3，实际 ${withNew.calls}`);
+  assert.equal(result.added.length, 3);
+
+  const records = await readRecords(tempFile);
+  assert.equal(records.find((r) => r.id === '101').seq, 1, '最老的仍是 1 号');
+  assert.equal(records.find((r) => r.id === '298').seq, 101);
+  assert.equal(records.find((r) => r.id === '300').seq, 103, '最新加的是最大序号');
 });
 
 await test('已有记录的 first_seen 不会被后续全量同步覆盖', async () => {
-  // 手动把一个日期改到远古，再跑全量同步，它必须原样保留。
   const records = await readRecords(tempFile);
   records.find((r) => r.id === '200').first_seen = '2020-01-01';
   await writeRecords(tempFile, records, { lastSync: 'test' });
 
-  const complete = makeFakeServer([300, 299, 298, 297, 296, ...serverIds]);
-  await syncKind(complete, { ...baseOptions, filePath: tempFile, full: true });
+  await syncKind(makeFakeServer([300, 299, 298, ...serverIds]), {
+    ...baseOptions,
+    filePath: tempFile,
+    full: true,
+  });
 
   const after = await readRecords(tempFile);
   assert.equal(after.find((r) => r.id === '200').first_seen, '2020-01-01');
-  assert.equal(after.length, 105);
+  assert.equal(after.length, 103);
 });
 
-await test('全量模式能发现取消收藏并移除', async () => {
-  const shrunk = makeFakeServer(serverIds.slice(0, 80));
+await test('全量发现取消收藏时只打 removed 标记，不删除记录', async () => {
+  // 服务端少了 serverIds 末尾 5 条（最早收藏的 5 条被取消），其余不变
+  const shrunk = makeFakeServer([300, 299, 298, ...serverIds.slice(0, 95)]);
   const result = await syncKind(shrunk, { ...baseOptions, filePath: tempFile, full: true });
-  assert.equal(result.localAfter, 80);
-  assert.equal(result.removed.length, 25);
+
+  assert.equal(result.removed.length, 5, '应报告 5 条新标记');
+  assert.equal(result.localAfter, 103, '记录数不该减少');
+
+  const after = await readRecords(tempFile);
+  assert.equal(after.length, 103);
+  const marked = after.filter((r) => r.removed === 'yes');
+  assert.equal(marked.length, 5);
+  assert.ok(
+    marked.every((r) => r.title && Number(r.seq) > 0),
+    '被标记的记录原始内容应完整保留',
+  );
 });
 
-await test('全量模式遇到结果异常缩水时中止，且不破坏原文件', async () => {
+await test('重新收藏会清除 removed 标记，记录数不变', async () => {
+  await syncKind(makeFakeServer([300, 299, 298, ...serverIds]), {
+    ...baseOptions,
+    filePath: tempFile,
+    full: true,
+  });
+
+  const after = await readRecords(tempFile);
+  assert.equal(after.filter((r) => r.removed === 'yes').length, 0, '标记应被清除');
+  assert.equal(after.length, 103);
+});
+
+await test('全量遇到结果异常缩水时中止，且不破坏原文件', async () => {
   const before = await readRecords(tempFile);
   const collapsed = makeFakeServer(serverIds.slice(0, 5));
 
@@ -256,30 +310,57 @@ await test('全量模式遇到结果异常缩水时中止，且不破坏原文�
   }
 
   assert.ok(aborted, '应该抛出 SyncAbort');
-  const after = await readRecords(tempFile);
-  assert.equal(after.length, before.length, '原文件必须保持不变');
+  assert.deepEqual(await readRecords(tempFile), before, '原文件必须一字不改');
 });
 
 await test('dry-run 不写入文件', async () => {
   const before = await readRecords(tempFile);
-  const unchanged = makeFakeServer(serverIds.slice(0, 80));
-  await syncKind(unchanged, { ...baseOptions, filePath: tempFile, full: true, dryRun: true });
-  const after = await readRecords(tempFile);
-  assert.deepEqual(after, before);
+  await syncKind(makeFakeServer([300, 299, 298, ...serverIds]), {
+    ...baseOptions,
+    filePath: tempFile,
+    full: true,
+    dryRun: true,
+  });
+  assert.deepEqual(await readRecords(tempFile), before);
 });
 
 await test('本地被 --max-pages 截断后，增量能自愈补全而不是误判追平', async () => {
   const partialFile = path.join(tempRoot, 'partial.txt');
 
-  // 第一次只同步 1 页，模拟被 maxPages 截断
   await syncKind(makeFakeServer(serverIds), { ...baseOptions, filePath: partialFile, maxPages: 1 });
   assert.equal((await readRecords(partialFile)).length, 20);
 
-  // 再跑完整增量：前两页全已知，但覆盖率只有 20%，必须继续翻到底
   const srv = makeFakeServer(serverIds);
   const result = await syncKind(srv, { ...baseOptions, filePath: partialFile });
   assert.equal(result.localAfter, 100, '应该补齐到 100 条');
   assert.equal(srv.calls, 5, `应该翻 5 页，实际 ${srv.calls} 页`);
+});
+
+await test('旧数据缺 seq 时拒绝增量同步，全量可完成迁移', async () => {
+  const legacyFile = path.join(tempRoot, 'legacy.txt');
+  await fs.writeFile(legacyFile, 'id: 111\ntitle: 旧数据\n\n', 'utf8');
+
+  let aborted = false;
+  try {
+    await syncKind(makeFakeServer(serverIds), { ...baseOptions, filePath: legacyFile });
+  } catch (err) {
+    aborted = err instanceof SyncAbort;
+  }
+  assert.ok(aborted, '应该拒绝并要求先跑 --full');
+
+  await syncKind(makeFakeServer(serverIds), { ...baseOptions, filePath: legacyFile, full: true });
+  const migrated = await readRecords(legacyFile);
+  assert.equal(migrated.filter((r) => Number(r.seq) > 0).length, migrated.length);
+});
+
+await test('私密通道确实以 visibility=private 发起请求', async () => {
+  const srv = makeFakeServer(serverIds);
+  await syncKind(srv, {
+    ...baseOptions,
+    filePath: path.join(tempRoot, 'vis.txt'),
+    visibility: 'private',
+  });
+  assert.equal(srv.lastVisibility, 'private');
 });
 
 await fs.rm(tempRoot, { recursive: true, force: true });

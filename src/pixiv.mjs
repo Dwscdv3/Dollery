@@ -168,13 +168,18 @@ export class PixivClient {
   }
 
   /**
-   * 拉一页收藏。kind = 'illust' | 'novel'。
+   * 拉一页收藏。kind = 'illust' | 'novel'，visibility = 'public' | 'private'。
+   *
+   * rest 参数的语义极易搞反，这里记下实测结论（2026-11 验证）：
+   *   rest=show → 只返回公开收藏，bookmarkData.private 全为 false
+   *   rest=hide → 只返回私密收藏，bookmarkData.private 全为 true
+   * 也就是说 rest 表达的是「这条收藏是否对他人可见」。两者是**互斥的两个列表**，
+   * 各自有独立的 total，必须分别翻页，不存在「show 能一次拿全」的捷径。
    */
-  async fetchBookmarkPage(kind, offset, { limit, includePrivate = true } = {}) {
+  async fetchBookmarkPage(kind, offset, { limit, visibility = 'public' } = {}) {
     const segment = kind === 'novel' ? 'novels' : 'illusts';
     const uid = await this.resolveUserId();
-    // rest=show 返回全部（含非公开），rest=hide 只返回公开收藏。
-    const rest = includePrivate ? 'show' : 'hide';
+    const rest = visibility === 'private' ? 'hide' : 'show';
     const body = await this.ajax(`/ajax/user/${uid}/${segment}/bookmarks`, {
       tag: '',
       offset,

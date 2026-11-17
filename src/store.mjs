@@ -23,6 +23,7 @@ import path from 'node:path';
  * 有价值的变更（新增收藏、标题改动）淹掉。何况插画侧的收藏接口根本不返回这些数。
  */
 export const FIELD_ORDER = [
+  'seq',
   'id',
   'type',
   'title',
@@ -39,6 +40,7 @@ export const FIELD_ORDER = [
   'ai_type',
   'private_bookmark',
   'status',
+  'removed',
   'first_seen',
   'url',
 ];
@@ -145,7 +147,9 @@ export function serialize(records, meta = {}) {
   lines.push(`${HEADER_PREFIX} pixiv-export 收藏元数据备份`);
   lines.push(`${HEADER_PREFIX} 格式：每条记录为多行 key: value，记录之间用空行分隔`);
   lines.push(`${HEADER_PREFIX} 由程序自动生成，手工编辑会在下次同步时被覆盖`);
-  lines.push(`${HEADER_PREFIX} 按作品 id 降序排列；first_seen 表示本程序首次发现该收藏的日期`);
+  lines.push(`${HEADER_PREFIX} 按 seq 升序排列，seq=1 是最早收藏的作品`);
+  lines.push(`${HEADER_PREFIX} first_seen 表示本程序首次发现该收藏的日期`);
+  lines.push(`${HEADER_PREFIX} removed: yes 表示该作品已不在收藏夹中，记录仅为留存历史`);
   lines.push(`${HEADER_PREFIX} 记录数: ${records.length}`);
 
   if (meta.kindLabel) lines.push(`${HEADER_PREFIX} 类型: ${meta.kindLabel}`);
@@ -212,7 +216,7 @@ export function parse(text) {
 
   // 数字类字段还原成数字，方便后续比较和展示。
   for (const record of records) {
-    for (const key of ['pages', 'width', 'height', 'text_length', 'x_restrict', 'ai_type']) {
+    for (const key of ['seq', 'pages', 'width', 'height', 'text_length', 'x_restrict', 'ai_type']) {
       if (record[key] === undefined || record[key] === '') continue;
       const num = Number(record[key]);
       if (!Number.isNaN(num)) record[key] = num;
@@ -222,11 +226,25 @@ export function parse(text) {
   return records;
 }
 
+/**
+ * 按收藏顺序排列：seq 升序，最早收藏的排在最前面。
+ *
+ * seq 是「收藏顺序号」，不是作品 id。它一经分配就不再重排 —— 哪怕中间取消了收藏
+ * 也不会让后面的记录往前挪，否则取消一条就会导致几千行一起位移，diff 彻底失效。
+ * 取消只留空洞，靠 removed 字段标记。
+ *
+ * 没有 seq 的记录（首次迁移前的旧数据）排在最后；两者都没有时退化为 id 降序，
+ * 保证输出结果稳定可复现。
+ */
 export function sortRecords(records) {
   return [...records].sort((a, b) => {
-    const ida = Number(a.id);
-    const idb = Number(b.id);
-    if (Number.isFinite(ida) && Number.isFinite(idb) && ida !== idb) return idb - ida;
+    const seqA = Number(a.seq);
+    const seqB = Number(b.seq);
+    const hasA = Number.isFinite(seqA) && seqA > 0;
+    const hasB = Number.isFinite(seqB) && seqB > 0;
+
+    if (hasA && hasB && seqA !== seqB) return seqA - seqB;
+    if (hasA !== hasB) return hasA ? -1 : 1;
     return String(b.id).localeCompare(String(a.id));
   });
 }
