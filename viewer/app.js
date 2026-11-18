@@ -392,6 +392,13 @@ function createCard(record) {
   return card;
 }
 
+/** 叠纸图标：多图作品的页数角标用，跟 pixiv 网页端一个意思 */
+const PAGES_ICON =
+  '<svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">' +
+  '<rect x="2.5" y="1.5" width="8" height="10" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".8"/>' +
+  '<rect x="5.5" y="4.5" width="8" height="10" rx="1.2" fill="#000" fill-opacity=".6" stroke="currentColor" stroke-width="1.3"/>' +
+  '</svg>';
+
 function renderCardInner(card, record) {
   const firstPage = record.localPages?.[0] ?? 0;
   const isNovel = record.type === 'novel';
@@ -402,6 +409,14 @@ function renderCardInner(card, record) {
   else if (record.status === 'unavailable') badge = '<span class="badge warn">已失效</span>';
   else if (record.localUgoira) badge = '<span class="badge">动图</span>';
   else if (isNovel) badge = '<span class="badge">小说</span>';
+
+  // 多图作品在右上角标页数（和 pixiv 网页端一样）。动图的 pages 是帧数，
+  // 小说的是 1，都不该显示这个角标。
+  const totalPages = Number(record.pages) || 1;
+  const pageBadge =
+    !isNovel && record.type !== 'ugoira' && totalPages > 1
+      ? `<span class="badge pages" title="共 ${totalPages} 页">${PAGES_ICON}<b>${totalPages}</b></span>`
+      : '';
 
   let frame;
   if (record.hasImage && downloadable) {
@@ -446,7 +461,7 @@ function renderCardInner(card, record) {
       : '';
 
   card.innerHTML = `
-    <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${spinner}</div>
+    <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${pageBadge}${spinner}</div>
     <div class="info">
       <div class="title">${escapeHtml(record.title || '(无题)')}</div>
       <div class="sub"><span class="author-name">${escapeHtml(record.author || '未知')}</span></div>

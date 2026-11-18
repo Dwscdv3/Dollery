@@ -555,6 +555,20 @@ body {
 .card .badge.warn { background: rgba(224, 164, 88, .92); color: #241a08; }
 .card .badge.danger { background: rgba(224, 108, 117, .92); color: #2a0d10; }
 
+/* 多图作品的页数角标：右上角，叠纸图标 + 数字，跟 pixiv 网页端一个位置 */
+.card .badge.pages {
+  left: auto;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(0, 0, 0, .62);
+  font-variant-numeric: tabular-nums;
+}
+
+.card .badge.pages b { font-weight: 500; }
+.card .badge.pages svg { display: block; }
+
 /* 这两个都盖在图片上，文字要能压住画面的细节 */
 .card .badge, .card .spinner { text-shadow: var(--text-shadow-on-image); }
 
