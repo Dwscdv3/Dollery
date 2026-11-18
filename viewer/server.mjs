@@ -21,6 +21,7 @@ import { readDocument } from '../src/store.mjs';
 import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
 import { RateLimiter } from '../src/http.mjs';
+import { compileQuery, matches as matchQuery } from './query.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IMAGES_DIR = path.join(ROOT, 'images');
@@ -548,6 +549,37 @@ function searchParams(url) {
   return new URL(url, 'http://127.0.0.1').searchParams;
 }
 
+/** 确定性 PRNG，用于「随机排序」——同一个种子必须每次洗出同样的顺序，否则翻页会重复。 */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seededShuffle(list, seed) {
+  const rand = mulberry32(seed);
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/**
+ * 排序。id 是收藏序号，升序 = 最早收藏在前。
+ * 随机排序必须带种子，否则分页请求之间顺序会变，出现重复和漏项。
+ */
+function orderRecords(list, sort, seed) {
+  if (sort === 'desc') return list.slice().sort((a, b) => Number(b.id) - Number(a.id));
+  if (sort === 'random') return seededShuffle(list, seed);
+  return list.slice().sort((a, b) => Number(a.id) - Number(b.id));
+}
+
 function decorate(record) {
   const entry = state.imageIndex.get(String(record.pid));
   const pages = entry ? [...entry.pages].sort((a, b) => a - b) : [];
@@ -557,14 +589,18 @@ function decorate(record) {
     type: record.type,
     title: record.title ?? '',
     author: record.author ?? '',
+    author_id: record.author_id ?? '',
+    published: record.published ?? '',
     pages: record.pages ?? '',
     width: record.width ?? '',
     height: record.height ?? '',
     x_restrict: record.x_restrict ?? 0,
+    ai_type: record.ai_type ?? 0,
     tags: record.tags ?? [],
     bookmark_tags: record.bookmark_tags ?? [],
     status: record.status ?? '',
     removed: record.removed ?? '',
+    url: record.url ?? '',
     source: record.source,
     hasImage: pages.length > 0 || Boolean(entry?.ugoira),
     localPages: pages,
@@ -577,29 +613,30 @@ function decorate(record) {
 async function handleApi(req, res, url) {
   const params = searchParams(url);
 
-  // 列表：支持按来源、关键词、标签筛选
+  // 列表：支持按来源、布尔查询、标签、作者、缺图筛选，以及三种排序
   if (url.startsWith('/api/records')) {
     const source = params.get('source') ?? 'illustPublic';
-    const query = (params.get('q') ?? '').trim().toLowerCase();
+    const queryText = (params.get('q') ?? '').trim();
     const tag = (params.get('tag') ?? '').trim();
+    const authorId = (params.get('author_id') ?? '').trim();
     const missingOnly = params.get('missing') === '1';
     const showRemoved = params.get('removed') === '1';
+    const sort = params.get('sort') ?? 'asc';
+    const seed = Number(params.get('seed') ?? 1) || 1;
     const offset = Number(params.get('offset') ?? 0);
     const limit = Math.min(Number(params.get('limit') ?? 120), 500);
 
     let list = state.records.filter((r) => r.source === source);
     if (!showRemoved) list = list.filter((r) => r.removed !== 'yes');
-    if (query) {
-      list = list.filter(
-        (r) =>
-          String(r.title ?? '').toLowerCase().includes(query) ||
-          String(r.author ?? '').toLowerCase().includes(query) ||
-          String(r.pid ?? '').includes(query),
-      );
+
+    if (queryText) {
+      const ast = compileQuery(queryText);
+      if (ast) list = list.filter((r) => matchQuery(ast, r));
     }
-    if (tag) {
-      list = list.filter((r) => (r.bookmark_tags ?? []).includes(tag));
-    }
+
+    if (tag) list = list.filter((r) => (r.bookmark_tags ?? []).includes(tag));
+    if (authorId) list = list.filter((r) => String(r.author_id ?? '') === authorId);
+
     if (missingOnly) {
       list = list.filter((r) => {
         const entry = state.imageIndex.get(String(r.pid));
@@ -607,9 +644,43 @@ async function handleApi(req, res, url) {
       });
     }
 
+    list = orderRecords(list, sort, seed);
+
     const total = list.length;
     const page = list.slice(offset, offset + limit).map(decorate);
     return sendJson(res, 200, { total, offset, limit, items: page });
+  }
+
+  // 作者聚合：默认按收藏作品数降序
+  if (url.startsWith('/api/authors')) {
+    const source = params.get('source');
+    const queryText = (params.get('q') ?? '').trim();
+    const ast = queryText ? compileQuery(queryText) : null;
+
+    const map = new Map();
+
+    for (const record of state.records) {
+      if (source && record.source !== source) continue;
+      if (record.removed === 'yes') continue;
+      if (ast && !matchQuery(ast, record)) continue;
+      if (record.status === 'unavailable') continue;
+
+      const key = String(record.author_id || record.author || '未知');
+      let entry = map.get(key);
+      if (!entry) {
+        entry = { author_id: key, name: record.author || '未知', count: 0, done: 0, sources: new Set() };
+        map.set(key, entry);
+      }
+      entry.count += 1;
+      entry.sources.add(record.source);
+      if (state.imageIndex.has(String(record.pid))) entry.done += 1;
+    }
+
+    const authors = [...map.values()]
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+      .map((item) => ({ ...item, sources: [...item.sources] }));
+
+    return sendJson(res, 200, { total: authors.length, authors });
   }
 
   if (url.startsWith('/api/state')) {

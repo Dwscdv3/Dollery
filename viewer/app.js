@@ -16,6 +16,9 @@ const state = {
   loading: false,
   tag: '',
   query: '',
+  sort: 'asc',
+  seed: Math.floor(Math.random() * 1e9), // 随机排序的种子，翻页时保持不变
+  authorId: '',
   missingOnly: false,
   showRemoved: false,
   observer: null,
@@ -28,6 +31,7 @@ const els = {
   tabs: document.getElementById('tabs'),
   search: document.getElementById('search'),
   tagFilter: document.getElementById('tagFilter'),
+  sortMode: document.getElementById('sortMode'),
   missingOnly: document.getElementById('missingOnly'),
   showRemoved: document.getElementById('showRemoved'),
   autoDownload: document.getElementById('autoDownload'),
@@ -40,6 +44,8 @@ const els = {
   lightbox: document.getElementById('lightbox'),
   lbStage: document.getElementById('lbStage'),
   lbImage: document.getElementById('lbImage'),
+  lbPages: document.getElementById('lbPages'),
+  lbPanel: document.getElementById('lbPanel'),
   lbTitle: document.getElementById('lbTitle'),
   lbMeta: document.getElementById('lbMeta'),
   lbZoom: document.getElementById('lbZoom'),
@@ -93,10 +99,33 @@ async function loadState() {
   const data = await api('/api/state');
   state.sources = data.sources;
 
+  const params = new URLSearchParams(location.search);
+
   // 支持 ?source=illustPrivate 直达某个收藏夹
-  const fromUrl = new URLSearchParams(location.search).get('source');
+  const fromUrl = params.get('source');
   if (fromUrl && data.sources.some((s) => s.key === fromUrl)) {
     state.current = fromUrl;
+  }
+
+  // 支持 ?q=... 直接带查询（含布尔语法）进来
+  const qParam = params.get('q');
+  if (qParam) {
+    state.query = qParam;
+    els.search.value = qParam;
+  }
+
+  // 支持 ?sort=random 等
+  const sortParam = params.get('sort');
+  if (sortParam && ['asc', 'desc', 'random'].includes(sortParam)) {
+    state.sort = sortParam;
+    els.sortMode.value = sortParam;
+  }
+
+  // 支持 ?author_id=12345 从作者页跳过来
+  const authorParam = params.get('author_id');
+  if (authorParam) {
+    state.authorId = authorParam;
+    setStatus(`已按作者筛选（author_id=${authorParam}），清除筛选请点「刷新」`);
   }
 
   if (!state.current) {
@@ -125,11 +154,15 @@ function buildQuery(offset) {
     source: state.current,
     offset: String(offset),
     limit: String(PAGE_SIZE),
+    sort: state.sort,
   });
   if (state.query) params.set('q', state.query);
   if (state.tag) params.set('tag', state.tag);
+  if (state.authorId) params.set('author_id', state.authorId);
   if (state.missingOnly) params.set('missing', '1');
   if (state.showRemoved) params.set('removed', '1');
+  // 随机排序必须带固定种子，否则翻页会重复/漏项
+  if (state.sort === 'random') params.set('seed', String(state.seed));
   return `/api/records?${params}`;
 }
 
@@ -269,7 +302,7 @@ function renderCardInner(card, record) {
     <div class="frame">${frame}${badge}${spinner}</div>
     <div class="info">
       <div class="title">${escapeHtml(record.title || '(无题)')}</div>
-      <div class="sub">#${record.id} · ${escapeHtml(record.author || '未知')}</div>
+      <div class="sub">${escapeHtml(record.author || '未知')}</div>
     </div>
   `;
 }
@@ -456,13 +489,18 @@ const lb = {
   tx: 0,
   ty: 0,
   dragging: false,
+  moved: false, // 本次按下后是否真的拖动过，用于区分「拖图」和「点空白」
   startX: 0,
   startY: 0,
+  originX: 0,
+  originY: 0,
 };
 
 async function openLightbox(record, card) {
   lb.record = record;
   lb.card = card;
+  stripPid = null; // 换作品要重建左侧页码条
+  lb.moved = false;
 
   const ok = await ensureDownloaded(record, card);
   if (!ok && !record.hasImage) {
@@ -480,6 +518,96 @@ async function openLightbox(record, card) {
   document.body.style.overflow = 'hidden';
 }
 
+/* 左栏页码条只在换作品时重建，翻页只改高亮 —— 92 页的作品重建一次要创建 92 个节点 */
+let stripPid = null;
+
+function renderPageStrip(record, totalPages, currentPage) {
+  if (totalPages <= 1) {
+    els.lbPages.innerHTML = '';
+    stripPid = null;
+    return;
+  }
+
+  if (stripPid === String(record.pid)) {
+    for (const el of els.lbPages.children) {
+      el.classList.toggle('active', Number(el.dataset.page) === currentPage);
+    }
+    els.lbPages.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+
+  stripPid = String(record.pid);
+  const local = new Set(record.localPages ?? []);
+  const frag = document.createDocumentFragment();
+
+  for (let i = 0; i < totalPages; i += 1) {
+    const item = document.createElement('div');
+    item.className = `lb-page-thumb${i === currentPage ? ' active' : ''}`;
+    item.dataset.page = String(i);
+
+    // 只给本地已有的页请求缩略图；没下载的页先显示页码，翻到那儿时会自动补
+    item.innerHTML = local.has(i)
+      ? `<img loading="lazy" src="/api/thumb/${record.pid}/${i}" alt=""><span class="num">${i + 1}</span>`
+      : `<span class="ph">${i + 1}</span>`;
+
+    item.addEventListener('click', () => {
+      lb.index = i;
+      showLightboxPage();
+    });
+    frag.appendChild(item);
+  }
+
+  els.lbPages.innerHTML = '';
+  els.lbPages.appendChild(frag);
+  els.lbPages.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+}
+
+function renderInfoPanel(record) {
+  const rows = [];
+  const addRow = (key, value) => {
+    if (value === undefined || value === null || value === '') return;
+    rows.push(`<div class="row"><span class="k">${key}</span><span class="v">${escapeHtml(value)}</span></div>`);
+  };
+
+  addRow('pid', record.pid);
+  if (record.width && record.height) addRow('尺寸', `${record.width} × ${record.height}`);
+  addRow('页数', record.pages);
+  if (record.published) addRow('发布', String(record.published).slice(0, 10));
+  addRow('类型', record.type);
+  if (Number(record.x_restrict) > 0) addRow('分级', Number(record.x_restrict) === 1 ? 'R-18' : 'R-18G');
+  if (record.ai_type !== undefined && Number(record.ai_type) > 0) addRow('AI', '是');
+  if (record.removed === 'yes') addRow('状态', '已取消收藏');
+  else if (record.status === 'unavailable') addRow('状态', '作品已失效');
+  addRow('来源', state.sources.find((s) => s.key === record.source)?.label);
+
+  let html = `<h3>${escapeHtml(record.title || '(无题)')}</h3>`;
+  if (record.author) html += `<div class="sub">${escapeHtml(record.author)}</div>`;
+  html += rows.join('');
+
+  const owned = record.bookmark_tags ?? [];
+  const tags = record.tags ?? [];
+
+  if (owned.length > 0) {
+    html += `<div class="section">我的收藏标签</div><div class="taglist">${owned
+      .map((tag) => `<span class="tag owned">${escapeHtml(tag)}</span>`)
+      .join('')}</div>`;
+  }
+
+  if (tags.length > 0) {
+    html += `<div class="section">作品标签 ${tags.length}</div><div class="taglist">${tags
+      .map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`)
+      .join('')}</div>`;
+  }
+
+  if (record.url) {
+    html += `<div class="section">链接</div><div><a href="${escapeHtml(
+      record.url,
+    )}" target="_blank" rel="noopener">${escapeHtml(record.url)}</a></div>`;
+  }
+
+  els.lbPanel.innerHTML = html;
+}
+
 function showLightboxPage() {
   const record = lb.record;
   if (!record) return;
@@ -494,7 +622,6 @@ function showLightboxPage() {
   const bits = [`pid ${record.pid}`];
   if (totalPages > 1) bits.push(`第 ${lb.index + 1}/${totalPages} 页`);
   if (record.width && record.height) bits.push(`${record.width}×${record.height}`);
-  if (record.bookmark_tags?.length) bits.push(record.bookmark_tags.join(' / '));
   const metaText = bits.join(' · ');
 
   const hasLocal = (record.localPages ?? []).includes(page);
@@ -508,6 +635,9 @@ function showLightboxPage() {
   };
 
   els.lbImage.src = `/api/full/${record.pid}/${page}?t=${Date.now()}`;
+
+  renderPageStrip(record, totalPages, page);
+  renderInfoPanel(record);
 
   els.lbPrev.disabled = lb.index === 0 && !hasPrevRecord();
   els.lbNext.disabled = lb.index === totalPages - 1 && !hasNextRecord();
@@ -568,13 +698,21 @@ function closeLightbox() {
   document.body.style.overflow = '';
 }
 
-// 滚轮缩放，以鼠标位置为中心
+// 滚轮缩放。用指数映射而不是固定倍数：触控板的小 delta 得到微调，
+// 鼠标滚轮的大 delta 得到明显变化，不会一格一格地跳。
 els.lbStage.addEventListener(
   'wheel',
   (event) => {
     event.preventDefault();
-    const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-    const next = Math.min(8, Math.max(0.2, lb.scale * factor));
+
+    let delta = event.deltaY;
+    if (event.deltaMode === 1) delta *= 16; // 按行
+    else if (event.deltaMode === 2) delta *= 400; // 按页
+
+    const factor = Math.exp(-delta * 0.0016);
+    const next = Math.min(8, Math.max(0.15, lb.scale * factor));
+    if (next === lb.scale) return;
+
     const rect = els.lbStage.getBoundingClientRect();
     const cx = event.clientX - rect.left - rect.width / 2;
     const cy = event.clientY - rect.top - rect.height / 2;
@@ -590,13 +728,25 @@ els.lbStage.addEventListener(
 els.lbStage.addEventListener('mousedown', (event) => {
   if (event.button !== 0) return;
   lb.dragging = true;
+  lb.moved = false;
+  lb.originX = event.clientX;
+  lb.originY = event.clientY;
   lb.startX = event.clientX - lb.tx;
   lb.startY = event.clientY - lb.ty;
   els.lbStage.classList.add('dragging');
 });
 
+// 点空白关闭：必须排除「刚才是拖图」的情况，否则拖动后松手会误关
+els.lbStage.addEventListener('click', (event) => {
+  if (event.target !== els.lbStage) return;
+  if (lb.moved) return;
+  closeLightbox();
+});
+
 window.addEventListener('mousemove', (event) => {
   if (!lb.dragging) return;
+  // 超过 4px 才算拖动，避免手抖把点击当成拖拽
+  if (Math.hypot(event.clientX - lb.originX, event.clientY - lb.originY) > 4) lb.moved = true;
   lb.tx = event.clientX - lb.startX;
   lb.ty = event.clientY - lb.startY;
   applyTransform();
@@ -649,6 +799,13 @@ els.search.addEventListener('input', () => {
 
 els.tagFilter.addEventListener('change', () => {
   state.tag = els.tagFilter.value;
+  reloadAll();
+});
+
+els.sortMode.addEventListener('change', () => {
+  state.sort = els.sortMode.value;
+  // 每次切到随机都换一个种子，否则还是上次那个顺序
+  if (state.sort === 'random') state.seed = Math.floor(Math.random() * 1e9);
   reloadAll();
 });
 

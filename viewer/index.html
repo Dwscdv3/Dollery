@@ -12,8 +12,13 @@
   <div class="tabs" id="tabs"></div>
 
   <div class="filters">
-    <input id="search" type="search" placeholder="搜索标题 / 作者 / pid" autocomplete="off">
+    <input id="search" type="search" placeholder="搜索 / 布尔：foo AND (bar OR baz) NOT qux" autocomplete="off" spellcheck="false">
     <select id="tagFilter"><option value="">全部收藏标签</option></select>
+    <select id="sortMode" title="排序方式">
+      <option value="asc">最早收藏在前</option>
+      <option value="desc">最新收藏在前</option>
+      <option value="random">随机顺序</option>
+    </select>
     <label class="chip"><input type="checkbox" id="missingOnly"> 只看未下载</label>
     <label class="chip"><input type="checkbox" id="showRemoved"> 含已取消</label>
   </div>
@@ -24,6 +29,7 @@
     </label>
     <span id="queueState" class="queue-state"></span>
     <span id="counter">—</span>
+    <a class="meta-link" href="/authors.html" target="_blank" rel="noopener" title="按作者浏览">作者</a>
     <a class="meta-link" href="/downloader.html" target="_blank" rel="noopener" title="打开下载管理器">下载管理</a>
     <button id="reload" title="重新读取磁盘上的图片">刷新</button>
   </div>
@@ -36,12 +42,18 @@
 <div id="statusbar" class="statusbar"></div>
 
 <div id="lightbox" class="lightbox" hidden>
+  <aside class="lb-pages" id="lbPages" title="作品内页"></aside>
+
   <div class="lb-stage" id="lbStage">
     <img id="lbImage" alt="">
   </div>
+
+  <aside class="lb-panel" id="lbPanel"></aside>
+
   <button class="lb-btn lb-close" id="lbClose" title="关闭 (Esc)">✕</button>
   <button class="lb-btn lb-prev" id="lbPrev" title="上一个 (←)">‹</button>
   <button class="lb-btn lb-next" id="lbNext" title="下一个 (→)">›</button>
+
   <div class="lb-bar">
     <span id="lbTitle"></span>
     <span id="lbMeta"></span>
