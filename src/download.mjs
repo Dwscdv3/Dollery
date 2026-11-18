@@ -15,7 +15,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { httpsGet } from './http.mjs';
+import { httpsGet, httpsGetWithRetry } from './http.mjs';
 
 const REFERER = 'https://www.pixiv.net/';
 const USER_AGENT =
@@ -93,7 +93,7 @@ async function downloadOne(client, record, ctx) {
     if (dryRun) return false;
 
     const res = await imageLimiter.run(() =>
-      httpsGet(url, {
+      httpsGetWithRetry(url, {
         proxy,
         binary: true,
         timeoutMs: 120000,
@@ -170,7 +170,7 @@ async function downloadOne(client, record, ctx) {
 
     const tempFile = path.join(tmpDir, `${record.pid}_p${index}.${extensionOf(url)}`);
     const res = await imageLimiter.run(() =>
-      httpsGet(url, {
+      httpsGetWithRetry(url, {
         proxy,
         binary: true,
         timeoutMs: 180000,
@@ -185,8 +185,15 @@ async function downloadOne(client, record, ctx) {
     try {
       await runProcess('magick', [tempFile, '-quality', String(quality), target]);
     } finally {
-      // 无论转换成败都清掉临时原图，除非用户明确要求保留
-      if (!keepOriginal) await fs.rm(tempFile, { force: true });
+      // 清理失败不能当成下载失败 —— 成品已经写好了，原图残留最多占点空间，
+      // 一轮 rm 抛错就把整个作品判失败是不合理的。
+      if (!keepOriginal) {
+        try {
+          await fs.rm(tempFile, { force: true });
+        } catch {
+          /* 留给下次清理 */
+        }
+      }
     }
 
     const stat = await fs.stat(target);
@@ -199,6 +206,9 @@ async function downloadOne(client, record, ctx) {
 
 /**
  * 批量下载一批记录。
+ *
+ * `tempDir` 传入时由调用方负责清理 —— 队列式调用（比如查看器连续下载几十个作品）
+ * 不该每下完一个就把临时目录建了又删，那样既浪费又容易撞上系统/沙箱的删除限制。
  */
 export async function downloadRecords(client, options) {
   const {
@@ -210,10 +220,13 @@ export async function downloadRecords(client, options) {
     imageLimiter,
     proxy,
     onProgress,
+    tempDir,
   } = options;
 
   await fs.mkdir(outDir, { recursive: true });
-  const tmpDir = path.join(outDir, '.tmp');
+
+  const managesTemp = !tempDir;
+  const tmpDir = tempDir ?? path.join(outDir, '.tmp');
   if (!dryRun) await fs.mkdir(tmpDir, { recursive: true });
 
   const summary = {
@@ -222,6 +235,7 @@ export async function downloadRecords(client, options) {
     failed: 0,
     skipped: 0,
     files: 0,
+    filePaths: [],
     originalBytes: 0,
     finalBytes: 0,
     errors: [],
@@ -248,6 +262,7 @@ export async function downloadRecords(client, options) {
         summary.ok += 1;
         summary.skipped += result.skipped;
         summary.files += result.files.length;
+        summary.filePaths.push(...result.files);
         summary.originalBytes += result.originalBytes;
         summary.finalBytes += result.finalBytes;
 
@@ -263,7 +278,8 @@ export async function downloadRecords(client, options) {
       }
     }
   } finally {
-    if (!dryRun) await fs.rm(tmpDir, { recursive: true, force: true });
+    // 临时目录由调用方提供时，清理由它负责
+    if (managesTemp && !dryRun) await fs.rm(tmpDir, { recursive: true, force: true });
   }
 
   return summary;

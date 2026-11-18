@@ -24,6 +24,8 @@ import { RateLimiter } from '../src/http.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IMAGES_DIR = path.join(ROOT, 'images');
+// 队列连续下载时复用同一个临时目录，由服务端负责生命周期
+const TMP_DIR = path.join(IMAGES_DIR, '.tmp');
 const THUMB_DIR = path.join(ROOT, 'viewer', '.thumbs');
 const VIEWER_DIR = path.join(ROOT, 'viewer');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
@@ -44,11 +46,38 @@ const state = {
   bySource: new Map(), // sourceKey -> 记录数
   imageIndex: new Map(), // `${pid}` -> { pages: Set<number>, ugoira: bool }
   thumbJobs: new Map(), // 缩略图生成去重
-  downloading: new Set(), // 正在下载的 pid
   client: null,
   imageLimiter: null,
   config: null,
 };
+
+/**
+ * 下载队列。
+ *
+ * 前端滚动时会把「视口内且未下载」的作品扔进来，这里串行处理。串行是必须的：
+ * 下载本身已经带着 2 秒接口限速和 1 秒图片限速，并发只会让两边互相抢配额。
+ *
+ * `queued` 是去重的关键 —— 它同时覆盖「排队中」和「正在下载」，前端即使重复提交
+ * 同一个 pid 也只会被接受一次。
+ */
+const queue = {
+  pending: [],
+  queued: new Set(),
+  active: null,
+  done: new Set(),
+  failed: new Map(),
+  running: false,
+  processed: 0,
+  pageCount: new Map(), // pid -> 页数，用于让短作品先下
+};
+
+/**
+ * 自动队列单作品的页数上限。
+ *
+ * 实测收藏里有 62 页、92 页的合集，下载一个要两三分钟 —— 一旦进了自动队列，
+ * 后面的作品全被堵住。所以超过这个页数的不自动下，留给用户点开时再决定。
+ */
+const AUTO_MAX_PAGES = 30;
 
 async function loadConfig() {
   try {
@@ -120,6 +149,156 @@ async function loadRecords() {
 
 async function refreshIndex() {
   state.imageIndex = await scanImages();
+}
+
+/** 把刚下载的文件登记进索引，避免每下完一个就重扫整个 images 目录。 */
+function indexDownloadedFiles(files) {
+  for (const file of files) {
+    const name = path.basename(file);
+
+    const pageMatch = name.match(/^(\d+)_p(\d+)\.avif$/);
+    if (pageMatch) {
+      const pid = pageMatch[1];
+      const entry = state.imageIndex.get(pid) ?? { pages: new Set(), ugoira: false };
+      entry.pages.add(Number(pageMatch[2]));
+      state.imageIndex.set(pid, entry);
+      continue;
+    }
+
+    const ugoiraMatch = name.match(/^(\d+)_ugoira\.zip$/);
+    if (ugoiraMatch) {
+      const pid = ugoiraMatch[1];
+      const entry = state.imageIndex.get(pid) ?? { pages: new Set(), ugoira: false };
+      entry.ugoira = true;
+      state.imageIndex.set(pid, entry);
+      continue;
+    }
+
+    const novelMatch = name.match(/^(\d+)\.txt$/);
+    if (novelMatch) {
+      const pid = novelMatch[1];
+      const entry = state.imageIndex.get(pid) ?? { pages: new Set(), ugoira: false };
+      entry.novel = true;
+      state.imageIndex.set(pid, entry);
+    }
+  }
+}
+
+async function downloadByPid(pid) {
+  const key = String(pid);
+  const record = state.records.find((r) => String(r.pid) === key);
+  if (!record) throw new Error('记录不存在');
+  if (record.status === 'unavailable') throw new Error('作品已失效');
+  if (state.imageIndex.has(key)) return { skipped: true, files: 0 };
+
+  const summary = await downloadRecords(state.client, {
+    records: [record],
+    outDir: IMAGES_DIR,
+    quality: state.config?.download?.avifQuality ?? 50,
+    keepOriginal: false,
+    dryRun: false,
+    imageLimiter: state.imageLimiter,
+    proxy: state.config?.proxy,
+    // 复用同一个临时目录，队列连续下载时不反复建删
+    tempDir: TMP_DIR,
+  });
+
+  if (summary.failed > 0) {
+    throw new Error(summary.errors[0]?.message ?? '下载失败');
+  }
+  indexDownloadedFiles(summary.filePaths ?? []);
+  return summary;
+}
+
+function queueSnapshot() {
+  return {
+    pending: queue.pending.length,
+    active: queue.active,
+    running: queue.running,
+    processed: queue.processed,
+    doneCount: queue.done.size,
+    failedCount: queue.failed.size,
+    // 只回传近期的，够前端把卡片状态对上就行
+    doneList: [...queue.done].slice(-300),
+    failedList: [...queue.failed.entries()].slice(-50),
+  };
+}
+
+/**
+ * 把一批 pid 塞进队列。
+ *
+ * 去重靠三层：`queued`（排队+进行中）、`done`、`failed`。任一命中就跳过，
+ * 所以前端反复提交同一批 pid 也不会重复下载。
+ *
+ * `manual: true` 用于用户主动点击 —— 那种情况不下页数限制，也插到队首优先处理。
+ */
+function enqueue(pids, { manual = false } = {}) {
+  let added = 0;
+  let skippedLarge = 0;
+
+  for (const raw of pids) {
+    const pid = String(raw ?? '');
+    if (!pid) continue;
+    if (queue.queued.has(pid) || queue.done.has(pid) || queue.failed.has(pid)) continue;
+
+    const record = state.records.find((r) => String(r.pid) === pid);
+    if (!record) continue;
+    if (record.status === 'unavailable') {
+      queue.failed.set(pid, '作品已失效');
+      continue;
+    }
+    if (state.imageIndex.has(pid)) continue;
+
+    const pageCount = Number(record.pages) || 0;
+    if (!manual && pageCount > AUTO_MAX_PAGES) {
+      // 不入队、也不记失败：卡片保持「点击下载」，用户可以自己决定要不要下
+      skippedLarge += 1;
+      continue;
+    }
+
+    queue.queued.add(pid);
+    queue.pageCount.set(pid, pageCount);
+    if (manual) queue.pending.unshift(pid);
+    else queue.pending.push(pid);
+    added += 1;
+  }
+
+  // 短作品优先：让用户尽快看到更多图，而不是被一个大合集堵住
+  if (added > 0 && !manual) {
+    queue.pending.sort((a, b) => (queue.pageCount.get(a) ?? 0) - (queue.pageCount.get(b) ?? 0));
+    runQueue();
+  } else if (added > 0) {
+    runQueue();
+  }
+
+  return { added, skippedLarge };
+}
+
+async function runQueue() {
+  if (queue.running) return;
+  queue.running = true;
+
+  while (queue.pending.length > 0) {
+    const pid = queue.pending.shift();
+    queue.active = pid;
+
+    try {
+      await downloadByPid(pid);
+      queue.done.add(pid);
+    } catch (err) {
+      queue.failed.set(pid, err.message);
+    } finally {
+      queue.queued.delete(pid);
+      queue.active = null;
+      queue.processed += 1;
+    }
+  }
+
+  queue.running = false;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---- 缩略图 ----
@@ -243,7 +422,7 @@ function decorate(record) {
     localPages: pages,
     localNovel: Boolean(entry?.novel),
     localUgoira: Boolean(entry?.ugoira),
-    downloading: state.downloading.has(String(record.pid)),
+    downloading: queue.queued.has(String(record.pid)),
   };
 }
 
@@ -313,15 +492,27 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { tags: list });
   }
 
-  // 按需下载：本地没有时由前端触发
+  // 批量入队：前端滚动时把视口内未下载的作品扔进来
+  if (url.startsWith('/api/enqueue') && req.method === 'POST') {
+    const body = await readBody(req);
+    const pids = Array.isArray(body.pids) ? body.pids : [];
+    if (pids.length === 0) return sendJson(res, 400, { error: '缺少 pids' });
+    if (pids.length > 500) return sendJson(res, 400, { error: '一次最多 500 个' });
+
+    const { added, skippedLarge } = enqueue(pids);
+    return sendJson(res, 200, { added, skippedLarge, queue: queueSnapshot() });
+  }
+
+  // 队列状态：前端轮询这个来更新卡片
+  if (url.startsWith('/api/queue')) {
+    return sendJson(res, 200, queueSnapshot());
+  }
+
+  // 单个下载（点开大图时用）：入队后阻塞等待它完成，避免和自动队列抢同一份配额
   if (url.startsWith('/api/download') && req.method === 'POST') {
     const body = await readBody(req);
     const pid = String(body.pid ?? '');
     if (!pid) return sendJson(res, 400, { error: '缺少 pid' });
-
-    if (state.downloading.has(pid)) {
-      return sendJson(res, 202, { status: 'already-running' });
-    }
 
     const record = state.records.find((r) => String(r.pid) === pid);
     if (!record) return sendJson(res, 404, { error: '记录不存在' });
@@ -329,32 +520,28 @@ async function handleApi(req, res, url) {
       return sendJson(res, 400, { error: '作品已失效，无法下载' });
     }
 
-    state.downloading.add(pid);
-    try {
-      const summary = await downloadRecords(state.client, {
-        records: [record],
-        outDir: IMAGES_DIR,
-        quality: state.config?.download?.avifQuality ?? 50,
-        keepOriginal: false,
-        dryRun: false,
-        imageLimiter: state.imageLimiter,
-        proxy: state.config?.proxy,
-      });
-      await refreshIndex();
-
-      if (summary.failed > 0) {
-        return sendJson(res, 502, { error: summary.errors[0]?.message ?? '下载失败' });
-      }
-      return sendJson(res, 200, {
-        status: 'ok',
-        files: summary.files,
-        bytes: summary.finalBytes,
-      });
-    } catch (err) {
-      return sendJson(res, 500, { error: err.message });
-    } finally {
-      state.downloading.delete(pid);
+    if (state.imageIndex.has(pid)) {
+      return sendJson(res, 200, { status: 'already', files: 0 });
     }
+
+    enqueue([pid], { manual: true });
+
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      if (queue.done.has(pid)) {
+        const entry = state.imageIndex.get(pid);
+        return sendJson(res, 200, {
+          status: 'ok',
+          files: entry ? entry.pages.size || 1 : 1,
+        });
+      }
+      if (queue.failed.has(pid)) {
+        return sendJson(res, 502, { error: queue.failed.get(pid) });
+      }
+      await sleep(250);
+    }
+
+    return sendJson(res, 504, { error: '下载超时，已转入后台队列继续' });
   }
 
   return sendJson(res, 404, { error: 'unknown api' });
@@ -483,6 +670,7 @@ function openBrowser(url) {
 
 async function main() {
   await fsp.mkdir(THUMB_DIR, { recursive: true });
+  await fsp.mkdir(TMP_DIR, { recursive: true });
 
   state.config = await loadConfig();
   await loadRecords();

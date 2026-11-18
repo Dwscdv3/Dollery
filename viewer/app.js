@@ -19,6 +19,9 @@ const state = {
   missingOnly: false,
   showRemoved: false,
   observer: null,
+  autoDownload: true,
+  submitted: new Set(), // 已提交过下载的 pid，防止重复入队
+  cardMap: new Map(), // pid -> 卡片元素，用于按队列状态刷新
 };
 
 const els = {
@@ -27,6 +30,8 @@ const els = {
   tagFilter: document.getElementById('tagFilter'),
   missingOnly: document.getElementById('missingOnly'),
   showRemoved: document.getElementById('showRemoved'),
+  autoDownload: document.getElementById('autoDownload'),
+  queueState: document.getElementById('queueState'),
   counter: document.getElementById('counter'),
   reload: document.getElementById('reload'),
   grid: document.getElementById('grid'),
@@ -87,6 +92,13 @@ function switchSource(key) {
 async function loadState() {
   const data = await api('/api/state');
   state.sources = data.sources;
+
+  // 支持 ?source=illustPrivate 直达某个收藏夹
+  const fromUrl = new URLSearchParams(location.search).get('source');
+  if (fromUrl && data.sources.some((s) => s.key === fromUrl)) {
+    state.current = fromUrl;
+  }
+
   if (!state.current) {
     const firstWithData = data.sources.find((s) => s.count > 0) ?? data.sources[0];
     state.current = firstWithData?.key ?? 'illustPublic';
@@ -130,6 +142,7 @@ async function loadPage(reset) {
     if (reset) {
       state.offset = 0;
       state.records = [];
+      state.cardMap.clear();
       els.grid.innerHTML = '';
     }
 
@@ -183,28 +196,34 @@ function createCard(record) {
   card.dataset.id = record.id;
   renderCardInner(card, record);
   card.addEventListener('click', () => openLightbox(record, card));
+  state.cardMap.set(String(record.pid), card);
 
-  // 懒加载：进入视口才请求缩略图
+  // 懒加载 + 自动入队：同一份可见性判断做两件事
   if (!state.observer) {
     state.observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
           state.observer.unobserve(entry.target);
+
           const img = entry.target.querySelector('img[data-src]');
-          if (!img) continue;
-          // 淡入效果靠 .loaded 触发，加载失败也要给出可见反馈
-          img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
-          img.addEventListener(
-            'error',
-            () => {
-              img.classList.add('loaded');
-              img.style.opacity = '0.25';
-            },
-            { once: true },
-          );
-          img.src = img.dataset.src;
-          delete img.dataset.src;
+          if (img) {
+            // 淡入效果靠 .loaded 触发，加载失败也要给出可见反馈
+            img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
+            img.addEventListener(
+              'error',
+              () => {
+                img.classList.add('loaded');
+                img.style.opacity = '0.25';
+              },
+              { once: true },
+            );
+            img.src = img.dataset.src;
+            delete img.dataset.src;
+          }
+
+          const target = state.records.find((r) => String(r.pid) === entry.target.dataset.pid);
+          if (target) queueForDownload(target);
         }
       },
       { root: els.grid, rootMargin: '400px' },
@@ -234,10 +253,13 @@ function renderCardInner(card, record) {
   } else if (record.localUgoira) {
     frame = '<div class="placeholder"><span class="icon">🎞</span>动图 zip 已下载</div>';
   } else {
+    const failed = Boolean(record.error);
+    const icon = failed ? '⚠' : downloadable ? '⬇' : '📄';
+    const label = failed ? '下载失败' : downloadable ? '点击下载' : '点击获取';
     frame = `
       <div class="placeholder">
-        <span class="icon">${downloadable ? '⬇' : '📄'}</span>
-        <span>${downloadable ? '点击下载' : '点击获取'}</span>
+        <span class="icon">${icon}</span>
+        <span>${label}</span>
       </div>`;
   }
 
@@ -257,15 +279,155 @@ function refreshCard(card, record) {
   state.observer?.observe(card);
 }
 
+// ---------- 自动下载队列 ----------
+
+/* 滚动时把视口内未下载的作品攒一小批再提交，避免每张图一次请求。
+   `state.submitted` 是前端侧的防重，服务端还有一层 queued/done/failed 去重。 */
+
+let enqueueBuffer = new Set();
+let enqueueTimer = null;
+
+const AUTO_MAX_PAGES = 30; // 与服务端一致：超过这个页数的不自动下载
+
+function queueForDownload(record) {
+  if (!state.autoDownload) return;
+  if (record.hasImage || record.localNovel || record.localUgoira) return;
+  if (record.status === 'unavailable') return;
+  if (record.error) return;
+  // 大合集自动下会堵住队列好几分钟，留给用户自己点
+  if (Number(record.pages) > AUTO_MAX_PAGES) return;
+
+  const pid = String(record.pid);
+  if (state.submitted.has(pid)) return;
+
+  state.submitted.add(pid);
+  enqueueBuffer.add(pid);
+
+  clearTimeout(enqueueTimer);
+  enqueueTimer = setTimeout(flushEnqueue, 120);
+}
+
+async function flushEnqueue() {
+  if (enqueueBuffer.size === 0) return;
+
+  const pids = [...enqueueBuffer];
+  enqueueBuffer.clear();
+
+  try {
+    const data = await api('/api/enqueue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pids }),
+    });
+    if (data.added > 0) {
+      startPolling();
+      applyQueueState(data.queue);
+    }
+    if (data.skippedLarge > 0) {
+      setStatus(`跳过 ${data.skippedLarge} 个页数超过 ${AUTO_MAX_PAGES} 的作品，可点开单独下载`);
+    }
+  } catch (err) {
+    setStatus(`加入下载队列失败：${err.message}`);
+  }
+}
+
+let pollTimer = null;
+let idleTicks = 0;
+
+function startPolling() {
+  if (pollTimer) return;
+  idleTicks = 0;
+  pollTimer = setInterval(pollQueue, 1200);
+  pollQueue();
+}
+
+function stopPolling() {
+  if (!pollTimer) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+async function pollQueue() {
+  try {
+    const snapshot = await api('/api/queue');
+    applyQueueState(snapshot);
+    updateQueueLabel(snapshot);
+
+    if (!snapshot.running && snapshot.pending === 0 && !snapshot.active) {
+      idleTicks += 1;
+      if (idleTicks >= 3) stopPolling();
+    } else {
+      idleTicks = 0;
+    }
+  } catch {
+    stopPolling();
+  }
+}
+
+function applyQueueState(snapshot) {
+  const done = new Set(snapshot.doneList ?? []);
+  const failed = new Map(snapshot.failedList ?? []);
+  const active = snapshot.active ? String(snapshot.active) : null;
+
+  for (const record of state.records) {
+    const pid = String(record.pid);
+    const card = state.cardMap.get(pid);
+
+    if (done.has(pid)) {
+      if (!record.hasImage) {
+        record.hasImage = true;
+        record.localPages = [0];
+        record.downloading = false;
+        if (card) refreshCard(card, record);
+      }
+      continue;
+    }
+
+    if (failed.has(pid) && !record.error) {
+      record.error = failed.get(pid);
+      record.downloading = false;
+      if (card) refreshCard(card, record);
+      continue;
+    }
+
+    const isActive = active === pid;
+    if (isActive !== record.downloading) {
+      record.downloading = isActive;
+      if (card) refreshCard(card, record);
+    }
+  }
+}
+
+function updateQueueLabel(snapshot) {
+  const busy = snapshot.running || snapshot.pending > 0 || snapshot.active;
+  els.queueState.classList.toggle('busy', Boolean(busy));
+
+  if (busy) {
+    const parts = [];
+    if (snapshot.active) parts.push('下载中');
+    if (snapshot.pending > 0) parts.push(`队列 ${snapshot.pending}`);
+    if (snapshot.failedCount > 0) parts.push(`失败 ${snapshot.failedCount}`);
+    els.queueState.textContent = parts.join(' · ');
+  } else if (snapshot.doneCount > 0) {
+    els.queueState.textContent = `已下载 ${snapshot.doneCount}`;
+  } else {
+    els.queueState.textContent = '';
+  }
+}
+
 // ---------- 按需下载 ----------
 
 async function ensureDownloaded(record, card) {
   if (record.hasImage || record.localNovel || record.localUgoira) return true;
-  if (record.downloading) return false;
+  if (record.error) {
+    setStatus(`#${record.id} 之前下载失败：${record.error}`);
+    return false;
+  }
 
   record.downloading = true;
   refreshCard(card, record);
   setStatus(`正在下载 #${record.id} 《${record.title || '无题'}》…`);
+  startPolling();
 
   try {
     const data = await api('/api/download', {
@@ -278,7 +440,8 @@ async function ensureDownloaded(record, card) {
     if (record.type === 'novel') record.localNovel = true;
     if (record.type === 'ugoira') record.localUgoira = true;
     record.localPages = Array.from({ length: data.files || 1 }, (_, i) => i);
-    setStatus(`已下载 #${record.id}，${(data.bytes / 1024).toFixed(0)} KB`);
+    setStatus(`已下载 #${record.id}`);
+    state.submitted.add(String(record.pid));
     return true;
   } catch (err) {
     record.error = err.message;
@@ -491,6 +654,16 @@ els.missingOnly.addEventListener('change', () => {
 els.showRemoved.addEventListener('change', () => {
   state.showRemoved = els.showRemoved.checked;
   reloadAll();
+});
+
+// 重新打开开关时，把当前已经渲染的卡片重新过一遍可见性判断
+els.autoDownload.addEventListener('change', () => {
+  state.autoDownload = els.autoDownload.checked;
+  if (!state.autoDownload) {
+    setStatus('已暂停自动下载，队列中已有的作品仍会完成。');
+    return;
+  }
+  for (const card of state.cardMap.values()) state.observer?.observe(card);
 });
 
 els.reload.addEventListener('click', async () => {
