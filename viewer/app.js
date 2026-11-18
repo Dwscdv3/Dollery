@@ -434,15 +434,22 @@ function renderCardInner(card, record) {
 
   const spinner = record.downloading ? '<div class="spinner">下载中</div>' : '';
 
-  const own = settings.showOwnTags ? record.bookmark_tags ?? [] : [];
-  const works = settings.showTags ? record.tags ?? [] : [];
+  const ownAll = settings.showOwnTags ? record.bookmark_tags ?? [] : [];
+  const worksAll = settings.showTags ? record.tags ?? [] : [];
+
+  // 同一个标签可能既是收藏标签又是作品标签。两处都显示时只保留收藏标签那一份，
+  // 否则卡片上会出现两个一模一样的胶囊（颜色还不同，看着像 bug）。
+  const key = (tag) => String(tag ?? '').trim().toLowerCase();
+  const ownKeys = new Set(ownAll.map(key));
+  const worksUnique = worksAll.filter((tag) => !ownKeys.has(key(tag)));
+
+  const own = ownAll.slice(0, 4);
+  const works = worksUnique.slice(0, 3);
   const tagHtml =
     own.length || works.length
       ? `<div class="card-tags">${own
-          .slice(0, 4)
           .map((t) => `<span class="card-tag own">${escapeHtml(t)}</span>`)
           .join('')}${works
-          .slice(0, 3)
           .map((t) => `<span class="card-tag">${escapeHtml(t)}</span>`)
           .join('')}</div>`
       : '';

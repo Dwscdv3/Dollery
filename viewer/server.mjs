@@ -1100,19 +1100,23 @@ async function handleApi(req, res, url) {
     for (const record of state.records) {
       if (record.source !== source) continue;
 
+      // 同一作品上的同名标签只算一次；大小写不同视为同一个（和卡片上的去重一致）
       const seen = new Set();
+      const norm = (tag) => String(tag ?? '').trim().toLowerCase();
 
       for (const tag of record.bookmark_tags ?? []) {
-        if (!tag || seen.has(tag)) continue;
-        seen.add(tag);
+        const key = norm(tag);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
         bump(tag, true);
       }
 
       if (!includeWork) continue;
 
       for (const tag of record.tags ?? []) {
-        if (!tag || seen.has(tag)) continue;
-        seen.add(tag);
+        const key = norm(tag);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
         bump(tag, false);
       }
     }
