@@ -74,7 +74,7 @@ const state = {
 const queue = {
   pending: [],
   queued: new Set(),
-  active: null,
+  actives: new Set(),
   done: new Set(),
   failed: new Map(),
   running: false,
@@ -238,11 +238,7 @@ async function downloadByPid(pid) {
 
   // 图片已下载时不再重复下，但简介可能还缺，所以仍然要走一遍下面的简介抓取
   if (hasImage) {
-    try {
-      await ensureDescription(key);
-    } catch {
-      /* 简介失败不影响结果 */
-    }
+    await ensureDescription(key).catch(() => {});
     return { skipped: true, files: 0, filePaths: [] };
   }
 
@@ -265,18 +261,14 @@ async function downloadByPid(pid) {
   }
   indexDownloadedFiles(summary.filePaths ?? []);
 
-  // 下载完立刻把缩略图各档都生成好并永久保存，之后浏览不再触发转换
+  // 缩略图丢到后台生成，不阻塞队列推进（magick 很吃 CPU，等它会把整条队列拖慢）
   for (const file of summary.filePaths ?? []) {
     const match = path.basename(file).match(/^(\d+)_p(\d+)\.avif$/);
-    if (match) await generateThumbLevels(match[1], Number(match[2]));
+    if (match) void generateThumbLevels(match[1], Number(match[2]));
   }
 
-  // 批量下载时顺带把简介也补上，省得以后逐个打开才抓
-  try {
-    await ensureDescription(key);
-  } catch {
-    /* 简介失败不影响图片下载 */
-  }
+  // 简介也放后台补，不占用队列的推进节奏
+  void ensureDescription(key).catch(() => {});
 
   return summary;
 }
@@ -327,7 +319,9 @@ async function ensurePage(pid, page) {
 function queueSnapshot() {
   return {
     pending: queue.pending.length,
-    active: queue.active,
+    active: [...queue.actives][0] ?? null,
+    activeCount: queue.actives.size,
+    activeList: [...queue.actives],
     running: queue.running,
     processed: queue.processed,
     doneCount: queue.done.size,
@@ -391,14 +385,25 @@ function enqueue(pids, { manual = false } = {}) {
   return { added, skippedLarge };
 }
 
+const QUEUE_CONCURRENCY = 2;
+
+/** 两个 worker 并行：下载受 1 秒限速约束，但 AVIF 压制是 CPU 活，能重叠起来。 */
 async function runQueue() {
   if (queue.running) return;
   queue.running = true;
 
-  while (queue.pending.length > 0) {
-    const pid = queue.pending.shift();
-    queue.active = pid;
+  const workers = Array.from({ length: QUEUE_CONCURRENCY }, () => queueWorker());
+  await Promise.all(workers);
 
+  queue.running = false;
+}
+
+async function queueWorker() {
+  for (;;) {
+    const pid = queue.pending.shift();
+    if (!pid) return;
+
+    queue.actives.add(pid);
     try {
       await downloadByPid(pid);
       queue.done.add(pid);
@@ -406,12 +411,10 @@ async function runQueue() {
       queue.failed.set(pid, err.message);
     } finally {
       queue.queued.delete(pid);
-      queue.active = null;
+      queue.actives.delete(pid);
       queue.processed += 1;
     }
   }
-
-  queue.running = false;
 }
 
 function sleep(ms) {

@@ -65,7 +65,7 @@ const PAGE_SIZE = 120;
 const els = {};
 for (const id of [
   'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
-  'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'edgeLeft', 'edgeRight',
+  'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
   'grid', 'sentinel', 'statusbar',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
@@ -530,7 +530,7 @@ async function pollQueue() {
 function applyQueueState(snapshot) {
   const done = new Set(snapshot.doneList ?? []);
   const failed = new Map(snapshot.failedList ?? []);
-  const active = snapshot.active ? String(snapshot.active) : null;
+  const activeSet = new Set((snapshot.activeList ?? (snapshot.active ? [snapshot.active] : [])).map(String));
 
   for (const record of state.records) {
     const pid = String(record.pid);
@@ -553,7 +553,7 @@ function applyQueueState(snapshot) {
       continue;
     }
 
-    const isActive = active === pid;
+    const isActive = activeSet.has(pid);
     if (isActive !== record.downloading) {
       record.downloading = isActive;
       if (card) refreshCard(card, record);
@@ -823,15 +823,17 @@ function renderInfoPanel(record) {
   )}</h3>`;
 
   if (record.author) {
-    html += `<span class="author" data-author-page="${
+    html += `<div class="author-row">${
+      record.author_id
+        ? `<img class="author-avatar" src="/api/avatar/${escapeHtml(record.author_id)}" loading="lazy" alt="">`
+        : ''
+    }<span class="author" data-author-page="${
       record.author_id ? `https://www.pixiv.net/users/${record.author_id}` : ''
-    }">${escapeHtml(record.author)}</span>`;
+    }">${escapeHtml(record.author)}</span></div>`;
   }
 
   if (chips.length) html += `<div class="chips">${chips.join('')}</div>`;
   if (metaLine) html += `<div style="color:var(--muted);margin-bottom:10px">${escapeHtml(metaLine)}</div>`;
-
-  if (record.description) html += `<div class="desc">${escapeHtml(record.description)}</div>`;
 
   if (owned.length) {
     html += `<div class="section">我的收藏标签</div><div class="taglist">${owned
@@ -849,6 +851,11 @@ function renderInfoPanel(record) {
     html += `<a class="pid-link" href="${escapeHtml(record.url)}" target="_blank" rel="noopener">pid ${escapeHtml(
       record.pid,
     )} →</a>`;
+  }
+
+  // 简介放在最底部，跟着面板一起滚动，不单独做成小滚动框
+  if (record.description) {
+    html += `<div class="section">作品简介</div><div class="desc">${escapeHtml(record.description)}</div>`;
   }
 
   els.lbPanel.innerHTML = html;
@@ -883,6 +890,7 @@ function showLightboxPage() {
 
   els.lbImage.onload = () => {
     els.lbMeta.textContent = bits.join(' · ');
+    applyTransform(); // 图片解码后才有 naturalWidth，重新算百分比
   };
   els.lbImage.onerror = () => {
     els.lbMeta.textContent = `${bits.join(' · ')} · 获取失败`;
@@ -1167,7 +1175,7 @@ els.optReset.addEventListener('click', () => {
   setStatus('视图设置已恢复默认');
 });
 
-els.edgeLeft.addEventListener('click', () => {
+els.btnLeft.addEventListener('click', () => {
   settings.leftOpen = !settings.leftOpen;
   saveSettings();
   applySettings();
@@ -1175,7 +1183,7 @@ els.edgeLeft.addEventListener('click', () => {
   if (settings.leftOpen && state.authors.length === 0 && state.tags.length === 0) loadSidePanel();
 });
 
-els.edgeRight.addEventListener('click', () => {
+els.btnRight.addEventListener('click', () => {
   settings.rightOpen = !settings.rightOpen;
   saveSettings();
   applySettings();

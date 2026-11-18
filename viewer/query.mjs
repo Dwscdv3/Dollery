@@ -136,8 +136,90 @@ function parse(tokens) {
   return parseExpr();
 }
 
+function truthy(value) {
+  return ['yes', '1', 'true', 'y', 'on'].includes(String(value).toLowerCase());
+}
+
+function matchNumber(actual, expr) {
+  const m = /^(>=|<=|>|<|=)?(\d+)$/.exec(String(expr));
+  if (!m) return false;
+  const n = Number(m[2]);
+  switch (m[1] ?? '=') {
+    case '>':
+      return actual > n;
+    case '>=':
+      return actual >= n;
+    case '<':
+      return actual < n;
+    case '<=':
+      return actual <= n;
+    default:
+      return actual === n;
+  }
+}
+
+/**
+ * 字段限定。支持作品自身的属性（不是标签）：
+ *   type:illust|manga|ugoira|novel
+ *   ai:yes / ai:no         是否 AI 生成
+ *   r18:yes / r18:no       是否 R-18
+ *   pages:>10 / pages:<5 / pages:2
+ *   is:ai|r18|ugoira|manga|novel|removed|unavailable|bookmarked
+ *
+ * 返回 null 表示「不认识这个字段」，交给全文匹配兜底。
+ */
+function matchField(key, value, record) {
+  switch (key) {
+    case 'type':
+      return String(record.type ?? '').toLowerCase() === value;
+
+    case 'ai':
+      return truthy(value) === (Number(record.ai_type) > 0);
+
+    case 'r18':
+      return truthy(value) === (Number(record.x_restrict) > 0);
+
+    case 'pages':
+      return matchNumber(Number(record.pages) || 0, value);
+
+    case 'is':
+      switch (value) {
+        case 'ai':
+          return Number(record.ai_type) > 0;
+        case 'r18':
+          return Number(record.x_restrict) > 0;
+        case 'ugoira':
+          return record.type === 'ugoira';
+        case 'manga':
+          return record.type === 'manga';
+        case 'novel':
+          return record.type === 'novel';
+        case 'illust':
+          return record.type === 'illust';
+        case 'removed':
+          return record.removed === 'yes';
+        case 'unavailable':
+          return record.status === 'unavailable';
+        case 'bookmarked':
+          return record.removed !== 'yes';
+        default:
+          return false;
+      }
+
+    default:
+      return null;
+  }
+}
+
 function matchWord(word, record) {
   if (!word) return true;
+
+  // 先尝试字段语法，再退回全文匹配
+  const colon = word.indexOf(':');
+  if (colon > 0) {
+    const handled = matchField(word.slice(0, colon), word.slice(colon + 1), record);
+    if (handled !== null) return handled;
+  }
 
   const fields = [
     record.title,

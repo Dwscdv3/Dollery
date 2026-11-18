@@ -5,15 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 
 <header class="toolbar">
+  <button id="btnLeft" class="icon-btn edge-in-toolbar" title="作者 / 标签">☰</button>
   <div class="tabs" id="tabs"></div>
 
   <div class="filters">
-    <input id="search" type="search" placeholder="搜索 / 布尔：foo AND (bar OR baz) NOT qux" autocomplete="off" spellcheck="false">
+    <input id="search" type="search" placeholder="搜索 / 布尔 / 属性：foo AND is:ai OR type:manga" autocomplete="off" spellcheck="false">
     <select id="sortMode" title="排序方式">
       <option value="asc">最早收藏在前</option>
       <option value="desc">最新收藏在前</option>
@@ -26,6 +27,7 @@
     <span id="queueState" class="queue-state"></span>
     <span id="counter">—</span>
     <button id="reload" class="icon-btn" title="刷新">⟳</button>
+    <button id="btnRight" class="icon-btn edge-in-toolbar" title="下载管理">▤</button>
   </div>
 </header>
 
@@ -102,8 +104,6 @@
   <div class="pop-foot"><button id="optReset">恢复默认</button></div>
 </div>
 
-<button class="edge-toggle edge-left" id="edgeLeft" title="作者 / 标签">›</button>
-<button class="edge-toggle edge-right" id="edgeRight" title="下载管理">‹</button>
 
 <div id="lightbox" class="lightbox" hidden>
   <div class="lb-stage" id="lbStage">
@@ -138,6 +138,6 @@
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=5"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>
