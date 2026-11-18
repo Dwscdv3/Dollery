@@ -500,9 +500,6 @@ async function flushEnqueue() {
       body: JSON.stringify({ pids }),
     });
     if (data.added > 0) startPolling();
-    if (data.skippedLarge > 0) {
-      setStatus(`有 ${data.skippedLarge} 个作品页数过多，未自动下载；点开即可单独补全`);
-    }
   } catch (err) {
     setStatus(`加入下载队列失败：${err.message}`);
   }

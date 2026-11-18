@@ -80,17 +80,10 @@ const queue = {
   running: false,
   processed: 0,
   pageCount: new Map(), // pid -> 页数，用于让短作品先下
+  // 每个任务的下载范围：first = 只下首张（滚动触发），full = 补齐所有页（点开 / 全部下载）
+  modes: new Map(), // pid -> 'first' | 'full'
+  doneMode: new Map(), // pid -> 完成时的模式，决定还能不能因为「要全页」再入队一次
 };
-
-/**
- * 自动队列（滚动时「可见即下载」）的单作品页数上限。
- *
- * 补齐所有页之后，页数重新变成了成本：收藏里有 200 页的合集，一个就要跑四分钟，
- * 滚一下触发几个这种作品就会把队列堵死。所以自动入队仍然跳过超大作品，
- * 它们留在卡片上等用户主动点开（/api/download 不受此限），
- * 「全部下载」也显式绕过（用户点了就是要全下）。
- */
-const AUTO_MAX_PAGES = 30;
 
 async function loadConfig() {
   try {
@@ -231,13 +224,24 @@ function indexDownloadedFiles(files) {
   }
 }
 
-async function downloadByPid(pid) {
+/**
+ * 下载一个作品。
+ *
+ * mode 决定下载范围：
+ *   first —— 只下首张（滚动时自动触发，省时间和空间）
+ *   full  —— 补齐该作品所有缺失的页（点开作品、下载管理里点「全部下载」）
+ */
+async function downloadByPid(pid, mode = 'full') {
   const key = String(pid);
   const record = state.records.find((r) => String(r.pid) === key);
   if (!record) throw new Error('记录不存在');
   if (record.status === 'unavailable') throw new Error('作品已失效');
-  // 所有页都齐了才跳过；只下了首张的多页作品要继续补齐
-  if (isComplete(record)) {
+
+  // first：只补首张（滚动触发）；full：补齐所有缺页（点开 / 全部下载）
+  const stats = pageStats(record);
+  const needPages = mode === 'full' ? stats.have < stats.total : stats.have === 0;
+
+  if (!needPages) {
     await ensureDescription(key).catch(() => {});
     return { skipped: true, files: 0, filePaths: [] };
   }
@@ -252,8 +256,8 @@ async function downloadByPid(pid) {
     proxy: state.config?.proxy,
     // 复用同一个临时目录，队列连续下载时不反复建删
     tempDir: TMP_DIR,
-    // 补齐所有缺失的页 —— 已存在的页在下载层会自己跳过，不会重复下
-    firstPageOnly: false,
+    // 已存在的页在下载层会自己跳过，所以 full 也是幂等的
+    firstPageOnly: mode !== 'full',
   });
 
   if (summary.failed > 0) {
@@ -335,19 +339,45 @@ function queueSnapshot() {
 /**
  * 把一批 pid 塞进队列。
  *
- * 去重靠三层：`queued`（排队+进行中）、`done`、`failed`。任一命中就跳过，
- * 所以前端反复提交同一批 pid 也不会重复下载。
- *
- * `manual: true` 用于用户主动点击 —— 那种情况不下页数限制，也插到队首优先处理。
+ * 去重靠三层：`queued`（排队+进行中）、`done`、`failed`。但不是一刀切——
+ * 还要看「下载范围」：
+ *   · 滚动触发的 first 只下首张，一个作品一次就够了；
+ *   · 点开作品和「全部下载」要 full（补齐所有页）。
+ * 所以一个已经用 first 下过的作品，遇到 full 请求时仍然要再排一次；
+ * 反过来 full 下完的作品，再收到 first 请求直接忽略。
  */
-function enqueue(pids, { bypassPageLimit = false, priority = false } = {}) {
+function enqueue(pids, { mode = 'first', priority = false } = {}) {
+  const wants = (m) => (m === 'full' ? 'full' : 'first');
+
+  // 某个 pid 是否已经满足了这次请求的范围
+  const satisfied = (pid) => {
+    if (queue.failed.has(pid)) return true;
+    if (!queue.done.has(pid)) return false;
+    if (wants(mode) === 'first') return true; // 只下首张，下过一次就够
+    return (queue.doneMode.get(pid) ?? 'first') === 'full';
+  };
+
   let added = 0;
-  let skippedLarge = 0;
+  let upgraded = 0;
 
   for (const raw of pids) {
     const pid = String(raw ?? '');
     if (!pid) continue;
-    if (queue.queued.has(pid) || queue.done.has(pid) || queue.failed.has(pid)) continue;
+
+    // 已在队列里：如果这次要得更全，就地升级（正在跑的那个跑完会再看一次）
+    if (queue.queued.has(pid)) {
+      if (wants(mode) === 'full' && queue.modes.get(pid) !== 'full') {
+        queue.modes.set(pid, 'full');
+        upgraded += 1;
+      }
+      continue;
+    }
+
+    if (satisfied(pid)) continue;
+
+    // 重新入队意味着它现在算「未完成」—— 之前可能只用 first 下过首张
+    queue.done.delete(pid);
+    queue.doneMode.delete(pid);
 
     const record = state.records.find((r) => String(r.pid) === pid);
     if (!record) continue;
@@ -355,19 +385,22 @@ function enqueue(pids, { bypassPageLimit = false, priority = false } = {}) {
       queue.failed.set(pid, '作品已失效');
       continue;
     }
-    // 页数补齐 + 简介都有，才算「已完成」；只缺其中任一样都要再跑一遍
-    const hasDesc = Boolean(record.description) || descCache.has(pid) || record.type === 'novel';
-    if (isComplete(record) && hasDesc) continue;
 
-    const pageCount = Number(record.pages) || 0;
-    if (AUTO_MAX_PAGES > 0 && !bypassPageLimit && pageCount > AUTO_MAX_PAGES) {
-      // 不入队、也不记失败：卡片保持「点击下载」，用户可以自己决定要不要下
-      skippedLarge += 1;
+    const stats = pageStats(record);
+    const hasDesc = Boolean(record.description) || descCache.has(pid) || record.type === 'novel';
+
+    if (wants(mode) === 'first') {
+      // 只下首张：已经有任意一页就不用再下；但简介缺了仍要走一趟
+      if (stats.have > 0 && hasDesc) continue;
+    } else if (stats.have >= stats.total && hasDesc) {
       continue;
     }
 
+    const pageCount = Number(record.pages) || 0;
+
     queue.queued.add(pid);
     queue.pageCount.set(pid, pageCount);
+    queue.modes.set(pid, wants(mode));
     // priority 是「用户点开的这一个」，插到队首；其余一律追加，
     // 避免一次性入队几千个时反复 unshift 变成 O(n²)
     if (priority) queue.pending.unshift(pid);
@@ -383,7 +416,7 @@ function enqueue(pids, { bypassPageLimit = false, priority = false } = {}) {
     runQueue();
   }
 
-  return { added, skippedLarge };
+  return { added, upgraded };
 }
 
 const QUEUE_CONCURRENCY = 2;
@@ -404,16 +437,29 @@ async function queueWorker() {
     const pid = queue.pending.shift();
     if (!pid) return;
 
+    // 排队期间可能被升级成 full（用户点开了它），出队时以最新的为准
+    const mode = queue.modes.get(pid) ?? 'first';
+
     queue.actives.add(pid);
     try {
-      await downloadByPid(pid);
+      await downloadByPid(pid, mode);
       queue.done.add(pid);
+      queue.doneMode.set(pid, mode);
     } catch (err) {
       queue.failed.set(pid, err.message);
     } finally {
+      const upgradedWhileRunning = queue.modes.get(pid) === 'full' && mode === 'first';
       queue.queued.delete(pid);
       queue.actives.delete(pid);
+      queue.modes.delete(pid);
       queue.processed += 1;
+
+      // 跑的过程中用户点开了它，但这次只下了首张 —— 再排一次补齐后续页
+      if (upgradedWhileRunning) {
+        queue.queued.add(pid);
+        queue.modes.set(pid, 'full');
+        queue.pending.push(pid);
+      }
     }
   }
 }
@@ -1087,8 +1133,8 @@ async function handleApi(req, res, url) {
     if (pids.length === 0) return sendJson(res, 400, { error: '缺少 pids' });
     if (pids.length > 500) return sendJson(res, 400, { error: '一次最多 500 个' });
 
-    const { added, skippedLarge } = enqueue(pids);
-    return sendJson(res, 200, { added, skippedLarge, queue: queueSnapshot() });
+    const { added } = enqueue(pids);
+    return sendJson(res, 200, { added, queue: queueSnapshot() });
   }
 
   // 队列状态：前端轮询这个来更新卡片
@@ -1097,6 +1143,7 @@ async function handleApi(req, res, url) {
     for (const pid of queue.pending) {
       queue.queued.delete(pid);
       queue.pageCount.delete(pid);
+      queue.modes.delete(pid);
     }
     queue.pending = [];
     return sendJson(res, 200, { cleared, queue: queueSnapshot() });
@@ -1180,7 +1227,7 @@ async function handleApi(req, res, url) {
       pids.push(record.pid);
     }
 
-    const { added } = enqueue(pids, { bypassPageLimit: true });
+    const { added } = enqueue(pids, { mode: 'full' });
     return sendJson(res, 200, { candidates: pids.length, added, queue: queueSnapshot() });
   }
 
@@ -1202,15 +1249,17 @@ async function handleApi(req, res, url) {
       return sendJson(res, 400, { error: '作品已失效，无法下载' });
     }
 
-    if (state.imageIndex.has(pid)) {
+    // 只有「所有页都齐了」才算已在本地；只下了首张的要继续补
+    if (isComplete(record)) {
       return sendJson(res, 200, { status: 'already', files: 0 });
     }
 
-    enqueue([pid], { bypassPageLimit: true, priority: true });
+    enqueue([pid], { mode: 'full', priority: true });
 
     const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {
-      if (queue.done.has(pid)) {
+      // 之前可能被滚动任务用 first 模式下过，那种 done 不算数，要等 full 那次
+      if (queue.done.has(pid) && (queue.doneMode.get(pid) ?? 'first') === 'full') {
         const entry = state.imageIndex.get(pid);
         return sendJson(res, 200, {
           status: 'ok',
