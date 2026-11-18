@@ -679,6 +679,7 @@ const lb = {
   scale: 1,
   tx: 0,
   ty: 0,
+  fitted: true, // 当前是否处于「适应可用区域」状态（双击时据此判断往哪切）
   dragging: false,
   moved: false,
   startX: 0,
@@ -890,7 +891,9 @@ function showLightboxPage() {
 
   els.lbImage.onload = () => {
     els.lbMeta.textContent = bits.join(' · ');
-    applyTransform(); // 图片解码后才有 naturalWidth，重新算百分比
+    // 解码后才有 naturalWidth/clientWidth，fit 的基准尺寸这时才有效
+    if (lb.fitted) resetTransform();
+    else applyTransform();
   };
   els.lbImage.onerror = () => {
     els.lbMeta.textContent = `${bits.join(' · ')} · 获取失败`;
@@ -915,10 +918,43 @@ function hasNextRecord() {
   return i >= 0 && i < state.records.length - 1;
 }
 
+/**
+ * 舞台铺满整个窗口，但左右两栏是盖在上面的浮层，所以「可用区域」要把它们刨掉。
+ * 返回的是相对舞台的像素几何：left/right 为两栏占宽，width/height 为剩余空间。
+ */
+function availRect() {
+  const W = els.lbStage.clientWidth;
+  const H = els.lbStage.clientHeight;
+
+  const left = els.lbPages && els.lbPages.childElementCount > 0 ? els.lbPages.offsetWidth : 0;
+  const right = els.lbPanel && els.lbPanel.childElementCount > 0 ? els.lbPanel.offsetWidth : 0;
+
+  return { W, H, left, right, width: Math.max(120, W - left - right), height: H };
+}
+
+/**
+ * 回到「适应可用区域」：
+ * 图片本身按整屏 fit（CSS max-width/max-height），这里再叠一个 scale 把它收进
+ * 左右两栏之间的区域，并把中心从屏幕中心平移到可用区域的中心。
+ */
 function resetTransform() {
-  lb.scale = 1;
-  lb.tx = 0;
+  const img = els.lbImage;
+  const area = availRect();
+
+  lb.fitted = true;
+  lb.tx = (area.left - area.right) / 2; // 可用区域中心相对屏幕中心的偏移
   lb.ty = 0;
+
+  const baseW = img.clientWidth;
+  const baseH = img.clientHeight;
+  if (!baseW || !baseH) {
+    lb.scale = 1;
+    applyTransform();
+    return;
+  }
+
+  // 上限 1：图片比可用区域小时保持原尺寸，不放大（放大只会糊）
+  lb.scale = Math.min(area.width / baseW, area.height / baseH, 1);
   applyTransform();
 }
 
@@ -983,6 +1019,7 @@ els.lbStage.addEventListener(
     lb.tx = cx - (cx - lb.tx) * ratio;
     lb.ty = cy - (cy - lb.ty) * ratio;
     lb.scale = next;
+    lb.fitted = false;
     applyTransform();
   },
   { passive: false },
@@ -1016,20 +1053,30 @@ window.addEventListener('mouseup', () => {
   lb.dragging = false;
 });
 
-// 双击：适应屏幕 ↔ 1:1（按原图像素）
+// 双击：适应可用区域 ↔ 1:1（按原图像素）
 els.lbImage.addEventListener('dblclick', (event) => {
   event.stopPropagation();
-  if (Math.abs(lb.scale - 1) < 0.02) {
+  if (lb.fitted) {
     const target = oneToOneScale();
     if (target > 1.01) {
+      const area = availRect();
+      lb.fitted = false;
       lb.scale = Math.min(8, target);
-      lb.tx = 0;
+      lb.tx = (area.left - area.right) / 2;
       lb.ty = 0;
       applyTransform();
     }
   } else {
     resetTransform();
   }
+});
+
+// 窗口尺寸变化时，处于「适应」状态就重新算一遍，否则图片会跑到区域外
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (els.lightbox.hidden || !lb.fitted) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resetTransform, 120);
 });
 
 els.lbClose.addEventListener('click', closeLightbox);

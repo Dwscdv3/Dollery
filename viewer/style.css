@@ -773,28 +773,21 @@ body.right-open .edge-right { right: var(--side-right); }
   inset: 0;
   background: #05070a;
   z-index: 50;
-  /* 适应屏幕时要避开左右浮栏，不然图会被压在面板底下 */
-  --lb-left: 0px;
-  --lb-right: 0px;
 }
-
-.lightbox:has(.lb-pages:not(:empty)) { --lb-left: 200px; }
-.lightbox:has(.lb-panel:not(:empty)) { --lb-right: 340px; }
 
 .lightbox[hidden] { display: none; }
 
 .lb-stage {
+  /* 铺满整个窗口：左右浮栏是盖在上面的，图片可以延伸到它们下方，
+     浮栏的 backdrop-filter 才能真的模糊到底下的画面。
+     初始的缩放与位置由脚本按「可用区域」算（见 resetTransform）。 */
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: var(--lb-left, 0px);
-  right: var(--lb-right, 0px);
+  inset: 0;
   overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: grab;
-  transition: left .2s, right .2s;
 }
 
 .lb-stage img {
@@ -1004,13 +997,18 @@ body.right-open .edge-right { right: var(--side-right); }
 
 .lb-btn:hover { background: rgba(255, 255, 255, .2); }
 .lb-close { top: 12px; right: 12px; }
-.lb-prev { left: calc(var(--lb-left, 0px) + 12px); top: 50%; margin-top: -19px; }
-.lb-next { right: calc(var(--lb-right, 0px) + 12px); top: 50%; margin-top: -19px; }
+
+/* 翻页按钮和底栏贴在两栏之间的可用区域里（200 + 12 / 340 + 12） */
+.lb-prev { left: 212px; top: 50%; margin-top: -19px; }
+.lb-next { right: 352px; top: 50%; margin-top: -19px; }
+
+.lightbox:has(.lb-pages:empty) .lb-prev { left: 12px; }
+.lightbox:has(.lb-panel:empty) .lb-next { right: 12px; }
 
 .lb-bar {
   position: absolute;
-  left: var(--lb-left, 0px);
-  right: var(--lb-right, 0px);
+  left: 200px;
+  right: 340px;
   bottom: 0;
   padding: 10px 24px;
   background: linear-gradient(transparent, rgba(0, 0, 0, .85));
@@ -1022,6 +1020,9 @@ body.right-open .edge-right { right: var(--side-right); }
   pointer-events: none;
   justify-content: center;
 }
+
+.lightbox:has(.lb-pages:empty) .lb-bar { left: 0; }
+.lightbox:has(.lb-panel:empty) .lb-bar { right: 0; }
 
 .lb-bar #lbTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lb-bar #lbMeta, .lb-bar #lbZoom { color: var(--muted); flex: 0 0 auto; }
