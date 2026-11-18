@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   showOwnTags: false,
   showTags: false,
   autoDownload: true,
+  overlayInfo: false, // 标题 / 作者 / 标签叠在图片上，而不是图片外
   tagIncludeWork: false, // 标签面板是否把作品本身的标签也算进来
   leftOpen: false,
   rightOpen: false,
@@ -71,7 +72,7 @@ for (const id of [
   'grid', 'sentinel', 'statusbar',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
-  'optAutoDownload', 'optReset',
+  'optAutoDownload', 'optOverlayInfo', 'optReset',
   'lightbox', 'lbStage', 'lbImage', 'lbPages', 'lbPanel', 'lbTitle', 'lbMeta', 'lbZoom',
   'lbClose', 'lbPrev', 'lbNext',
   'reader', 'rdCover', 'rdCoverBox', 'rdTitle', 'rdAuthor', 'rdTags', 'rdLink', 'rdBody', 'rdClose',
@@ -98,7 +99,7 @@ function escapeHtml(text) {
 
 // ---------- 设置应用 ----------
 
-function applySettings() {
+function applySettings({ rerender = true } = {}) {
   document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
 
   els.sortMode.value = settings.sort;
@@ -110,6 +111,9 @@ function applySettings() {
   els.optShowOwnTags.checked = settings.showOwnTags;
   els.optShowTags.checked = settings.showTags;
   els.optAutoDownload.checked = settings.autoDownload;
+  els.optOverlayInfo.checked = settings.overlayInfo;
+  // 信息叠在图上时，卡片高度只由图片决定，CSS 那边靠这个 class 切换
+  document.body.classList.toggle('overlay-info', settings.overlayInfo);
 
   document.getElementById('sideLeft')?.classList.toggle('collapsed', !settings.leftOpen);
   document.getElementById('sideRight')?.classList.toggle('collapsed', !settings.rightOpen);
@@ -117,9 +121,11 @@ function applySettings() {
   document.getElementById('btnRight')?.classList.toggle('on', settings.rightOpen);
 
   // 重渲染卡片后必须重新 observe，否则新生成的 img[data-src] 不会被触发加载
-  for (const record of state.records) {
-    const card = state.cardMap.get(String(record.pid));
-    if (card) refreshCard(card, record);
+  if (rerender) {
+    for (const record of state.records) {
+      const card = state.cardMap.get(String(record.pid));
+      if (card) refreshCard(card, record);
+    }
   }
 }
 
@@ -1358,6 +1364,13 @@ els.optWidth.addEventListener('input', () => {
   els.optWidthVal.textContent = `${settings.cardWidth}px`;
   document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
   saveSettings();
+});
+
+els.optOverlayInfo.addEventListener('change', () => {
+  settings.overlayInfo = els.optOverlayInfo.checked;
+  saveSettings();
+  // 纯 CSS 切换，不用重建卡片（重建会让所有缩略图闪一下）
+  applySettings({ rerender: false });
 });
 
 els.optShowOwnTags.addEventListener('change', () => {

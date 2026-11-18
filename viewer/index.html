@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=5">
+<link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
 
@@ -91,6 +91,12 @@
   </div>
 
   <label class="switch">
+    <input type="checkbox" id="optOverlayInfo">
+    <span class="track"></span>
+    <span class="switch-text">信息叠在图上</span>
+  </label>
+
+  <label class="switch">
     <input type="checkbox" id="optShowOwnTags">
     <span class="track"></span>
     <span class="switch-text">显示收藏标签</span>
@@ -145,6 +151,6 @@
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=9"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>

@@ -14,6 +14,9 @@
   --side-left: 250px;
   --side-right: 286px;
   --card-w: 210px;
+
+  /* 压在图片 / 半透明浮层上的文字统一用这层阴影，否则深色图上看不清 */
+  --text-shadow-on-image: 0 1px 2px rgba(0, 0, 0, .92), 0 0 7px rgba(0, 0, 0, .6);
 }
 
 * { box-sizing: border-box; }
@@ -475,6 +478,9 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr));
   grid-auto-rows: max-content;
+  /* 卡片高度由内容决定，不拉伸到行高。否则同一行里封面比例不同时，
+     矮的卡片会在底部（或图片与文字之间）留出一大片空白。 */
+  align-items: start;
   gap: 12px;
   padding: 14px;
   align-content: start;
@@ -549,6 +555,9 @@ body {
 .card .badge.warn { background: rgba(224, 164, 88, .92); color: #241a08; }
 .card .badge.danger { background: rgba(224, 108, 117, .92); color: #2a0d10; }
 
+/* 这两个都盖在图片上，文字要能压住画面的细节 */
+.card .badge, .card .spinner { text-shadow: var(--text-shadow-on-image); }
+
 .card .spinner {
   position: absolute;
   inset: 0;
@@ -583,11 +592,10 @@ body {
 .card .title {
   font-size: 12px;
   line-height: 1.35;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  /* 标题始终单行，超出截断加省略号 —— 两行标题会让卡片高度参差不齐 */
+  white-space: nowrap;
   overflow: hidden;
-  word-break: break-word;
+  text-overflow: ellipsis;
 }
 
 .card .sub {
@@ -620,6 +628,47 @@ body {
 }
 
 .card .card-tag.own { background: rgba(106, 169, 255, .15); color: #9dc4ff; }
+
+/* ---------- 信息叠在图片上（视图设置里可切换）---------- */
+
+/* 信息区脱流后，卡片高度就只剩下图片本身，标题作者压在底部的渐变上 */
+body.overlay-info .card .info {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  gap: 1px;
+  padding: 34px 9px 8px;
+  background: linear-gradient(to top, rgba(6, 8, 12, .88), rgba(6, 8, 12, .52) 52%, transparent);
+  /* 点击穿透到卡片本身，否则点文字不会打开大图 */
+  pointer-events: none;
+}
+
+body.overlay-info .card .title {
+  color: #fff;
+  text-shadow: var(--text-shadow-on-image);
+}
+
+body.overlay-info .card .sub {
+  color: rgba(255, 255, 255, .76);
+  text-shadow: var(--text-shadow-on-image);
+}
+
+/* 作者名要能单独点击筛选，所以把它从穿透里放出来 */
+body.overlay-info .card .sub .author-name { pointer-events: auto; }
+
+body.overlay-info .card .card-tag {
+  background: rgba(255, 255, 255, .2);
+  color: #f4f7fc;
+  text-shadow: var(--text-shadow-on-image);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+body.overlay-info .card .card-tag.own {
+  background: rgba(106, 169, 255, .38);
+  color: #eef4ff;
+}
 
 .empty {
   grid-column: 1 / -1;
@@ -947,6 +996,10 @@ body.right-open .edge-right { right: var(--side-right); }
 }
 
 .lb-panel:empty { display: none; }
+
+/* 左右浮层和底部信息条都压在半透明背景（甚至直接压在图上），
+   统一加一层阴影，否则深色画面上的文字会糊成一片 */
+.lb-pages, .lb-panel, .lb-bar { text-shadow: var(--text-shadow-on-image); }
 
 .lb-panel h3 {
   margin: 0 0 3px;
