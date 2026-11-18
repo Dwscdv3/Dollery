@@ -677,19 +677,6 @@ body.overlay-info .card .card-tag.own {
   color: var(--muted);
 }
 
-.statusbar {
-  flex: 0 0 auto;
-  padding: 5px 14px;
-  background: var(--panel);
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 12px;
-  min-height: 24px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* 滚动条 */
 .grid-wrap::-webkit-scrollbar,
 .side-list::-webkit-scrollbar,
@@ -925,7 +912,7 @@ body.right-open .edge-right { right: var(--side-right); }
   top: 0;
   bottom: 0;
   width: 200px;
-  padding: 52px 14px 64px;
+  padding: 52px 14px 24px;
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
@@ -985,7 +972,7 @@ body.right-open .edge-right { right: var(--side-right); }
   top: 0;
   bottom: 0;
   width: 340px;
-  padding: 52px 18px 64px;
+  padding: 52px 18px 24px;
   overflow-y: auto;
   background: rgba(28, 33, 42, .62);
   backdrop-filter: blur(22px) saturate(150%);
@@ -999,7 +986,7 @@ body.right-open .edge-right { right: var(--side-right); }
 
 /* 左右浮层和底部信息条都压在半透明背景（甚至直接压在图上），
    统一加一层阴影，否则深色画面上的文字会糊成一片 */
-.lb-pages, .lb-panel, .lb-bar { text-shadow: var(--text-shadow-on-image); }
+.lb-pages, .lb-panel { text-shadow: var(--text-shadow-on-image); }
 
 .lb-panel h3 {
   margin: 0 0 3px;
@@ -1126,28 +1113,6 @@ body.right-open .edge-right { right: var(--side-right); }
 
 .lightbox:has(.lb-pages:empty) .lb-prev { left: 12px; }
 .lightbox:has(.lb-panel:empty) .lb-next { right: 12px; }
-
-.lb-bar {
-  position: absolute;
-  left: 200px;
-  right: 340px;
-  bottom: 0;
-  padding: 10px 24px;
-  background: linear-gradient(transparent, rgba(0, 0, 0, .85));
-  color: #cfd6e2;
-  font-size: 12px;
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  pointer-events: none;
-  justify-content: center;
-}
-
-.lightbox:has(.lb-pages:empty) .lb-bar { left: 0; }
-.lightbox:has(.lb-panel:empty) .lb-bar { right: 0; }
-
-.lb-bar #lbTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lb-bar #lbMeta, .lb-bar #lbZoom { color: var(--muted); flex: 0 0 auto; }
 
 /* ---------- 小说阅读器 ---------- */
 
