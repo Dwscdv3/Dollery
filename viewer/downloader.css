@@ -1,0 +1,295 @@
+/* 下载管理器专用样式。基础变量和按钮风格沿用 style.css。 */
+
+.dl-body {
+  display: block;
+  overflow-y: auto;
+  min-height: 100vh;
+}
+
+.dl-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 24px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.dl-title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.dl-title h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: .3px;
+}
+
+.dl-conn {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dl-conn.ok { color: #7bc47f; }
+.dl-conn.bad { color: var(--danger); }
+
+.dl-back {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 12px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.dl-back:hover { color: var(--text); border-color: var(--accent); }
+
+.dl-main {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 20px 24px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dl-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px 18px;
+}
+
+.dl-card h2 {
+  margin: 0 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---------- 统计 ---------- */
+
+.dl-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.dl-stat {
+  background: var(--panel-2);
+  border-radius: 9px;
+  padding: 12px 14px;
+}
+
+.dl-stat .v {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.dl-stat .k {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.dl-stat.done .v { color: #7bc47f; }
+.dl-stat.missing .v { color: var(--warn); }
+.dl-stat.dead .v { color: var(--muted); }
+
+/* ---------- 进度 ---------- */
+
+.dl-progress { margin-bottom: 14px; }
+
+.dl-bar {
+  height: 8px;
+  background: var(--panel-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.dl-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #4a8fe7, var(--accent));
+  border-radius: 4px;
+  transition: width .35s ease;
+}
+
+.dl-queue-meta {
+  margin-top: 9px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.dl-queue-meta .now { color: var(--accent); }
+.dl-queue-meta .dl-sep { color: #4a5160; margin: 0 8px; }
+
+/* ---------- 按钮 ---------- */
+
+.dl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.dl-actions button,
+.dl-sources button {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font: inherit;
+  transition: border-color .15s, background .15s;
+}
+
+.dl-actions button:hover:not(:disabled),
+.dl-sources button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.dl-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+
+.dl-actions button.primary:hover:not(:disabled) { filter: brightness(1.1); }
+
+.dl-actions button:disabled,
+.dl-sources button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.dl-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 17px;
+}
+
+.dl-hint.warn { color: var(--warn); }
+
+/* ---------- 按来源 ---------- */
+
+.dl-sources {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.dl-source {
+  background: var(--panel-2);
+  border-radius: 9px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dl-source .top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dl-source .name { font-size: 12px; }
+
+.dl-source .count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-source button { padding: 6px 10px; font-size: 12px; }
+
+/* ---------- 失败列表 ---------- */
+
+.dl-badge {
+  background: rgba(224, 108, 117, .18);
+  color: var(--danger);
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-fails {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dl-fails li {
+  background: var(--panel-2);
+  border-radius: 7px;
+  padding: 8px 11px;
+  font-size: 12px;
+  display: flex;
+  gap: 10px;
+}
+
+.dl-fails .pid {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.dl-fails .msg { color: var(--danger); word-break: break-word; }
+
+/* ---------- 校验 ---------- */
+
+.dl-verify-line {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.dl-broken-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dl-broken-list li {
+  background: rgba(224, 108, 117, .12);
+  color: #e8a1a7;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-family: Consolas, monospace;
+}
+
+.dl-body::-webkit-scrollbar { width: 10px; }
+.dl-body::-webkit-scrollbar-thumb { background: #333a45; border-radius: 5px; }

@@ -18,7 +18,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { readDocument } from '../src/store.mjs';
-import { downloadRecords } from '../src/download.mjs';
+import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
 import { RateLimiter } from '../src/http.mjs';
 
@@ -31,6 +31,16 @@ const VIEWER_DIR = path.join(ROOT, 'viewer');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
 
 const BASE_PORT = 7788;
+
+/**
+ * 判定「文件是否为可用图片」的快速门槛。
+ *
+ * 实测很反直觉：一张 64×64 的纯色 AVIF 只有 300 字节。收藏里存在像素画、纯色图这类
+ * 极小作品，阈值一旦设成几百字节就会把它们误判成损坏、反复重下。
+ * 所以这里压到 64 字节，只拦「0 字节」和「写了一半就断」这种明显情况；
+ * 真正的判定交给 magick identify -ping（见 /api/verify）。
+ */
+const MIN_VALID_BYTES = 64;
 
 const SOURCES = [
   { key: 'illustPublic', file: 'bookmarks-illust.json', label: '插画·公开', kind: 'illust' },
@@ -74,10 +84,10 @@ const queue = {
 /**
  * 自动队列单作品的页数上限。
  *
- * 实测收藏里有 62 页、92 页的合集，下载一个要两三分钟 —— 一旦进了自动队列，
- * 后面的作品全被堵住。所以超过这个页数的不自动下，留给用户点开时再决定。
+ * 只下首张之后这个限制其实已经用不上了（每个作品固定 1 页），
+ * 保留常量只是为了 /api/enqueue 的 skip 语义有地方可调。
  */
-const AUTO_MAX_PAGES = 30;
+const AUTO_MAX_PAGES = 0; // 0 = 不限制
 
 async function loadConfig() {
   try {
@@ -87,7 +97,37 @@ async function loadConfig() {
   }
 }
 
-/** 扫描 images/ 目录，建立 pid -> 已下载文件 的索引。 */
+/** 文件存在且不算明显损坏。只做大小判断，不碰内容（内容校验见 verify 流程）。 */
+async function isFileUsable(filePath) {
+  try {
+    const stat = await fsp.stat(filePath);
+    return stat.isFile() && stat.size >= MIN_VALID_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+/** 分批并发 stat，避免 1.5 万个文件同时打开句柄。 */
+async function statMany(dir, names, batchSize = 200) {
+  const results = [];
+  for (let i = 0; i < names.length; i += batchSize) {
+    const slice = names.slice(i, i + batchSize);
+    const stats = await Promise.all(
+      slice.map(async (name) => {
+        try {
+          const stat = await fsp.stat(path.join(dir, name));
+          return { name, size: stat.size };
+        } catch {
+          return { name, size: 0 };
+        }
+      }),
+    );
+    results.push(...stats);
+  }
+  return results;
+}
+
+/** 扫描 images/ 目录，建立 pid -> 已下载文件 的索引。明显损坏的文件当未下载处理。 */
 async function scanImages() {
   const index = new Map();
   let names = [];
@@ -97,7 +137,11 @@ async function scanImages() {
     return index;
   }
 
-  for (const name of names) {
+  const stats = await statMany(IMAGES_DIR, names);
+
+  for (const { name, size } of stats) {
+    if (size < MIN_VALID_BYTES) continue; // 0 字节或截断，视为没下载
+
     const pageMatch = name.match(/^(\d+)_p(\d+)\.avif$/);
     if (pageMatch) {
       const pid = pageMatch[1];
@@ -201,6 +245,8 @@ async function downloadByPid(pid) {
     proxy: state.config?.proxy,
     // 复用同一个临时目录，队列连续下载时不反复建删
     tempDir: TMP_DIR,
+    // 网格只用第一页当缩略图，其余页等用户翻到大图时再取
+    firstPageOnly: true,
   });
 
   if (summary.failed > 0) {
@@ -208,6 +254,47 @@ async function downloadByPid(pid) {
   }
   indexDownloadedFiles(summary.filePaths ?? []);
   return summary;
+}
+
+/**
+ * 确保某一页在本地存在，没有就现下。
+ *
+ * 供大图翻页用：默认只下首张，翻到第 N 页时才走这里补那一页。
+ */
+async function ensurePage(pid, page) {
+  const target = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
+  if (await isFileUsable(target)) return target;
+
+  const key = String(pid);
+  const record = state.records.find((r) => String(r.pid) === key);
+  if (!record) return null;
+  if (record.status === 'unavailable') return null;
+  if (record.type === 'novel' || record.type === 'ugoira') return null;
+
+  // 同一页的并发请求合并
+  const jobKey = `page:${key}:${page}`;
+  if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
+
+  const job = (async () => {
+    await downloadSinglePage(state.client, {
+      pid: key,
+      page,
+      outDir: IMAGES_DIR,
+      tmpDir: TMP_DIR,
+      imageLimiter: state.imageLimiter,
+      proxy: state.config?.proxy,
+      quality: state.config?.download?.avifQuality ?? 50,
+    });
+
+    const entry = state.imageIndex.get(key) ?? { pages: new Set(), ugoira: false };
+    entry.pages.add(page);
+    state.imageIndex.set(key, entry);
+
+    return target;
+  })().finally(() => state.thumbJobs.delete(jobKey));
+
+  state.thumbJobs.set(jobKey, job);
+  return job;
 }
 
 function queueSnapshot() {
@@ -250,7 +337,7 @@ function enqueue(pids, { manual = false } = {}) {
     if (state.imageIndex.has(pid)) continue;
 
     const pageCount = Number(record.pages) || 0;
-    if (!manual && pageCount > AUTO_MAX_PAGES) {
+    if (AUTO_MAX_PAGES > 0 && !manual && pageCount > AUTO_MAX_PAGES) {
       // 不入队、也不记失败：卡片保持「点击下载」，用户可以自己决定要不要下
       skippedLarge += 1;
       continue;
@@ -299,6 +386,67 @@ async function runQueue() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 全量完整性校验。
+ *
+ * 用 `magick identify -ping` 只读文件头，不解像素，比真正解码快得多。
+ * 发现坏文件就从索引里摘掉 —— 下次浏览时它会被当作「未下载」重新排队。
+ *
+ * 1.5 万个文件要跑十几分钟，所以只在用户手动触发时执行。
+ */
+const verifyState = {
+  running: false,
+  checked: 0,
+  total: 0,
+  broken: [],
+  startedAt: null,
+  finishedAt: null,
+};
+
+async function runVerify() {
+  if (verifyState.running) return;
+
+  verifyState.running = true;
+  verifyState.checked = 0;
+  verifyState.broken = [];
+  verifyState.startedAt = new Date().toISOString();
+  verifyState.finishedAt = null;
+
+  let names = [];
+  try {
+    names = await fsp.readdir(IMAGES_DIR);
+  } catch {
+    verifyState.running = false;
+    return;
+  }
+
+  const targets = names.filter((name) => /^\d+_p\d+\.avif$/.test(name));
+  verifyState.total = targets.length;
+
+  for (const name of targets) {
+    const filePath = path.join(IMAGES_DIR, name);
+    try {
+      await runProcess('magick', ['identify', '-ping', filePath]);
+    } catch {
+      verifyState.broken.push(name);
+      const match = name.match(/^(\d+)_p(\d+)\.avif$/);
+      if (match) {
+        const entry = state.imageIndex.get(match[1]);
+        if (entry) {
+          entry.pages.delete(Number(match[2]));
+          if (entry.pages.size === 0 && !entry.ugoira && !entry.novel) {
+            state.imageIndex.delete(match[1]);
+          }
+        }
+      }
+    }
+    verifyState.checked += 1;
+  }
+
+  verifyState.running = false;
+  verifyState.finishedAt = new Date().toISOString();
 }
 
 // ---- 缩略图 ----
@@ -504,8 +652,82 @@ async function handleApi(req, res, url) {
   }
 
   // 队列状态：前端轮询这个来更新卡片
+  if (url.startsWith('/api/queue/clear')) {
+    const cleared = queue.pending.length;
+    for (const pid of queue.pending) {
+      queue.queued.delete(pid);
+      queue.pageCount.delete(pid);
+    }
+    queue.pending = [];
+    return sendJson(res, 200, { cleared, queue: queueSnapshot() });
+  }
+
   if (url.startsWith('/api/queue')) {
     return sendJson(res, 200, queueSnapshot());
+  }
+
+  // 统计：给下载管理器用的总览
+  if (url.startsWith('/api/stats')) {
+    const sources = SOURCES.map((source) => {
+      let total = 0;
+      let done = 0;
+      let removed = 0;
+      let unavailable = 0;
+      for (const record of state.records) {
+        if (record.source !== source.key) continue;
+        total += 1;
+        if (record.removed === 'yes') {
+          removed += 1;
+          continue;
+        }
+        if (record.status === 'unavailable') {
+          unavailable += 1;
+          continue;
+        }
+        if (state.imageIndex.has(String(record.pid))) done += 1;
+      }
+      return {
+        key: source.key,
+        label: source.label,
+        total,
+        done,
+        removed,
+        unavailable,
+        missing: total - done - removed - unavailable,
+      };
+    });
+
+    return sendJson(res, 200, {
+      sources,
+      queue: queueSnapshot(),
+      verify: verifyState,
+      records: state.records.length,
+      downloaded: state.imageIndex.size,
+    });
+  }
+
+  // 把「所有还没下载的」一次性塞进队列
+  if (url.startsWith('/api/enqueue-all')) {
+    const source = params.get('source');
+    const pids = [];
+
+    for (const record of state.records) {
+      if (source && record.source !== source) continue;
+      if (record.removed === 'yes') continue;
+      if (record.status === 'unavailable') continue;
+      if (record.type === 'novel') continue; // 小说没有图片，不参与图片批量下载
+      if (state.imageIndex.has(String(record.pid))) continue;
+      pids.push(record.pid);
+    }
+
+    const { added } = enqueue(pids);
+    return sendJson(res, 200, { candidates: pids.length, added, queue: queueSnapshot() });
+  }
+
+  // 手动触发全量完整性校验
+  if (url.startsWith('/api/verify')) {
+    if (!verifyState.running) runVerify();
+    return sendJson(res, 202, verifyState);
   }
 
   // 单个下载（点开大图时用）：入队后阻塞等待它完成，避免和自动队列抢同一份配额
@@ -582,9 +804,14 @@ async function serveImage(req, res, url, kind) {
     }
   }
 
-  const original = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
-  if (!fs.existsSync(original)) return sendJson(res, 404, { error: '尚未下载' });
-  return sendFile(res, original, 'image/avif', 'public, max-age=604800');
+  // 大图：本地没有就现下这一页（默认只下首张，翻页时才补）
+  try {
+    const original = await ensurePage(pid, page);
+    if (!original) return sendJson(res, 404, { error: '这一页拿不到（作品已失效或页数不存在）' });
+    return sendFile(res, original, 'image/avif', 'public, max-age=604800');
+  } catch (err) {
+    return sendJson(res, 502, { error: err.message });
+  }
 }
 
 function serveStatic(req, res, url) {

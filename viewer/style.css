@@ -148,7 +148,8 @@ body {
   50% { opacity: 1; }
 }
 
-.meta button {
+.meta button,
+.meta .meta-link {
   background: var(--panel-2);
   border: 1px solid var(--line);
   color: var(--text);
@@ -156,9 +157,12 @@ body {
   border-radius: 8px;
   cursor: pointer;
   font: inherit;
+  text-decoration: none;
+  display: inline-block;
 }
 
-.meta button:hover { border-color: var(--accent); }
+.meta button:hover,
+.meta .meta-link:hover { border-color: var(--accent); }
 
 /* ---------- 网格 ---------- */
 

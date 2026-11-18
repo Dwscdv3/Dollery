@@ -82,7 +82,7 @@ function extensionOf(url) {
  * 下载单个作品。返回 { files, skipped, originalBytes, finalBytes, kind }。
  */
 async function downloadOne(client, record, ctx) {
-  const { outDir, tmpDir, imageLimiter, proxy, quality, keepOriginal, dryRun } = ctx;
+  const { outDir, tmpDir, imageLimiter, proxy, quality, keepOriginal, dryRun, firstPageOnly } = ctx;
   const result = { files: [], skipped: 0, originalBytes: 0, finalBytes: 0, kind: record.type };
 
   const saveBinary = async (url, target) => {
@@ -157,7 +157,11 @@ async function downloadOne(client, record, ctx) {
     throw new DownloadError('pages 接口没有返回任何页面');
   }
 
-  for (let index = 0; index < pages.length; index += 1) {
+  // 浏览器的网格只用第一页做缩略图，所以默认只下首张；
+  // 其余页等用户真的翻到大图那一页时再按需取，省空间也省时间。
+  const pageCount = firstPageOnly ? 1 : pages.length;
+
+  for (let index = 0; index < pageCount; index += 1) {
     const url = pages[index]?.urls?.original;
     if (!url) continue;
 
@@ -221,6 +225,7 @@ export async function downloadRecords(client, options) {
     proxy,
     onProgress,
     tempDir,
+    firstPageOnly = false,
   } = options;
 
   await fs.mkdir(outDir, { recursive: true });
@@ -257,6 +262,7 @@ export async function downloadRecords(client, options) {
           quality,
           keepOriginal,
           dryRun,
+          firstPageOnly,
         });
 
         summary.ok += 1;
@@ -286,3 +292,60 @@ export async function downloadRecords(client, options) {
 }
 
 export { formatBytes };
+
+/**
+ * 只下载某一页。
+ *
+ * 配合「默认只下首张」使用：用户在大图里翻到第 N 页时，才去取那一页。
+ * 和批量下载共用同一套限速、重试和压缩参数。
+ */
+export async function downloadSinglePage(client, options) {
+  const {
+    pid,
+    page,
+    outDir,
+    tmpDir,
+    imageLimiter,
+    proxy,
+    quality = 50,
+    keepOriginal = false,
+  } = options;
+
+  const pages = await client.ajax(`/ajax/illust/${pid}/pages`, { lang: 'zh' });
+  if (!Array.isArray(pages) || !pages[page]) {
+    throw new DownloadError(`第 ${page} 页不存在（共 ${Array.isArray(pages) ? pages.length : 0} 页）`);
+  }
+
+  const url = pages[page].urls?.original;
+  if (!url) throw new DownloadError(`第 ${page} 页没有原图地址`);
+
+  const target = path.join(outDir, `${pid}_p${page}.avif`);
+  const tempFile = path.join(tmpDir, `${pid}_p${page}.${extensionOf(url)}`);
+
+  const res = await imageLimiter.run(() =>
+    httpsGetWithRetry(url, {
+      proxy,
+      binary: true,
+      timeoutMs: 180000,
+      headers: { Referer: REFERER, 'User-Agent': USER_AGENT, Accept: 'image/*,*/*' },
+    }),
+  );
+  if (res.status !== 200) throw new DownloadError(`HTTP ${res.status}`);
+
+  await fs.mkdir(tmpDir, { recursive: true });
+  await fs.writeFile(tempFile, res.buffer);
+
+  try {
+    await runProcess('magick', [tempFile, '-quality', String(quality), target]);
+  } finally {
+    if (!keepOriginal) {
+      try {
+        await fs.rm(tempFile, { force: true });
+      } catch {
+        /* 留给下次清理 */
+      }
+    }
+  }
+
+  return target;
+}

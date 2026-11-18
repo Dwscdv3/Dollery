@@ -287,15 +287,11 @@ function refreshCard(card, record) {
 let enqueueBuffer = new Set();
 let enqueueTimer = null;
 
-const AUTO_MAX_PAGES = 30; // 与服务端一致：超过这个页数的不自动下载
-
 function queueForDownload(record) {
   if (!state.autoDownload) return;
   if (record.hasImage || record.localNovel || record.localUgoira) return;
   if (record.status === 'unavailable') return;
   if (record.error) return;
-  // 大合集自动下会堵住队列好几分钟，留给用户自己点
-  if (Number(record.pages) > AUTO_MAX_PAGES) return;
 
   const pid = String(record.pid);
   if (state.submitted.has(pid)) return;
@@ -322,9 +318,6 @@ async function flushEnqueue() {
     if (data.added > 0) {
       startPolling();
       applyQueueState(data.queue);
-    }
-    if (data.skippedLarge > 0) {
-      setStatus(`跳过 ${data.skippedLarge} 个页数超过 ${AUTO_MAX_PAGES} 的作品，可点开单独下载`);
     }
   } catch (err) {
     setStatus(`加入下载队列失败：${err.message}`);
@@ -491,20 +484,33 @@ function showLightboxPage() {
   const record = lb.record;
   if (!record) return;
 
-  const pages = record.localPages?.length ? record.localPages : [0];
-  const page = pages[lb.index] ?? 0;
+  // 默认只下了首张，所以页数要用记录里的总页数，而不是本地已有文件数。
+  // 缺的页由服务端的 /api/full 现场补下。
+  const totalPages = Math.max(1, Number(record.pages) || 1);
+  const page = lb.index;
 
-  els.lbImage.src = `/api/full/${record.pid}/${page}`;
   els.lbTitle.textContent = `#${record.id} 《${record.title || '无题'}》 — ${record.author || '未知'}`;
 
   const bits = [`pid ${record.pid}`];
-  if (pages.length > 1) bits.push(`第 ${lb.index + 1}/${pages.length} 页`);
+  if (totalPages > 1) bits.push(`第 ${lb.index + 1}/${totalPages} 页`);
   if (record.width && record.height) bits.push(`${record.width}×${record.height}`);
   if (record.bookmark_tags?.length) bits.push(record.bookmark_tags.join(' / '));
-  els.lbMeta.textContent = bits.join(' · ');
+  const metaText = bits.join(' · ');
+
+  const hasLocal = (record.localPages ?? []).includes(page);
+  els.lbMeta.textContent = hasLocal ? metaText : `${metaText} · 正在取这一页…`;
+
+  els.lbImage.onload = () => {
+    els.lbMeta.textContent = metaText;
+  };
+  els.lbImage.onerror = () => {
+    els.lbMeta.textContent = `${metaText} · 这一页获取失败`;
+  };
+
+  els.lbImage.src = `/api/full/${record.pid}/${page}?t=${Date.now()}`;
 
   els.lbPrev.disabled = lb.index === 0 && !hasPrevRecord();
-  els.lbNext.disabled = lb.index === pages.length - 1 && !hasNextRecord();
+  els.lbNext.disabled = lb.index === totalPages - 1 && !hasNextRecord();
   updateZoomLabel();
   resetTransform();
 }
@@ -537,10 +543,10 @@ function updateZoomLabel() {
 function stepPage(delta) {
   const record = lb.record;
   if (!record) return;
-  const pages = record.localPages?.length ? record.localPages : [0];
 
+  const totalPages = Math.max(1, Number(record.pages) || 1);
   const next = lb.index + delta;
-  if (next >= 0 && next < pages.length) {
+  if (next >= 0 && next < totalPages) {
     lb.index = next;
     showLightboxPage();
     return;
