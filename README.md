@@ -474,7 +474,8 @@ Rust/egui 内存最省，但 `image` crate 不支持 AVIF，得编译 libavif �
 | 写法 | 含义 |
 | --- | --- |
 | `type:illust` / `type:manga` / `type:ugoira` / `type:novel` | 按类型 |
-| `is:ai` / `NOT is:ai` | 是否 AI 生成 |
+| `is:ai` / `NOT is:ai` | 是否 AI 生成（见下面的三态说明） |
+| `ai:0` / `ai:1` / `ai:2` | 直接按 aiType 原值匹配 |
 | `is:r18` / `NOT is:r18` | 是否 R-18 |
 | `pages:>10` / `pages:<5` / `pages:2` | 按页数比较 |
 | `ratio:landscape` / `ratio:portrait` / `ratio:square` | 横图 / 竖图 / 方图 |
@@ -484,6 +485,21 @@ Rust/egui 内存最省，但 `image` crate 不支持 AVIF，得编译 libavif �
 | `is:unavailable` / `is:removed` / `is:bookmarked` | 已失效 / 已取消 / 仍在收藏 |
 
 不认识的字段会自动退回全文匹配，所以 `foo:bar` 不会报错，只会当成普通词。
+
+**`ai_type` 是三态，不是布尔。** pixiv 投稿时 AI 声明有三个选项，接口原样返回：
+
+| 值 | 含义 | 公开侧条数 |
+| --- | --- | --- |
+| 0 | 未标注（老作品大多是这种） | 3444 |
+| 1 | 作者声明**不是** AI | 1345 |
+| 2 | 是 AI | 70 |
+
+所以 `is:ai` 只匹配 `ai_type === 2`。用 `> 0` 是错的——那会把 1345 条
+「明确非 AI」的作品也算进去（这正是早期版本的 bug）。`NOT is:ai` 匹配 0 和 1，
+想单独找「作者声明非 AI」的用 `ai:1`，找「没标注过」的用 `ai:0`。
+
+交叉验证：`ai_type=2` 的作品里 17% 带 `midjourney` / `AIイラスト` 之类的标签，
+`ai_type=1` 的只有 0.8%，`ai_type=0` 的 0%——三种取值的语义就是这么区分开的。
 
 **搜索框获得焦点时会弹出可点选的条件面板**（按组列出上面这些），点击即插入到搜索框。
 插入时会替换光标前那半截输入，所以先打 `ra` 再点 `ratio:portrait` 不会留下 `ra`。

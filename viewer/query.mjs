@@ -270,8 +270,13 @@ function matchField(key, value, record) {
     case 'type':
       return String(record.type ?? '').toLowerCase() === value;
 
-    case 'ai':
-      return truthy(value) === (Number(record.ai_type) > 0);
+    case 'ai': {
+      // pixiv 的 aiType 是三态：0 未标注 / 1 作者声明不是 AI / 2 是 AI。
+      // 别用 > 0 —— 那会把「明确非 AI」的 1345 条也算成 AI。
+      const type = Number(record.ai_type) || 0;
+      if (/^[012]$/.test(String(value))) return type === Number(value);
+      return truthy(value) === (type === 2);
+    }
 
     case 'r18':
       return truthy(value) === (Number(record.x_restrict) > 0);
@@ -288,7 +293,7 @@ function matchField(key, value, record) {
     case 'is':
       switch (value) {
         case 'ai':
-          return Number(record.ai_type) > 0;
+          return Number(record.ai_type) === 2;
         case 'r18':
           return Number(record.x_restrict) > 0;
         case 'ugoira':

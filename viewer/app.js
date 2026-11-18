@@ -828,7 +828,8 @@ function renderInfoPanel(record) {
   const chips = [];
   if (Number(record.x_restrict) === 1) chips.push('<span class="chip-tag r18">R-18</span>');
   if (Number(record.x_restrict) === 2) chips.push('<span class="chip-tag r18">R-18G</span>');
-  if (Number(record.ai_type) > 0) chips.push('<span class="chip-tag ai">AI 生成</span>');
+  // aiType：0 未标注、1 作者声明非 AI、2 是 AI —— 只有 2 才配这个标签
+  if (Number(record.ai_type) === 2) chips.push('<span class="chip-tag ai">AI 生成</span>');
   if (record.type === 'manga') chips.push('<span class="chip-tag type">漫画</span>');
   if (record.type === 'ugoira') chips.push('<span class="chip-tag type">动图</span>');
   if (record.removed === 'yes') chips.push('<span class="chip-tag">已取消收藏</span>');
@@ -1210,8 +1211,10 @@ const FIELD_GROUPS = [
   {
     group: '属性',
     items: [
-      ['is:ai', 'AI 生成'],
-      ['NOT is:ai', '非 AI'],
+      ['is:ai', 'AI 生成（aiType=2）'],
+      ['NOT is:ai', '非 AI（含未标注）'],
+      ['ai:1', '作者声明不是 AI'],
+      ['ai:0', 'AI 未标注'],
       ['is:r18', 'R-18'],
       ['NOT is:r18', '非 R-18'],
     ],
