@@ -4,8 +4,11 @@
  * 语法：
  *   expr    := andExpr (OR andExpr)*
  *   andExpr := notExpr ((AND)? notExpr)*      ← 空格视为隐式 AND
- *   notExpr := NOT notExpr | primary
+ *   notExpr := NOT notExpr | -notExpr | primary
  *   primary := '(' expr ')' | WORD | "PHRASE"
+ *
+ * 排除条件有两种写法，等价：
+ *   NOT 原神      -原神      -type:novel      -"白 タイツ"      -(a OR b)
  *
  * 所有词项对「标题 / 作者 / pid / 作品标签 / 收藏标签」做统一的不区分大小写包含匹配。
  * 中文没有空格分词，所以一个 WORD 常常就是一整个中文短语，直接 includes 即可。
@@ -51,6 +54,20 @@ function tokenize(text) {
     const raw = text.slice(i, j);
     const upper = raw.toUpperCase();
 
+    // 前缀减号 = 排除。注意只认词首：R-18 这种标签里的连字符不受影响。
+    // 单独的 "-" 后面可能跟着引号短语或括号，也要当成否定。
+    if (raw === '-') {
+      tokens.push({ type: 'NOT' });
+      i = j;
+      continue;
+    }
+    if (raw.startsWith('-') && raw.length > 1) {
+      tokens.push({ type: 'NOT' });
+      tokens.push({ type: 'word', value: raw.slice(1).toLowerCase() });
+      i = j;
+      continue;
+    }
+
     if (KEYWORDS.has(upper)) tokens.push({ type: upper });
     else tokens.push({ type: 'word', value: raw.toLowerCase() });
 
@@ -94,8 +111,9 @@ function parse(tokens) {
         continue;
       }
 
-      // 隐式 AND：紧跟着的 word 或左括号说明还有个子表达式
-      if (token.type === 'word' || token.type === '(') {
+      // 隐式 AND：紧跟着的 word / 左括号 / 否定词说明还有个子表达式。
+      // NOT 必须算进来，否则 `原神 -風景` 会在 NOT 处断掉，只剩「原神」生效。
+      if (token.type === 'word' || token.type === '(' || token.type === 'NOT') {
         node = { op: 'and', left: node, right: parseNot() };
         continue;
       }

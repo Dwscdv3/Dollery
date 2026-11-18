@@ -1239,7 +1239,9 @@ function searchTail() {
 }
 
 function showSuggest() {
-  const keyword = searchTail().toLowerCase();
+  const tail = searchTail();
+  // 支持 `-ra` 这种写法：前缀减号只影响插入结果，过滤建议时忽略它
+  const keyword = (tail.startsWith('-') ? tail.slice(1) : tail).toLowerCase();
   const parts = [];
   let count = 0;
 
@@ -1274,9 +1276,11 @@ function hideSuggest() {
 /** 把条件插到搜索框里，替换掉光标前那段半截输入。 */
 function insertSearchTerm(term) {
   const tail = searchTail();
+  const negated = tail.startsWith('-');
   const value = els.search.value;
   const head = value.slice(0, value.length - tail.length);
-  const next = `${head}${term}`;
+  // 用户先打了减号：插入时保留，变成排除条件
+  const next = `${head}${negated ? '-' : ''}${term}`;
 
   els.search.value = next;
   state.query = next.trim();
