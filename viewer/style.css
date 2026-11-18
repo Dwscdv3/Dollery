@@ -92,6 +92,75 @@ body {
 
 .filters input[type="search"]:focus { border-color: var(--accent); }
 
+/* 搜索框要包一层，好把建议面板绝对定位在它下面 */
+.search-box {
+  position: relative;
+  display: flex;
+  flex: 1 1 200px;
+  min-width: 120px;
+}
+
+.search-box input[type="search"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+
+.search-suggest {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: min(430px, 86vw);
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, .6);
+  z-index: 45;
+}
+
+.search-suggest[hidden] { display: none; }
+
+.sg-group {
+  padding: 7px 8px 3px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: .4px;
+}
+
+.sg-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sg-item:hover, .sg-item.active { background: var(--panel-2); }
+.sg-item code { color: var(--accent); }
+.sg-item .sg-desc { color: var(--muted); font-size: 11px; }
+.sg-empty { padding: 10px 8px; color: var(--muted); font-size: 12px; }
+
+/* 左栏标签面板里的「含作品标签」开关 */
+.side-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 8px 6px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.side-toggle[hidden] { display: none; }
+.side-toggle:hover { background: rgba(255, 255, 255, .04); }
+.side-toggle .switch-text { flex: 0 1 auto; }
+
 .filters select {
   background: var(--panel-2);
   border: 1px solid var(--line);

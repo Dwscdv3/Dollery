@@ -83,12 +83,14 @@ const queue = {
 };
 
 /**
- * 自动队列单作品的页数上限。
+ * 自动队列（滚动时「可见即下载」）的单作品页数上限。
  *
- * 只下首张之后这个限制其实已经用不上了（每个作品固定 1 页），
- * 保留常量只是为了 /api/enqueue 的 skip 语义有地方可调。
+ * 补齐所有页之后，页数重新变成了成本：收藏里有 200 页的合集，一个就要跑四分钟，
+ * 滚一下触发几个这种作品就会把队列堵死。所以自动入队仍然跳过超大作品，
+ * 它们留在卡片上等用户主动点开（/api/download 不受此限），
+ * 「全部下载」也显式绕过（用户点了就是要全下）。
  */
-const AUTO_MAX_PAGES = 0; // 0 = 不限制
+const AUTO_MAX_PAGES = 30;
 
 async function loadConfig() {
   try {
@@ -234,10 +236,8 @@ async function downloadByPid(pid) {
   const record = state.records.find((r) => String(r.pid) === key);
   if (!record) throw new Error('记录不存在');
   if (record.status === 'unavailable') throw new Error('作品已失效');
-  const hasImage = state.imageIndex.has(key);
-
-  // 图片已下载时不再重复下，但简介可能还缺，所以仍然要走一遍下面的简介抓取
-  if (hasImage) {
+  // 所有页都齐了才跳过；只下了首张的多页作品要继续补齐
+  if (isComplete(record)) {
     await ensureDescription(key).catch(() => {});
     return { skipped: true, files: 0, filePaths: [] };
   }
@@ -252,8 +252,8 @@ async function downloadByPid(pid) {
     proxy: state.config?.proxy,
     // 复用同一个临时目录，队列连续下载时不反复建删
     tempDir: TMP_DIR,
-    // 网格只用第一页当缩略图，其余页等用户翻到大图时再取
-    firstPageOnly: true,
+    // 补齐所有缺失的页 —— 已存在的页在下载层会自己跳过，不会重复下
+    firstPageOnly: false,
   });
 
   if (summary.failed > 0) {
@@ -340,7 +340,7 @@ function queueSnapshot() {
  *
  * `manual: true` 用于用户主动点击 —— 那种情况不下页数限制，也插到队首优先处理。
  */
-function enqueue(pids, { manual = false } = {}) {
+function enqueue(pids, { bypassPageLimit = false, priority = false } = {}) {
   let added = 0;
   let skippedLarge = 0;
 
@@ -355,13 +355,12 @@ function enqueue(pids, { manual = false } = {}) {
       queue.failed.set(pid, '作品已失效');
       continue;
     }
-    // 图片和简介都齐了才算「已完成」，只缺简介也要入队
-    const hasImage = state.imageIndex.has(pid);
+    // 页数补齐 + 简介都有，才算「已完成」；只缺其中任一样都要再跑一遍
     const hasDesc = Boolean(record.description) || descCache.has(pid) || record.type === 'novel';
-    if (hasImage && hasDesc) continue;
+    if (isComplete(record) && hasDesc) continue;
 
     const pageCount = Number(record.pages) || 0;
-    if (AUTO_MAX_PAGES > 0 && !manual && pageCount > AUTO_MAX_PAGES) {
+    if (AUTO_MAX_PAGES > 0 && !bypassPageLimit && pageCount > AUTO_MAX_PAGES) {
       // 不入队、也不记失败：卡片保持「点击下载」，用户可以自己决定要不要下
       skippedLarge += 1;
       continue;
@@ -369,13 +368,15 @@ function enqueue(pids, { manual = false } = {}) {
 
     queue.queued.add(pid);
     queue.pageCount.set(pid, pageCount);
-    if (manual) queue.pending.unshift(pid);
+    // priority 是「用户点开的这一个」，插到队首；其余一律追加，
+    // 避免一次性入队几千个时反复 unshift 变成 O(n²)
+    if (priority) queue.pending.unshift(pid);
     else queue.pending.push(pid);
     added += 1;
   }
 
   // 短作品优先：让用户尽快看到更多图，而不是被一个大合集堵住
-  if (added > 0 && !manual) {
+  if (added > 0 && !priority) {
     queue.pending.sort((a, b) => (queue.pageCount.get(a) ?? 0) - (queue.pageCount.get(b) ?? 0));
     runQueue();
   } else if (added > 0) {
@@ -833,9 +834,38 @@ function serveFallbackAvatar(res) {
   res.end(svg);
 }
 
+/**
+ * 一个作品的页数账本。
+ *
+ * 判断「下没下完」必须按页算而不是按作品算：多页作品只下了首张时，
+ * 按作品算会说它已完成，实际上大图翻到第二页还是要现取。
+ * 小说和动图各自只有一份产物，按 1 页记。
+ */
+function pageStats(record) {
+  const pid = String(record.pid);
+  const entry = state.imageIndex.get(pid);
+
+  if (record.type === 'novel') {
+    return { total: 1, have: entry?.novel ? 1 : 0 };
+  }
+  if (record.type === 'ugoira' || entry?.ugoira) {
+    return { total: 1, have: entry?.ugoira ? 1 : 0 };
+  }
+
+  const total = Math.max(1, Number(record.pages) || 1);
+  const have = entry ? Math.min(entry.pages.size, total) : 0;
+  return { total, have };
+}
+
+function isComplete(record) {
+  const stats = pageStats(record);
+  return stats.have >= stats.total;
+}
+
 function decorate(record) {
   const entry = state.imageIndex.get(String(record.pid));
   const pages = entry ? [...entry.pages].sort((a, b) => a - b) : [];
+  const stats = pageStats(record);
   return {
     id: record.id,
     pid: record.pid,
@@ -857,6 +887,9 @@ function decorate(record) {
     removed: record.removed ?? '',
     url: record.url ?? '',
     source: record.source,
+    totalPages: stats.total,
+    havePages: stats.have,
+    complete: stats.have >= stats.total,
     hasImage: pages.length > 0 || Boolean(entry?.ugoira),
     hasCover: record.type === 'novel' ? fs.existsSync(path.join(IMAGES_DIR, `${record.pid}_cover.jpg`)) : false,
     localPages: pages,
@@ -948,10 +981,8 @@ async function handleApi(req, res, url) {
     if (authorId) list = list.filter((r) => String(r.author_id ?? '') === authorId);
 
     if (missingOnly) {
-      list = list.filter((r) => {
-        const entry = state.imageIndex.get(String(r.pid));
-        return !entry || (entry.pages.size === 0 && !entry.ugoira && !entry.novel);
-      });
+      // 按页判断：多页作品只下了首张也算「未下载完」
+      list = list.filter((r) => !isComplete(r));
     }
 
     list = orderRecords(list, sort, seed);
@@ -1005,20 +1036,46 @@ async function handleApi(req, res, url) {
     });
   }
 
-  // 当前来源用到的收藏标签及数量，用于筛选下拉
+  // 当前来源用到的标签及数量，用于左栏的标签面板
+  // include=1 时把作品本身的标签也算进来；同一作品上的同名标签只计一次，
+  // 否则「收藏标签和作品标签重名」会被算成两个作品。
   if (url.startsWith('/api/tags')) {
     const source = params.get('source') ?? 'illustPublic';
-    const counter = new Map();
+    const includeWork = params.get('include') === '1';
+    const counter = new Map(); // tag -> { count, own }
+
+    const bump = (tag, isOwn) => {
+      const item = counter.get(tag) ?? { count: 0, own: 0 };
+      item.count += 1;
+      if (isOwn) item.own += 1;
+      counter.set(tag, item);
+    };
+
     for (const record of state.records) {
       if (record.source !== source) continue;
+
+      const seen = new Set();
+
       for (const tag of record.bookmark_tags ?? []) {
-        counter.set(tag, (counter.get(tag) ?? 0) + 1);
+        if (!tag || seen.has(tag)) continue;
+        seen.add(tag);
+        bump(tag, true);
+      }
+
+      if (!includeWork) continue;
+
+      for (const tag of record.tags ?? []) {
+        if (!tag || seen.has(tag)) continue;
+        seen.add(tag);
+        bump(tag, false);
       }
     }
+
     const list = [...counter.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([tag, count]) => ({ tag, count }));
-    return sendJson(res, 200, { tags: list });
+      .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0], 'zh'))
+      .map(([tag, item]) => ({ tag, count: item.count, own: item.own }));
+
+    return sendJson(res, 200, { tags: list, includeWork });
   }
 
   // 批量入队：前端滚动时把视口内未下载的作品扔进来
@@ -1049,13 +1106,20 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, queueSnapshot());
   }
 
-  // 统计：给下载管理器用的总览
+  // 统计：给下载管理器用的总览。作品数和页数各算一套 ——
+  // 「已下载 120 个作品」和「已下载 300 / 4200 页」是两回事，后者才反映真实进度。
   if (url.startsWith('/api/stats')) {
+    let allPagesTotal = 0;
+    let allPagesDone = 0;
+
     const sources = SOURCES.map((source) => {
       let total = 0;
       let done = 0;
       let removed = 0;
       let unavailable = 0;
+      let pagesTotal = 0;
+      let pagesDone = 0;
+
       for (const record of state.records) {
         if (record.source !== source.key) continue;
         total += 1;
@@ -1067,8 +1131,16 @@ async function handleApi(req, res, url) {
           unavailable += 1;
           continue;
         }
-        if (state.imageIndex.has(String(record.pid))) done += 1;
+
+        const stats = pageStats(record);
+        pagesTotal += stats.total;
+        pagesDone += stats.have;
+        if (stats.have >= stats.total) done += 1;
       }
+
+      allPagesTotal += pagesTotal;
+      allPagesDone += pagesDone;
+
       return {
         key: source.key,
         label: source.label,
@@ -1077,6 +1149,7 @@ async function handleApi(req, res, url) {
         removed,
         unavailable,
         missing: total - done - removed - unavailable,
+        pages: { total: pagesTotal, done: pagesDone, missing: pagesTotal - pagesDone },
       };
     });
 
@@ -1086,6 +1159,7 @@ async function handleApi(req, res, url) {
       verify: verifyState,
       records: state.records.length,
       downloaded: state.imageIndex.size,
+      pages: { total: allPagesTotal, done: allPagesDone, missing: allPagesTotal - allPagesDone },
     });
   }
 
@@ -1100,13 +1174,13 @@ async function handleApi(req, res, url) {
       if (record.status === 'unavailable') continue;
       if (record.type === 'novel') continue; // 小说没有图片，不参与图片批量下载
       const pid = String(record.pid);
-      const hasImg = state.imageIndex.has(pid);
+      // 页数补齐 + 简介齐全才算完成，只差其中一项也要入队
       const hasDesc = Boolean(record.description) || descCache.has(pid);
-      if (hasImg && hasDesc) continue;
+      if (isComplete(record) && hasDesc) continue;
       pids.push(record.pid);
     }
 
-    const { added } = enqueue(pids);
+    const { added } = enqueue(pids, { bypassPageLimit: true });
     return sendJson(res, 200, { candidates: pids.length, added, queue: queueSnapshot() });
   }
 
@@ -1132,7 +1206,7 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { status: 'already', files: 0 });
     }
 
-    enqueue([pid], { manual: true });
+    enqueue([pid], { bypassPageLimit: true, priority: true });
 
     const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {

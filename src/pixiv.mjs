@@ -93,6 +93,34 @@ export class PixivClient {
     return this.parseAjax(res, url);
   }
 
+  /**
+   * 取一个网页而不是 JSON。
+   *
+   * 只为一件事存在：收藏标签。Pixiv 没有任何接口能按作品查「我给它打了什么
+   * 收藏标签」，只有网页版「编辑收藏」的旧页面里，`<input name="tag">` 的
+   * value 才是当前已设的标签。实测两个入口都还活着：
+   *   插画  /bookmark_add.php?type=illust&illust_id={pid}
+   *   小说  /novel/bookmark_add.php?id={pid}
+   *
+   * 不走 JSON 解析，也不把非 200 当异常 —— 失效时由调用方降级。
+   */
+  async html(pathname, { allowRetry = true } = {}) {
+    const url = pathname.startsWith('http') ? pathname : `${ORIGIN}${pathname}`;
+    const headers = {
+      Cookie: this.cookie,
+      Referer: `${ORIGIN}/`,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'User-Agent': this.userAgent,
+    };
+    if (this.userId) headers['x-user-id'] = this.userId;
+
+    const options = { headers, proxy: this.proxy, timeoutMs: 30000 };
+    return this.limiter.run(() =>
+      allowRetry ? httpsGetWithRetry(url, options, { retries: 2 }) : httpsGetWithRetry(url, options, { retries: 0 }),
+    );
+  }
+
   parseAjax(res, url) {
     let payload;
     try {

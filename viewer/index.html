@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 
@@ -14,7 +14,10 @@
   <div class="tabs" id="tabs"></div>
 
   <div class="filters">
-    <input id="search" type="search" placeholder="搜索 / 布尔 / 属性：foo AND is:ai OR type:manga" autocomplete="off" spellcheck="false">
+    <div class="search-box">
+      <input id="search" type="search" placeholder="搜索 / 布尔 / 属性：foo AND is:ai OR type:manga" autocomplete="off" spellcheck="false">
+      <div class="search-suggest" id="searchSuggest" hidden></div>
+    </div>
     <select id="sortMode" title="排序方式">
       <option value="asc">最早收藏在前</option>
       <option value="desc">最新收藏在前</option>
@@ -38,6 +41,10 @@
       <button data-panel="tags">标签</button>
     </div>
     <input id="sideQuery" class="side-query" placeholder="筛选…" autocomplete="off" spellcheck="false">
+    <label class="side-toggle" id="tagIncludeWrap" hidden title="把作者给作品打的标签也算进来（同一作品上的同名标签只算一次）">
+      <span class="switch"><input type="checkbox" id="tagIncludeWork"><span class="track"></span></span>
+      <span class="switch-text">含作品标签</span>
+    </label>
     <div class="side-list" id="sideList"></div>
   </aside>
 
@@ -138,6 +145,6 @@
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>

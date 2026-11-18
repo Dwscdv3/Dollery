@@ -16,7 +16,7 @@ import { PixivClient, PixivError } from './pixiv.mjs';
 import { readRecords } from './store.mjs';
 import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
 import { downloadRecords, formatBytes } from './download.mjs';
-import { updateBookmarkTagMap, applyBookmarkTags } from './bookmark-tags.mjs';
+import { updateBookmarkTagMap, applyBookmarkTags, refreshBookmarkTags } from './bookmark-tags.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
@@ -335,7 +335,44 @@ function printSummary(result) {
  * 标签和元数据分两步走：元数据靠翻收藏列表，标签只能靠「逐标签反查」，
  * 两者成本差一个数量级，所以有缓存、有单独的开关。
  */
-async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal }) {
+async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal, result }) {
+  const meta = {
+    kindLabel: entry.label,
+    lastSync: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    sourceTotal: sourceTotal || undefined,
+  };
+
+  // ---- 差分：只查本次新增的作品，一个作品一次请求 ----
+  // 全量才用「逐标签反推」，因为反推一次要把所有标签翻一遍（约 868 个标签）。
+  if (!flags.full && !flags['rebuild-tags']) {
+    const pids = (result?.added ?? []).map((record) => record.pid).filter(Boolean);
+
+    if (pids.length === 0) {
+      console.log('    收藏标签：本次没有新增作品，无需检查');
+      return { changed: 0, stats: { total: 0, checked: 0, changed: 0, failed: 0 } };
+    }
+
+    const stats = await refreshBookmarkTags(client, {
+      filePath,
+      kind: entry.kind,
+      pids,
+      meta,
+      onProgress: (event) => {
+        if (event.index % 10 === 0 || event.index === event.total) {
+          console.log(`    逐个检查标签 ${event.index}/${event.total}（已改 ${event.changed}）`);
+        }
+      },
+    });
+
+    const failedNote = stats.failed > 0 ? `，${stats.failed} 个读取失败（保留原值）` : '';
+    console.log(
+      `    收藏标签：检查 ${stats.checked}/${stats.total} 个新增作品，${stats.changed} 条更新${failedNote}`,
+    );
+
+    return { changed: stats.changed, stats };
+  }
+
+  // ---- 全量：逐标签反推 ----
   const cacheDir = path.resolve(PROJECT_ROOT, config.bookmarkTags.cacheDir);
 
   const { map, stats } = await updateBookmarkTagMap(client, {
@@ -366,11 +403,7 @@ async function syncTagsForChannel(client, { entry, config, filePath, flags, sour
     );
   }
 
-  const changed = await applyBookmarkTags(filePath, map, {
-    kindLabel: entry.label,
-    lastSync: new Date().toISOString().replace('T', ' ').slice(0, 19),
-    sourceTotal: sourceTotal || undefined,
-  });
+  const changed = await applyBookmarkTags(filePath, map, meta);
 
   if (changed > 0) {
     console.log(`    收藏标签：${changed} 条记录已更新`);
@@ -425,6 +458,7 @@ async function commandSync(flags) {
         filePath,
         flags,
         sourceTotal: result.total,
+        result,
       });
     }
   }

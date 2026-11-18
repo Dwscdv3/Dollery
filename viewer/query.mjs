@@ -159,11 +159,90 @@ function matchNumber(actual, expr) {
 }
 
 /**
+ * 日期比较。record.published 形如 "2013-02-16T18:20:25+09:00"，取前 10 位比较，
+ * 这样 "2023"、"2023-05"、"2023-05-11" 都能按前缀匹配。
+ *   date:2023            → 落在 2023 年内
+ *   date:2023-05         → 落在 2023 年 5 月
+ *   date:>2023-01-01     → 晚于该日
+ *   date:2020..2022      → 闭区间
+ */
+function matchDate(published, expr) {
+  const text = String(published ?? '').slice(0, 10);
+  if (!text) return false;
+
+  const raw = String(expr).trim();
+
+  // 区间：a..b（任意一端可省略）
+  if (raw.includes('..')) {
+    const [from, to] = raw.split('..').map((s) => s.trim());
+    if (from && text < from) return false;
+    if (to && text > to) return false;
+    return Boolean(from || to);
+  }
+
+  // 比较：>=2023-01-01 / <2020
+  const cmp = /^(>=|<=|>|<)(\d{4}(?:-\d{2}(?:-\d{2})?)?)$/.exec(raw);
+  if (cmp) {
+    const [, op, value] = cmp;
+    const left = text.slice(0, value.length);
+    switch (op) {
+      case '>':
+        return left > value;
+      case '>=':
+        return left >= value;
+      case '<':
+        return left < value;
+      case '<=':
+        return left <= value;
+      default:
+        return false;
+    }
+  }
+
+  // 前缀：2023 / 2023-05 / 2023-05-11
+  if (/^\d{4}(-\d{2}(-\d{2})?)?$/.test(raw)) return text.startsWith(raw);
+
+  return false;
+}
+
+/**
+ * 图片比例。用「宽 / 高」判定：
+ *   ratio:landscape（横图） portrait（竖图） square（方图）
+ *   ratio:>1.5    ratio:<0.7    ratio:1.0（±2% 内算相等）
+ * 小说没有尺寸，一律不匹配（用 type:novel 找小说）。
+ */
+function matchRatio(record, expr) {
+  const w = Number(record.width) || 0;
+  const h = Number(record.height) || 0;
+  if (!w || !h) return false;
+
+  const value = String(expr).trim().toLowerCase();
+  const ratio = w / h;
+
+  if (value === 'landscape' || value === 'horizontal' || value === 'wide') return ratio > 1.02;
+  if (value === 'portrait' || value === 'vertical' || value === 'tall') return ratio < 0.98;
+  if (value === 'square') return ratio >= 0.98 && ratio <= 1.02;
+
+  const m = /^(>=|<=|>|<|=)?(\d+(?:\.\d+)?)$/.exec(value);
+  if (!m) return false;
+
+  const n = Number(m[2]);
+  const op = m[1] ?? '=';
+  if (op === '=') return Math.abs(ratio - n) <= 0.02;
+  if (op === '>') return ratio > n;
+  if (op === '>=') return ratio >= n;
+  if (op === '<') return ratio < n;
+  return ratio <= n;
+}
+
+/**
  * 字段限定。支持作品自身的属性（不是标签）：
  *   type:illust|manga|ugoira|novel
  *   ai:yes / ai:no         是否 AI 生成
  *   r18:yes / r18:no       是否 R-18
  *   pages:>10 / pages:<5 / pages:2
+ *   ratio:landscape|portrait|square|>1.5|<0.7
+ *   date:2023 / date:2023-05 / date:>2023-01-01 / date:2020..2022
  *   is:ai|r18|ugoira|manga|novel|removed|unavailable|bookmarked
  *
  * 返回 null 表示「不认识这个字段」，交给全文匹配兜底。
@@ -181,6 +260,12 @@ function matchField(key, value, record) {
 
     case 'pages':
       return matchNumber(Number(record.pages) || 0, value);
+
+    case 'ratio':
+      return matchRatio(record, value);
+
+    case 'date':
+      return matchDate(record.published, value);
 
     case 'is':
       switch (value) {

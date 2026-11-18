@@ -250,8 +250,7 @@ export async function updateBookmarkTagMap(client, options) {
  * 把标签映射写进数据文件。只改 bookmark_tags 字段，其他字段原样保留。
  * 返回实际发生变化的记录数。
  */
-export async function applyBookmarkTags(filePath, map, meta = {}) {
-  const records = await readRecords(filePath);
+export async function applyBookmarkTags(filePath, map, meta = {}) {  const records = await readRecords(filePath);
   if (records.length === 0) return 0;
 
   let changed = 0;
@@ -270,4 +269,128 @@ export async function applyBookmarkTags(filePath, map, meta = {}) {
   if (changed > 0) await writeRecords(filePath, records, meta);
 
   return changed;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * 按作品查标签（差分同步用）
+ *
+ * 上面的「逐标签反推」是全量方案：一次要把所有标签翻一遍。差分只需要处理
+ * 本次新增的少数作品，这时候逐作品查就便宜得多 —— 一个作品一次请求。
+ *
+ * 代价是它走的是网页而不是 JSON 接口，所以更容易随 Pixiv 改版失效；
+ * 失败时返回 null，调用方保留原值而不是把标签清空。
+ * ═══════════════════════════════════════════════════════════════ */
+
+function decodeEntities(text) {
+  return String(text)
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/** 标签用空格 / 逗号 / 顿号分隔；页面里会带尾随空格，必须 trim。 */
+function splitTagValue(raw) {
+  return decodeEntities(raw)
+    .split(/[,，、;；\s]+/)
+    .map((tag) => tag.trim())
+    .filter((tag) => tag && !isDefaultTag(tag));
+}
+
+/**
+ * 查单个作品当前的收藏标签。
+ * 返回 string[]（可能是空数组＝确实没打标签），或 null（拿不到，别当作空）。
+ */
+export async function fetchWorkBookmarkTags(client, kind, pid) {
+  const candidates =
+    kind === 'novel'
+      ? [`/novel/bookmark_add.php?id=${pid}`]
+      : [`/bookmark_add.php?type=illust&illust_id=${pid}`];
+
+  for (const path of candidates) {
+    let res;
+    try {
+      res = await client.html(path);
+    } catch {
+      continue;
+    }
+    if (res.status !== 200) continue;
+
+    // 页面里是 <input type="text" name="tag" value="...">
+    const match = /<input[^>]*name="tag"[^>]*>/i.exec(res.body ?? '');
+    if (!match) {
+      // 也兼容 value 在 name 前面的写法
+      const reversed = /<input[^>]*value="([^"]*)"[^>]*name="tag"/i.exec(res.body ?? '');
+      if (reversed) return splitTagValue(reversed[1]);
+      return null;
+    }
+    const value = /value="([^"]*)"/i.exec(match[0]);
+    return splitTagValue(value ? value[1] : '');
+  }
+
+  return null;
+}
+
+function sameTagSet(a, b) {
+  if (a.length !== b.length) return false;
+  const normalize = (list) => [...list].map((t) => t.toLowerCase()).sort();
+  return normalize(a).join('\u0000') === normalize(b).join('\u0000');
+}
+
+/**
+ * 对指定的一批作品逐个查收藏标签，写回数据文件。
+ *
+ * 只动这批作品，其余记录原样保留 —— 所以差分同步可以放心调用它，
+ * 不会像「整表套用映射」那样把没查到的作品标签清空。
+ *
+ * 返回 { total, checked, changed, failed }。
+ */
+export async function refreshBookmarkTags(client, options) {
+  const { filePath, kind, pids, meta = {}, onProgress } = options;
+
+  const records = await readRecords(filePath);
+  if (records.length === 0) return { total: 0, checked: 0, changed: 0, failed: 0 };
+
+  const byPid = new Map(records.map((record) => [String(record.pid), record]));
+  const targets = [];
+  const seen = new Set();
+
+  for (const raw of pids) {
+    const pid = String(raw ?? '');
+    if (!pid || seen.has(pid) || !byPid.has(pid)) continue;
+    seen.add(pid);
+    targets.push(pid);
+  }
+
+  let checked = 0;
+  let changed = 0;
+  let failed = 0;
+
+  for (let index = 0; index < targets.length; index += 1) {
+    const pid = targets[index];
+    const record = byPid.get(pid);
+
+    const tags = await fetchWorkBookmarkTags(client, kind, pid).catch(() => null);
+
+    if (tags === null) {
+      failed += 1;
+    } else {
+      const current = Array.isArray(record.bookmark_tags) ? record.bookmark_tags : [];
+      if (!sameTagSet(tags, current)) {
+        if (tags.length > 0) record.bookmark_tags = tags;
+        else delete record.bookmark_tags;
+        changed += 1;
+      }
+      checked += 1;
+    }
+
+    if (onProgress) {
+      onProgress({ index: index + 1, total: targets.length, pid, tags, changed, failed });
+    }
+  }
+
+  if (changed > 0) await writeRecords(filePath, records, meta);
+
+  return { total: targets.length, checked, changed, failed };
 }

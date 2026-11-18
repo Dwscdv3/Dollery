@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   showOwnTags: false,
   showTags: false,
   autoDownload: true,
+  tagIncludeWork: false, // 标签面板是否把作品本身的标签也算进来
   leftOpen: false,
   rightOpen: false,
 };
@@ -66,6 +67,7 @@ const els = {};
 for (const id of [
   'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
   'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
+  'searchSuggest', 'tagIncludeWrap', 'tagIncludeWork',
   'grid', 'sentinel', 'statusbar',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
@@ -155,6 +157,8 @@ function renderSideTabs() {
 
 async function loadSidePanel() {
   renderSideTabs();
+  els.tagIncludeWrap.hidden = state.sidePanel !== 'tags';
+  els.tagIncludeWork.checked = settings.tagIncludeWork;
   els.sideList.innerHTML = '<div class="side-empty">加载中…</div>';
 
   try {
@@ -163,7 +167,8 @@ async function loadSidePanel() {
       state.authors = data.authors;
       renderAuthors();
     } else {
-      const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}`);
+      const include = settings.tagIncludeWork ? '&include=1' : '';
+      const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}${include}`);
       state.tags = data.tags;
       renderTags();
     }
@@ -222,6 +227,12 @@ els.sideTabs.addEventListener('click', (event) => {
   state.sidePanel = btn.dataset.panel;
   state.sideQuery = '';
   els.sideQuery.value = '';
+  loadSidePanel();
+});
+
+els.tagIncludeWork.addEventListener('change', () => {
+  settings.tagIncludeWork = els.tagIncludeWork.checked;
+  saveSettings();
   loadSidePanel();
 });
 
@@ -489,6 +500,9 @@ async function flushEnqueue() {
       body: JSON.stringify({ pids }),
     });
     if (data.added > 0) startPolling();
+    if (data.skippedLarge > 0) {
+      setStatus(`有 ${data.skippedLarge} 个作品页数过多，未自动下载；点开即可单独补全`);
+    }
   } catch (err) {
     setStatus(`加入下载队列失败：${err.message}`);
   }
@@ -568,17 +582,20 @@ function renderDownloadPanel(data) {
     (acc, s) => {
       acc.total += s.total;
       acc.done += s.done;
-      acc.missing += s.missing;
       acc.dead += s.removed + s.unavailable;
       return acc;
     },
-    { total: 0, done: 0, missing: 0, dead: 0 },
+    { total: 0, done: 0, dead: 0 },
   );
 
+  // 计数按「页」而不是「作品」：一个 13 页的作品只下了首张，按作品算会说它完成，
+  // 实际上大图翻到第二页还得现取。失效/取消按作品记，那种没有页可算。
+  const pages = data.pages ?? { total: 0, done: 0, missing: 0 };
+
   els.dlSummary.innerHTML = `
-    <div class="cell"><div class="v">${sum.total}</div><div class="k">作品</div></div>
-    <div class="cell"><div class="v done">${sum.done}</div><div class="k">已下载</div></div>
-    <div class="cell"><div class="v miss">${sum.missing}</div><div class="k">待下载</div></div>
+    <div class="cell"><div class="v">${pages.total}</div><div class="k">总页数</div></div>
+    <div class="cell"><div class="v done">${pages.done}</div><div class="k">已下载</div></div>
+    <div class="cell"><div class="v miss">${pages.missing}</div><div class="k">待下载</div></div>
     <div class="cell"><div class="v">${sum.dead}</div><div class="k">失效/取消</div></div>
   `;
 
@@ -590,7 +607,7 @@ function renderDownloadPanel(data) {
   const bits = [];
   if (q.active) bits.push(`<span class="now">● ${q.active}</span>`);
   if (q.pending > 0) bits.push(`队列 ${q.pending}`);
-  if (q.processed > 0) bits.push(`本次完成 ${q.processed}`);
+  if (q.processed > 0) bits.push(`本次完成 ${q.processed} 个作品`);
   if (q.failedCount > 0) bits.push(`失败 ${q.failedCount}`);
   els.dlMeta.innerHTML = bits.length ? bits.join(' · ') : '队列空闲';
 
@@ -601,13 +618,16 @@ function renderDownloadPanel(data) {
   els.dlClear.disabled = q.pending === 0 && !q.active;
 
   els.dlSources.innerHTML = data.sources
-    .map(
-      (s) => `
-      <button data-source="${s.key}" ${s.missing === 0 ? 'disabled' : ''}>
+    .map((s) => {
+      // 按来源也按页显示，鼠标悬停给出作品数
+      const missingPages = s.pages?.missing ?? s.missing;
+      const title = `${s.label}：${s.pages?.done ?? 0}/${s.pages?.total ?? 0} 页 · ${s.done}/${s.total} 个作品`;
+      return `
+      <button data-source="${s.key}" ${missingPages === 0 ? 'disabled' : ''} title="${escapeHtml(title)}">
         <span>${escapeHtml(s.label)}</span>
-        <span class="n">${s.missing === 0 ? '✓' : s.missing}</span>
-      </button>`,
-    )
+        <span class="n">${missingPages === 0 ? '✓' : missingPages}</span>
+      </button>`;
+    })
     .join('');
 
   const fails = (q.failedList ?? []).slice(-6).reverse();
@@ -909,13 +929,31 @@ function showLightboxPage() {
   resetTransform();
 }
 
+/**
+ * 沿某个方向找下一个「还能看」的作品。
+ *
+ * 失效作品（status=unavailable）既没有图也下载不了，翻上去只会被强行弹回网格，
+ * 所以翻页时直接跳过它们。
+ */
+function neighborRecord(delta) {
+  const start = state.records.indexOf(lb.record);
+  if (start < 0) return null;
+
+  for (let i = start + delta; i >= 0 && i < state.records.length; i += delta) {
+    const candidate = state.records[i];
+    if (!candidate) continue;
+    if (candidate.status === 'unavailable') continue;
+    return candidate;
+  }
+  return null;
+}
+
 function hasPrevRecord() {
-  return state.records.indexOf(lb.record) > 0;
+  return Boolean(neighborRecord(-1));
 }
 
 function hasNextRecord() {
-  const i = state.records.indexOf(lb.record);
-  return i >= 0 && i < state.records.length - 1;
+  return Boolean(neighborRecord(1));
 }
 
 /**
@@ -985,8 +1023,7 @@ function stepPage(delta) {
     return;
   }
 
-  const currentIndex = state.records.indexOf(record);
-  const target = state.records[currentIndex + delta];
+  const target = neighborRecord(delta);
   if (!target) return;
   const targetCard = state.cardMap.get(String(target.pid));
   closeLightbox();
@@ -1161,8 +1198,136 @@ async function ensureDownloaded(record, card) {
 let searchTimer = null;
 els.search.addEventListener('input', () => {
   state.query = els.search.value.trim();
+  showSuggest();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(reloadAll, 280);
+});
+
+// ---------- 搜索建议：聚焦时列出可用的属性筛选 ----------
+
+const YEAR = new Date().getFullYear();
+
+const FIELD_GROUPS = [
+  {
+    group: '类型',
+    items: [
+      ['type:illust', '插画'],
+      ['type:manga', '漫画'],
+      ['type:ugoira', '动图'],
+      ['type:novel', '小说'],
+    ],
+  },
+  {
+    group: '属性',
+    items: [
+      ['is:ai', 'AI 生成'],
+      ['NOT is:ai', '非 AI'],
+      ['is:r18', 'R-18'],
+      ['NOT is:r18', '非 R-18'],
+    ],
+  },
+  {
+    group: '图片比例',
+    items: [
+      ['ratio:landscape', '横图（宽 > 高）'],
+      ['ratio:portrait', '竖图（高 > 宽）'],
+      ['ratio:square', '方图（±2%）'],
+      ['ratio:>1.5', '宽高比 > 1.5'],
+      ['ratio:<0.7', '宽高比 < 0.7'],
+    ],
+  },
+  {
+    group: '日期范围（发布日期）',
+    items: [
+      [`date:${YEAR}`, `${YEAR} 年`],
+      [`date:${YEAR - 1}`, `${YEAR - 1} 年`],
+      [`date:>${YEAR - 1}-01-01`, `${YEAR - 1} 年之后`],
+      [`date:${YEAR - 2}..${YEAR}`, '近三年'],
+      ['date:<2020-01-01', '2020 年之前'],
+    ],
+  },
+  {
+    group: '页数 / 状态',
+    items: [
+      ['pages:>1', '多页'],
+      ['pages:>10', '10 页以上'],
+      ['is:unavailable', '已失效'],
+      ['NOT is:removed', '仍在收藏'],
+    ],
+  },
+];
+
+/** 光标前正在输入的那一段（用于过滤建议、并在点击时替换掉它） */
+function searchTail() {
+  const match = /(\S*)$/.exec(els.search.value);
+  return match ? match[1] : '';
+}
+
+function showSuggest() {
+  const keyword = searchTail().toLowerCase();
+  const parts = [];
+  let count = 0;
+
+  for (const group of FIELD_GROUPS) {
+    const items = keyword
+      ? group.items.filter(
+          ([term, desc]) => term.toLowerCase().includes(keyword) || desc.toLowerCase().includes(keyword),
+        )
+      : group.items;
+    if (items.length === 0) continue;
+
+    parts.push(`<div class="sg-group">${escapeHtml(group.group)}</div>`);
+    for (const [term, desc] of items) {
+      parts.push(
+        `<div class="sg-item" data-term="${escapeHtml(term)}"><code>${escapeHtml(term)}</code>` +
+          `<span class="sg-desc">${escapeHtml(desc)}</span></div>`,
+      );
+      count += 1;
+    }
+  }
+
+  els.searchSuggest.innerHTML = count
+    ? parts.join('')
+    : '<div class="sg-empty">没有匹配的属性，可直接写全文关键词</div>';
+  els.searchSuggest.hidden = false;
+}
+
+function hideSuggest() {
+  els.searchSuggest.hidden = true;
+}
+
+/** 把条件插到搜索框里，替换掉光标前那段半截输入。 */
+function insertSearchTerm(term) {
+  const tail = searchTail();
+  const value = els.search.value;
+  const head = value.slice(0, value.length - tail.length);
+  const next = `${head}${term}`;
+
+  els.search.value = next;
+  state.query = next.trim();
+  hideSuggest();
+  reloadAll();
+  els.search.focus();
+  setStatus(`已插入条件 ${term}`);
+}
+
+els.search.addEventListener('focus', showSuggest);
+
+els.search.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') hideSuggest();
+});
+
+// 用 mousedown 而不是 click：click 之前会先触发 blur，建议面板可能已被隐藏
+els.searchSuggest.addEventListener('mousedown', (event) => {
+  event.preventDefault();
+  const item = event.target.closest('.sg-item');
+  if (item) insertSearchTerm(item.dataset.term);
+});
+
+document.addEventListener('click', (event) => {
+  if (els.searchSuggest.hidden) return;
+  if (event.target === els.search || els.searchSuggest.contains(event.target)) return;
+  hideSuggest();
 });
 
 els.sortMode.addEventListener('change', () => {
