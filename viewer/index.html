@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pixiv 收藏查看器</title>
+<title>pixiv 收藏查看器</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,41 +14,85 @@
 
   <div class="filters">
     <input id="search" type="search" placeholder="搜索 / 布尔：foo AND (bar OR baz) NOT qux" autocomplete="off" spellcheck="false">
-    <select id="tagFilter"><option value="">全部收藏标签</option></select>
     <select id="sortMode" title="排序方式">
       <option value="asc">最早收藏在前</option>
       <option value="desc">最新收藏在前</option>
       <option value="random">随机顺序</option>
     </select>
-    <label class="chip"><input type="checkbox" id="missingOnly"> 只看未下载</label>
-    <label class="chip"><input type="checkbox" id="showRemoved"> 含已取消</label>
+    <button id="btnView" class="icon-btn" title="视图设置">⚙</button>
   </div>
 
   <div class="meta">
-    <label class="chip" title="滚动时自动把视口内未下载的作品加入下载队列">
-      <input type="checkbox" id="autoDownload" checked> 可见即下载
-    </label>
     <span id="queueState" class="queue-state"></span>
     <span id="counter">—</span>
-    <a class="meta-link" href="/authors.html" target="_blank" rel="noopener" title="按作者浏览">作者</a>
-    <a class="meta-link" href="/downloader.html" target="_blank" rel="noopener" title="打开下载管理器">下载管理</a>
-    <button id="reload" title="重新读取磁盘上的图片">刷新</button>
+    <button id="btnLeft" class="icon-btn" title="左侧栏（作者 / 标签）">◧</button>
+    <button id="btnRight" class="icon-btn" title="右侧栏（下载管理）">◨</button>
+    <button id="reload" class="icon-btn" title="刷新">⟳</button>
   </div>
 </header>
 
-<main id="grid" class="grid" aria-live="polite"></main>
+<div class="app-body">
+  <aside class="side side-left" id="sideLeft">
+    <div class="side-tabs" id="sideTabs">
+      <button data-panel="authors" class="active">作者</button>
+      <button data-panel="tags">标签</button>
+    </div>
+    <input id="sideQuery" class="side-query" placeholder="筛选…" autocomplete="off" spellcheck="false">
+    <div class="side-list" id="sideList"></div>
+  </aside>
 
-<div id="sentinel" class="sentinel"></div>
+  <div class="grid-wrap">
+    <main class="grid" id="grid" aria-live="polite"></main>
+    <div id="sentinel" class="sentinel"></div>
+  </div>
+
+  <aside class="side side-right" id="sideRight">
+    <div class="side-head">下载管理</div>
+    <div class="dl-summary" id="dlSummary"></div>
+    <div class="dl-bar"><div class="dl-bar-fill" id="dlBar"></div></div>
+    <div class="dl-meta" id="dlMeta">—</div>
+    <div class="dl-actions">
+      <button id="dlAll" class="primary">全部下载</button>
+      <button id="dlClear">清空</button>
+      <button id="dlVerify" title="逐个读取文件头，检查图片是否损坏">校验</button>
+    </div>
+    <div class="side-sub">按来源</div>
+    <div class="dl-sources" id="dlSources"></div>
+    <div id="dlFails"></div>
+  </aside>
+</div>
 
 <div id="statusbar" class="statusbar"></div>
 
-<div id="lightbox" class="lightbox" hidden>
-  <aside class="lb-pages" id="lbPages" title="作品内页"></aside>
+<div class="popover" id="viewPopover" hidden>
+  <div class="pop-title">视图设置</div>
+  <div class="pop-row">
+    <label for="optRatio">封面比例</label>
+    <select id="optRatio">
+      <option value="auto">跟随原图</option>
+      <option value="3:4">3 : 4</option>
+      <option value="1:1">1 : 1</option>
+      <option value="4:3">4 : 3</option>
+      <option value="16:9">16 : 9</option>
+    </select>
+  </div>
+  <div class="pop-row">
+    <label for="optWidth">卡片宽度</label>
+    <input type="range" id="optWidth" min="140" max="340" step="10">
+    <span id="optWidthVal" class="pop-val"></span>
+  </div>
+  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optShowOwnTags"> 显示收藏标签</label></div>
+  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optShowTags"> 显示作品标签</label></div>
+  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optAutoDownload"> 可见即下载</label></div>
+  <div class="pop-foot"><button id="optReset">恢复默认</button></div>
+</div>
 
+<div id="lightbox" class="lightbox" hidden>
   <div class="lb-stage" id="lbStage">
     <img id="lbImage" alt="">
   </div>
 
+  <aside class="lb-pages" id="lbPages"></aside>
   <aside class="lb-panel" id="lbPanel"></aside>
 
   <button class="lb-btn lb-close" id="lbClose" title="关闭 (Esc)">✕</button>
@@ -61,6 +106,20 @@
   </div>
 </div>
 
-<script src="app.js"></script>
+<div id="reader" class="reader" hidden>
+  <aside class="rd-side">
+    <div class="rd-cover" id="rdCoverBox">
+      <img id="rdCover" alt="">
+    </div>
+    <h3 id="rdTitle"></h3>
+    <div class="rd-author" id="rdAuthor"></div>
+    <div class="rd-tags" id="rdTags"></div>
+    <a id="rdLink" target="_blank" rel="noopener">在 pixiv 打开 →</a>
+  </aside>
+  <div class="rd-body" id="rdBody"></div>
+  <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
+</div>
+
+<script src="app.js?v=4"></script>
 </body>
 </html>

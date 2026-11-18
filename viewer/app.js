@@ -1,11 +1,44 @@
-/* 收藏查看器前端。
+/* pixiv 收藏查看器 —— 单页应用
  *
- * 两个要点：
- *   1. 缩略图必须懒加载。服务端每张缩略图要现场调 ImageMagick，浏览器一口气发 6 个
- *      并发请求会让服务端排队，滚动手感立刻崩掉。用 IntersectionObserver 只请求视口内的。
- *   2. 点开作品时若本地没有，自动下载一次（用户要的「按需下载」）。下载期间卡片盖一层
- *      转圈，避免重复触发。
+ * 布局：顶栏 + 左栏（作者/标签）+ 网格 + 右栏（下载管理）。
+ * 所有偏好（排序、封面比例、卡片宽度、标签显示）存 localStorage。
  */
+
+// ---------- 设置 ----------
+
+const SETTINGS_KEY = 'pixiv-viewer-settings.v2';
+
+const DEFAULT_SETTINGS = {
+  sort: 'asc',
+  ratio: 'auto', // auto | 3:4 | 1:1 | 4:3 | 16:9
+  cardWidth: 210,
+  showOwnTags: false,
+  showTags: false,
+  autoDownload: true,
+  leftOpen: true,
+  rightOpen: true,
+};
+
+function loadSettings() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
+    return { ...DEFAULT_SETTINGS, ...raw };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* 隐私模式之类，忽略 */
+  }
+}
+
+let settings = loadSettings();
+
+// ---------- 状态 ----------
 
 const state = {
   sources: [],
@@ -14,47 +47,35 @@ const state = {
   total: 0,
   offset: 0,
   loading: false,
-  tag: '',
   query: '',
-  sort: 'asc',
-  seed: Math.floor(Math.random() * 1e9), // 随机排序的种子，翻页时保持不变
+  tag: '',
   authorId: '',
-  missingOnly: false,
-  showRemoved: false,
+  seed: Math.floor(Math.random() * 1e9),
+  submitted: new Set(),
+  cardMap: new Map(),
   observer: null,
-  autoDownload: true,
-  submitted: new Set(), // 已提交过下载的 pid，防止重复入队
-  cardMap: new Map(), // pid -> 卡片元素，用于按队列状态刷新
-};
-
-const els = {
-  tabs: document.getElementById('tabs'),
-  search: document.getElementById('search'),
-  tagFilter: document.getElementById('tagFilter'),
-  sortMode: document.getElementById('sortMode'),
-  missingOnly: document.getElementById('missingOnly'),
-  showRemoved: document.getElementById('showRemoved'),
-  autoDownload: document.getElementById('autoDownload'),
-  queueState: document.getElementById('queueState'),
-  counter: document.getElementById('counter'),
-  reload: document.getElementById('reload'),
-  grid: document.getElementById('grid'),
-  sentinel: document.getElementById('sentinel'),
-  statusbar: document.getElementById('statusbar'),
-  lightbox: document.getElementById('lightbox'),
-  lbStage: document.getElementById('lbStage'),
-  lbImage: document.getElementById('lbImage'),
-  lbPages: document.getElementById('lbPages'),
-  lbPanel: document.getElementById('lbPanel'),
-  lbTitle: document.getElementById('lbTitle'),
-  lbMeta: document.getElementById('lbMeta'),
-  lbZoom: document.getElementById('lbZoom'),
-  lbClose: document.getElementById('lbClose'),
-  lbPrev: document.getElementById('lbPrev'),
-  lbNext: document.getElementById('lbNext'),
+  sidePanel: 'authors',
+  sideQuery: '',
+  authors: [],
+  tags: [],
 };
 
 const PAGE_SIZE = 120;
+
+const els = {};
+for (const id of [
+  'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
+  'btnLeft', 'btnRight', 'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList',
+  'grid', 'sentinel', 'statusbar',
+  'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
+  'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
+  'optAutoDownload', 'optReset',
+  'lightbox', 'lbStage', 'lbImage', 'lbPages', 'lbPanel', 'lbTitle', 'lbMeta', 'lbZoom',
+  'lbClose', 'lbPrev', 'lbNext',
+  'reader', 'rdCover', 'rdCoverBox', 'rdTitle', 'rdAuthor', 'rdTags', 'rdLink', 'rdBody', 'rdClose',
+]) {
+  els[id] = document.getElementById(id);
+}
 
 function setStatus(text) {
   els.statusbar.textContent = text;
@@ -67,14 +88,45 @@ async function api(path, options) {
   return data;
 }
 
-// ---------- 来源标签 ----------
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]),
+  );
+}
+
+// ---------- 设置应用 ----------
+
+function applySettings() {
+  document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
+
+  els.sortMode.value = settings.sort;
+  els.optRatio.value = settings.ratio;
+  els.optWidth.value = String(settings.cardWidth);
+  els.optWidthVal.textContent = `${settings.cardWidth}px`;
+  els.optShowOwnTags.checked = settings.showOwnTags;
+  els.optShowTags.checked = settings.showTags;
+  els.optAutoDownload.checked = settings.autoDownload;
+
+  document.getElementById('sideLeft')?.classList.toggle('collapsed', !settings.leftOpen);
+  document.getElementById('sideRight')?.classList.toggle('collapsed', !settings.rightOpen);
+  document.getElementById('btnLeft')?.classList.toggle('on', settings.leftOpen);
+  document.getElementById('btnRight')?.classList.toggle('on', settings.rightOpen);
+
+  // 标签显示开关切换后要重渲染已渲染的卡片
+  for (const record of state.records) {
+    const card = state.cardMap.get(String(record.pid));
+    if (card) renderCardInner(card, record);
+  }
+}
+
+// ---------- 来源 ----------
 
 function renderTabs() {
   els.tabs.innerHTML = '';
   for (const source of state.sources) {
     const btn = document.createElement('button');
     btn.dataset.key = source.key;
-    btn.innerHTML = `${source.label}<span class="n">${source.count}</span>`;
+    btn.innerHTML = `${escapeHtml(source.label)}<span class="n">${source.count}</span>`;
     if (source.key === state.current) btn.classList.add('active');
     btn.addEventListener('click', () => switchSource(source.key));
     els.tabs.appendChild(btn);
@@ -85,91 +137,146 @@ function switchSource(key) {
   if (key === state.current) return;
   state.current = key;
   state.tag = '';
-  els.tagFilter.value = '';
-  for (const btn of els.tabs.children) {
-    btn.classList.toggle('active', btn.dataset.key === key);
-  }
-  loadTags();
+  state.authorId = '';
+  for (const btn of els.tabs.children) btn.classList.toggle('active', btn.dataset.key === key);
+  loadSidePanel();
   reloadAll();
 }
 
-// ---------- 数据加载 ----------
+// ---------- 左栏 ----------
 
-async function loadState() {
-  const data = await api('/api/state');
-  state.sources = data.sources;
-
-  const params = new URLSearchParams(location.search);
-
-  // 支持 ?source=illustPrivate 直达某个收藏夹
-  const fromUrl = params.get('source');
-  if (fromUrl && data.sources.some((s) => s.key === fromUrl)) {
-    state.current = fromUrl;
+function renderSideTabs() {
+  for (const btn of els.sideTabs.children) {
+    btn.classList.toggle('active', btn.dataset.panel === state.sidePanel);
   }
-
-  // 支持 ?q=... 直接带查询（含布尔语法）进来
-  const qParam = params.get('q');
-  if (qParam) {
-    state.query = qParam;
-    els.search.value = qParam;
-  }
-
-  // 支持 ?sort=random 等
-  const sortParam = params.get('sort');
-  if (sortParam && ['asc', 'desc', 'random'].includes(sortParam)) {
-    state.sort = sortParam;
-    els.sortMode.value = sortParam;
-  }
-
-  // 支持 ?author_id=12345 从作者页跳过来
-  const authorParam = params.get('author_id');
-  if (authorParam) {
-    state.authorId = authorParam;
-    setStatus(`已按作者筛选（author_id=${authorParam}），清除筛选请点「刷新」`);
-  }
-
-  if (!state.current) {
-    const firstWithData = data.sources.find((s) => s.count > 0) ?? data.sources[0];
-    state.current = firstWithData?.key ?? 'illustPublic';
-  }
-  renderTabs();
 }
 
-async function loadTags() {
+async function loadSidePanel() {
+  renderSideTabs();
+  els.sideList.innerHTML = '<div class="side-empty">加载中…</div>';
+
   try {
-    const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}`);
-    const options = ['<option value="">全部收藏标签</option>'];
-    for (const item of data.tags) {
-      options.push(`<option value="${escapeHtml(item.tag)}">${escapeHtml(item.tag)} (${item.count})</option>`);
+    if (state.sidePanel === 'authors') {
+      const data = await api(`/api/authors?source=${encodeURIComponent(state.current)}`);
+      state.authors = data.authors;
+      renderAuthors();
+    } else {
+      const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}`);
+      state.tags = data.tags;
+      renderTags();
     }
-    els.tagFilter.innerHTML = options.join('');
-    els.tagFilter.value = state.tag;
-  } catch {
-    els.tagFilter.innerHTML = '<option value="">全部收藏标签</option>';
+  } catch (err) {
+    els.sideList.innerHTML = `<div class="side-empty">加载失败：${escapeHtml(err.message)}</div>`;
   }
 }
+
+function renderAuthors() {
+  const filter = state.sideQuery.trim().toLowerCase();
+  const list = filter ? state.authors.filter((a) => a.name.toLowerCase().includes(filter)) : state.authors;
+
+  if (list.length === 0) {
+    els.sideList.innerHTML = '<div class="side-empty">没有匹配的作者</div>';
+    return;
+  }
+
+  els.sideList.innerHTML = list
+    .slice(0, 400)
+    .map(
+      (a) => `
+      <div class="side-item${a.author_id === state.authorId ? ' active' : ''}" data-author="${escapeHtml(
+        a.author_id,
+      )}" title="${escapeHtml(a.name)}">
+        <span class="name">${escapeHtml(a.name)}</span>
+        <span class="cnt">${a.count}</span>
+      </div>`,
+    )
+    .join('');
+}
+
+function renderTags() {
+  const filter = state.sideQuery.trim().toLowerCase();
+  const list = filter ? state.tags.filter((t) => t.tag.toLowerCase().includes(filter)) : state.tags;
+
+  if (list.length === 0) {
+    els.sideList.innerHTML = '<div class="side-empty">没有匹配的标签</div>';
+    return;
+  }
+
+  els.sideList.innerHTML = list
+    .map(
+      (t) => `
+      <div class="side-item" data-tag="${escapeHtml(t.tag)}" title="${escapeHtml(t.tag)}">
+        <span class="name">${escapeHtml(t.tag)}</span>
+        <span class="cnt">${t.count}</span>
+      </div>`,
+    )
+    .join('');
+}
+
+els.sideTabs.addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-panel]');
+  if (!btn) return;
+  state.sidePanel = btn.dataset.panel;
+  state.sideQuery = '';
+  els.sideQuery.value = '';
+  loadSidePanel();
+});
+
+els.sideList.addEventListener('click', (event) => {
+  const authorItem = event.target.closest('[data-author]');
+  if (authorItem) {
+    const id = authorItem.dataset.author;
+    state.authorId = state.authorId === id ? '' : id;
+    renderAuthors();
+    reloadAll();
+    setStatus(state.authorId ? `已筛选作者 ${id}` : '已取消作者筛选');
+    return;
+  }
+
+  const tagItem = event.target.closest('[data-tag]');
+  if (tagItem) addTagToSearch(tagItem.dataset.tag);
+});
+
+/** 点标签不是立即筛选，而是把它拼进顶部搜索框（用引号包住，标签里可能有空格）。 */
+function addTagToSearch(tag) {
+  const term = `"${tag}"`;
+  const current = els.search.value.trim();
+  const next = current ? `${current} AND ${term}` : term;
+  els.search.value = next;
+  state.query = next;
+  reloadAll();
+  setStatus(`已把标签「${tag}」加入搜索条件`);
+}
+
+let sideTimer = null;
+els.sideQuery.addEventListener('input', () => {
+  state.sideQuery = els.sideQuery.value;
+  clearTimeout(sideTimer);
+  sideTimer = setTimeout(() => {
+    if (state.sidePanel === 'authors') renderAuthors();
+    else renderTags();
+  }, 150);
+});
+
+// ---------- 列表 ----------
 
 function buildQuery(offset) {
   const params = new URLSearchParams({
     source: state.current,
     offset: String(offset),
     limit: String(PAGE_SIZE),
-    sort: state.sort,
+    sort: settings.sort,
   });
   if (state.query) params.set('q', state.query);
   if (state.tag) params.set('tag', state.tag);
   if (state.authorId) params.set('author_id', state.authorId);
-  if (state.missingOnly) params.set('missing', '1');
-  if (state.showRemoved) params.set('removed', '1');
-  // 随机排序必须带固定种子，否则翻页会重复/漏项
-  if (state.sort === 'random') params.set('seed', String(state.seed));
+  if (settings.sort === 'random') params.set('seed', String(state.seed));
   return `/api/records?${params}`;
 }
 
 async function loadPage(reset) {
   if (state.loading) return;
   state.loading = true;
-  setStatus('加载中…');
 
   try {
     if (reset) {
@@ -177,6 +284,7 @@ async function loadPage(reset) {
       state.records = [];
       state.cardMap.clear();
       els.grid.innerHTML = '';
+      document.querySelector('.grid-wrap').scrollTop = 0;
     }
 
     const data = await api(buildQuery(state.offset));
@@ -189,15 +297,13 @@ async function loadPage(reset) {
     state.records.push(...data.items);
     state.offset += data.items.length;
 
-    for (const record of data.items) {
-      els.grid.appendChild(createCard(record));
-    }
+    const frag = document.createDocumentFragment();
+    for (const record of data.items) frag.appendChild(createCard(record));
+    els.grid.appendChild(frag);
 
     updateCounter();
     setStatus(
-      data.items.length === 0
-        ? '没有更多了'
-        : `已显示 ${state.records.length} / ${state.total} 条`,
+      data.items.length === 0 ? '没有更多了' : `已显示 ${state.records.length} / ${state.total} 条`,
     );
   } catch (err) {
     setStatus(`加载失败：${err.message}`);
@@ -216,22 +322,31 @@ function reloadAll() {
 
 // ---------- 卡片 ----------
 
-function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]),
-  );
+function ratioPadding(record) {
+  if (settings.ratio === 'auto') {
+    const w = Number(record.width);
+    const h = Number(record.height);
+    if (w > 0 && h > 0) return (h / w) * 100;
+    return 133.33;
+  }
+  const [a, b] = settings.ratio.split(':').map(Number);
+  return (b / a) * 100;
+}
+
+function thumbUrl(record, page) {
+  // 按卡片显示宽度 × 像素密度请求，服务端选不小于该目标的最小级别
+  const target = Math.round(settings.cardWidth * (window.devicePixelRatio || 1));
+  return `/api/thumb/${record.pid}/${page}?w=${target}`;
 }
 
 function createCard(record) {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.pid = record.pid;
-  card.dataset.id = record.id;
   renderCardInner(card, record);
   card.addEventListener('click', () => openLightbox(record, card));
   state.cardMap.set(String(record.pid), card);
 
-  // 懒加载 + 自动入队：同一份可见性判断做两件事
   if (!state.observer) {
     state.observer = new IntersectionObserver(
       (entries) => {
@@ -241,13 +356,12 @@ function createCard(record) {
 
           const img = entry.target.querySelector('img[data-src]');
           if (img) {
-            // 淡入效果靠 .loaded 触发，加载失败也要给出可见反馈
             img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
             img.addEventListener(
               'error',
               () => {
                 img.classList.add('loaded');
-                img.style.opacity = '0.25';
+                img.style.opacity = '0.2';
               },
               { once: true },
             );
@@ -259,7 +373,7 @@ function createCard(record) {
           if (target) queueForDownload(target);
         }
       },
-      { root: els.grid, rootMargin: '400px' },
+      { root: document.querySelector('.grid-wrap'), rootMargin: '400px' },
     );
   }
   state.observer.observe(card);
@@ -269,42 +383,69 @@ function createCard(record) {
 
 function renderCardInner(card, record) {
   const firstPage = record.localPages?.[0] ?? 0;
-  const downloadable = record.type === 'illust' || record.type === 'manga';
+  const isNovel = record.type === 'novel';
+  const downloadable = !isNovel;
 
   let badge = '';
   if (record.removed === 'yes') badge = '<span class="badge danger">已取消</span>';
   else if (record.status === 'unavailable') badge = '<span class="badge warn">已失效</span>';
   else if (record.localUgoira) badge = '<span class="badge">动图</span>';
-  else if (record.type === 'novel') badge = '<span class="badge">小说</span>';
+  else if (isNovel) badge = '<span class="badge">小说</span>';
 
   let frame;
   if (record.hasImage && downloadable) {
-    const url = `/api/thumb/${record.pid}/${firstPage}`;
-    frame = `<img data-src="${url}" alt="">`;
+    frame = `<img data-src="${thumbUrl(record, firstPage)}" alt="">`;
+  } else if (isNovel && record.hasCover) {
+    frame = `<img data-src="/api/cover/${record.pid}" alt="">`;
+  } else if (isNovel) {
+    frame = '<div class="placeholder"><span class="icon">📖</span><span>点击阅读</span></div>';
   } else if (record.localNovel) {
     frame = '<div class="placeholder"><span class="icon">📖</span>正文已下载</div>';
   } else if (record.localUgoira) {
-    frame = '<div class="placeholder"><span class="icon">🎞</span>动图 zip 已下载</div>';
+    frame = '<div class="placeholder"><span class="icon">🎞</span>动图已下载</div>';
   } else {
     const failed = Boolean(record.error);
-    const icon = failed ? '⚠' : downloadable ? '⬇' : '📄';
-    const label = failed ? '下载失败' : downloadable ? '点击下载' : '点击获取';
     frame = `
       <div class="placeholder">
-        <span class="icon">${icon}</span>
-        <span>${label}</span>
+        <span class="icon">${failed ? '⚠' : downloadable ? '⬇' : '📄'}</span>
+        <span>${failed ? '下载失败' : downloadable ? '点击下载' : '点击打开'}</span>
       </div>`;
   }
 
   const spinner = record.downloading ? '<div class="spinner">下载中</div>' : '';
 
+  const own = settings.showOwnTags ? record.bookmark_tags ?? [] : [];
+  const works = settings.showTags ? record.tags ?? [] : [];
+  const tagHtml =
+    own.length || works.length
+      ? `<div class="card-tags">${own
+          .slice(0, 4)
+          .map((t) => `<span class="card-tag own">${escapeHtml(t)}</span>`)
+          .join('')}${works
+          .slice(0, 3)
+          .map((t) => `<span class="card-tag">${escapeHtml(t)}</span>`)
+          .join('')}</div>`
+      : '';
+
   card.innerHTML = `
-    <div class="frame">${frame}${badge}${spinner}</div>
+    <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${spinner}</div>
     <div class="info">
       <div class="title">${escapeHtml(record.title || '(无题)')}</div>
-      <div class="sub">${escapeHtml(record.author || '未知')}</div>
+      <div class="sub"><span class="author-name">${escapeHtml(record.author || '未知')}</span></div>
+      ${tagHtml}
     </div>
   `;
+
+  const authorEl = card.querySelector('.author-name');
+  if (authorEl && record.author_id) {
+    authorEl.addEventListener('click', (event) => {
+      event.stopPropagation(); // 别顺带打开大图
+      state.authorId = record.author_id;
+      renderAuthors();
+      reloadAll();
+      setStatus(`已筛选作者：${record.author}`);
+    });
+  }
 }
 
 function refreshCard(card, record) {
@@ -314,15 +455,12 @@ function refreshCard(card, record) {
 
 // ---------- 自动下载队列 ----------
 
-/* 滚动时把视口内未下载的作品攒一小批再提交，避免每张图一次请求。
-   `state.submitted` 是前端侧的防重，服务端还有一层 queued/done/failed 去重。 */
-
 let enqueueBuffer = new Set();
 let enqueueTimer = null;
 
 function queueForDownload(record) {
-  if (!state.autoDownload) return;
-  if (record.hasImage || record.localNovel || record.localUgoira) return;
+  if (!settings.autoDownload) return;
+  if (record.hasImage || record.localNovel || record.localUgoira || record.hasCover) return;
   if (record.status === 'unavailable') return;
   if (record.error) return;
 
@@ -338,7 +476,6 @@ function queueForDownload(record) {
 
 async function flushEnqueue() {
   if (enqueueBuffer.size === 0) return;
-
   const pids = [...enqueueBuffer];
   enqueueBuffer.clear();
 
@@ -348,10 +485,7 @@ async function flushEnqueue() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pids }),
     });
-    if (data.added > 0) {
-      startPolling();
-      applyQueueState(data.queue);
-    }
+    if (data.added > 0) startPolling();
   } catch (err) {
     setStatus(`加入下载队列失败：${err.message}`);
   }
@@ -363,7 +497,7 @@ let idleTicks = 0;
 function startPolling() {
   if (pollTimer) return;
   idleTicks = 0;
-  pollTimer = setInterval(pollQueue, 1200);
+  pollTimer = setInterval(pollQueue, 1300);
   pollQueue();
 }
 
@@ -375,11 +509,11 @@ function stopPolling() {
 
 async function pollQueue() {
   try {
-    const snapshot = await api('/api/queue');
-    applyQueueState(snapshot);
-    updateQueueLabel(snapshot);
+    const snapshot = await api('/api/stats');
+    applyQueueState(snapshot.queue);
+    renderDownloadPanel(snapshot);
 
-    if (!snapshot.running && snapshot.pending === 0 && !snapshot.active) {
+    if (!snapshot.queue.running && snapshot.queue.pending === 0 && !snapshot.queue.active) {
       idleTicks += 1;
       if (idleTicks >= 3) stopPolling();
     } else {
@@ -400,7 +534,7 @@ function applyQueueState(snapshot) {
     const card = state.cardMap.get(pid);
 
     if (done.has(pid)) {
-      if (!record.hasImage) {
+      if (!record.hasImage && !record.hasCover) {
         record.hasImage = true;
         record.localPages = [0];
         record.downloading = false;
@@ -424,60 +558,114 @@ function applyQueueState(snapshot) {
   }
 }
 
-function updateQueueLabel(snapshot) {
-  const busy = snapshot.running || snapshot.pending > 0 || snapshot.active;
-  els.queueState.classList.toggle('busy', Boolean(busy));
+// ---------- 右栏：下载管理 ----------
 
-  if (busy) {
-    const parts = [];
-    if (snapshot.active) parts.push('下载中');
-    if (snapshot.pending > 0) parts.push(`队列 ${snapshot.pending}`);
-    if (snapshot.failedCount > 0) parts.push(`失败 ${snapshot.failedCount}`);
-    els.queueState.textContent = parts.join(' · ');
-  } else if (snapshot.doneCount > 0) {
-    els.queueState.textContent = `已下载 ${snapshot.doneCount}`;
-  } else {
-    els.queueState.textContent = '';
-  }
+function renderDownloadPanel(data) {
+  const sum = data.sources.reduce(
+    (acc, s) => {
+      acc.total += s.total;
+      acc.done += s.done;
+      acc.missing += s.missing;
+      acc.dead += s.removed + s.unavailable;
+      return acc;
+    },
+    { total: 0, done: 0, missing: 0, dead: 0 },
+  );
+
+  els.dlSummary.innerHTML = `
+    <div class="cell"><div class="v">${sum.total}</div><div class="k">作品</div></div>
+    <div class="cell"><div class="v done">${sum.done}</div><div class="k">已下载</div></div>
+    <div class="cell"><div class="v miss">${sum.missing}</div><div class="k">待下载</div></div>
+    <div class="cell"><div class="v">${sum.dead}</div><div class="k">失效/取消</div></div>
+  `;
+
+  const q = data.queue;
+  const inFlight = (q.active ? 1 : 0) + q.pending;
+  const base = q.processed + inFlight;
+  els.dlBar.style.width = `${base > 0 ? Math.round((q.processed / base) * 100) : 0}%`;
+
+  const bits = [];
+  if (q.active) bits.push(`<span class="now">● ${q.active}</span>`);
+  if (q.pending > 0) bits.push(`队列 ${q.pending}`);
+  if (q.processed > 0) bits.push(`本次完成 ${q.processed}`);
+  if (q.failedCount > 0) bits.push(`失败 ${q.failedCount}`);
+  els.dlMeta.innerHTML = bits.length ? bits.join(' · ') : '队列空闲';
+
+  els.queueState.classList.toggle('busy', Boolean(inFlight));
+  els.queueState.textContent = inFlight ? `队列 ${inFlight}` : '';
+
+  els.dlAll.disabled = inFlight > 0;
+  els.dlClear.disabled = q.pending === 0 && !q.active;
+
+  els.dlSources.innerHTML = data.sources
+    .map(
+      (s) => `
+      <button data-source="${s.key}" ${s.missing === 0 ? 'disabled' : ''}>
+        <span>${escapeHtml(s.label)}</span>
+        <span class="n">${s.missing === 0 ? '✓' : s.missing}</span>
+      </button>`,
+    )
+    .join('');
+
+  const fails = (q.failedList ?? []).slice(-6).reverse();
+  els.dlFails.innerHTML = fails.length
+    ? `<div class="side-sub">最近失败</div><ul class="dl-fails">${fails
+        .map(([pid, msg]) => `<li>${escapeHtml(pid)} · ${escapeHtml(msg)}</li>`)
+        .join('')}</ul>`
+    : '';
 }
 
-// ---------- 按需下载 ----------
-
-async function ensureDownloaded(record, card) {
-  if (record.hasImage || record.localNovel || record.localUgoira) return true;
-  if (record.error) {
-    setStatus(`#${record.id} 之前下载失败：${record.error}`);
-    return false;
-  }
-
-  record.downloading = true;
-  refreshCard(card, record);
-  setStatus(`正在下载 #${record.id} 《${record.title || '无题'}》…`);
-  startPolling();
-
+els.dlAll.addEventListener('click', async () => {
+  els.dlAll.disabled = true;
+  setStatus('正在把全部未下载作品加入队列…');
   try {
-    const data = await api('/api/download', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pid: record.pid }),
-    });
-
-    record.hasImage = true;
-    if (record.type === 'novel') record.localNovel = true;
-    if (record.type === 'ugoira') record.localUgoira = true;
-    record.localPages = Array.from({ length: data.files || 1 }, (_, i) => i);
-    setStatus(`已下载 #${record.id}`);
-    state.submitted.add(String(record.pid));
-    return true;
+    const data = await api('/api/enqueue-all', { method: 'POST' });
+    setStatus(`已加入 ${data.added} 个作品（候选 ${data.candidates}），下载会串行进行`);
+    startPolling();
   } catch (err) {
-    record.error = err.message;
-    setStatus(`下载失败：#${record.id} ${err.message}`);
-    return false;
-  } finally {
-    record.downloading = false;
-    refreshCard(card, record);
+    setStatus(`批量下载失败：${err.message}`);
+    els.dlAll.disabled = false;
   }
-}
+});
+
+els.dlClear.addEventListener('click', async () => {
+  try {
+    const data = await api('/api/queue/clear', { method: 'POST' });
+    setStatus(`已清空队列，移除 ${data.cleared} 个待处理任务`);
+    startPolling();
+  } catch (err) {
+    setStatus(`清空失败：${err.message}`);
+  }
+});
+
+els.dlVerify.addEventListener('click', async () => {
+  els.dlVerify.disabled = true;
+  setStatus('开始校验图库，逐个读取文件头…');
+  try {
+    await api('/api/verify', { method: 'POST' });
+    startPolling();
+  } catch (err) {
+    setStatus(`校验启动失败：${err.message}`);
+    els.dlVerify.disabled = false;
+  }
+});
+
+els.dlSources.addEventListener('click', async (event) => {
+  const btn = event.target.closest('button[data-source]');
+  if (!btn) return;
+  btn.disabled = true;
+  setStatus('正在加入队列…');
+  try {
+    const data = await api(`/api/enqueue-all?source=${encodeURIComponent(btn.dataset.source)}`, {
+      method: 'POST',
+    });
+    setStatus(`已加入 ${data.added} 个作品`);
+    startPolling();
+  } catch (err) {
+    setStatus(`加入队列失败：${err.message}`);
+    btn.disabled = false;
+  }
+});
 
 // ---------- 大图 ----------
 
@@ -489,37 +677,84 @@ const lb = {
   tx: 0,
   ty: 0,
   dragging: false,
-  moved: false, // 本次按下后是否真的拖动过，用于区分「拖图」和「点空白」
+  moved: false,
   startX: 0,
   startY: 0,
   originX: 0,
   originY: 0,
 };
 
-async function openLightbox(record, card) {
-  lb.record = record;
-  lb.card = card;
-  stripPid = null; // 换作品要重建左侧页码条
-  lb.moved = false;
+let stripPid = null;
 
-  const ok = await ensureDownloaded(record, card);
-  if (!ok && !record.hasImage) {
-    // 下载失败或非图片类型：不打开大图，避免白屏
-    if (record.type === 'novel' || record.type === 'ugoira') {
-      setStatus('已保存到 images 目录，可用系统程序打开。');
-    }
+async function openLightbox(record, card) {
+  if (record.type === 'novel') {
+    await openReader(record, card);
     return;
   }
 
+  lb.record = record;
+  lb.card = card;
+  stripPid = null;
+  lb.moved = false;
   lb.index = 0;
-  resetTransform();
+
+  await ensureDownloaded(record, card);
+  if (!record.hasImage) return;
+
   showLightboxPage();
   els.lightbox.hidden = false;
   document.body.style.overflow = 'hidden';
+
+  prefetchPages(record);
+  fetchDescription(record);
 }
 
-/* 左栏页码条只在换作品时重建，翻页只改高亮 —— 92 页的作品重建一次要创建 92 个节点 */
-let stripPid = null;
+/** 列表接口的简介大多是空的，打开时按需向详情接口要一次，抓到就缓存在服务端。 */
+function fetchDescription(record) {
+  if (record.description || record.descFetched) return;
+  if (record.type === 'novel' || record.status === 'unavailable') return;
+
+  record.descFetched = true;
+  api(`/api/description/${record.pid}`)
+    .then((data) => {
+      if (data.description) {
+        record.description = data.description;
+        if (lb.record === record) renderInfoPanel(record);
+      }
+    })
+    .catch(() => {});
+}
+
+/** 点开作品后把尚未下载的分页逐个取回来（串行，避免抢占当前页的请求）。 */
+function prefetchPages(record) {
+  const total = Math.max(1, Number(record.pages) || 1);
+  if (total <= 1) return;
+
+  const local = new Set(record.localPages ?? []);
+  const missing = [];
+  for (let i = 0; i < total; i += 1) {
+    if (!local.has(i)) missing.push(i);
+  }
+  if (missing.length === 0) return;
+
+  setStatus(`正在补齐 ${missing.length} 页…`);
+
+  (async () => {
+    for (const page of missing) {
+      try {
+        await fetch(`/api/full/${record.pid}/${page}`);
+        record.localPages = [...(record.localPages ?? []), page];
+      } catch {
+        /* 单页失败不影响其他页 */
+      }
+    }
+    if (lb.record === record) {
+      stripPid = null;
+      renderPageStrip(record, total, lb.index);
+      setStatus('分页已补齐');
+    }
+  })();
+}
 
 function renderPageStrip(record, totalPages, currentPage) {
   if (totalPages <= 1) {
@@ -545,10 +780,9 @@ function renderPageStrip(record, totalPages, currentPage) {
     item.className = `lb-page-thumb${i === currentPage ? ' active' : ''}`;
     item.dataset.page = String(i);
 
-    // 只给本地已有的页请求缩略图；没下载的页先显示页码，翻到那儿时会自动补
     item.innerHTML = local.has(i)
-      ? `<img loading="lazy" src="/api/thumb/${record.pid}/${i}" alt=""><span class="num">${i + 1}</span>`
-      : `<span class="ph">${i + 1}</span>`;
+      ? `<img loading="lazy" src="/api/thumb/${record.pid}/${i}?w=200" alt=""><span class="num">${i + 1}</span>`
+      : `${i + 1}`;
 
     item.addEventListener('click', () => {
       lb.index = i;
@@ -563,75 +797,92 @@ function renderPageStrip(record, totalPages, currentPage) {
 }
 
 function renderInfoPanel(record) {
-  const rows = [];
-  const addRow = (key, value) => {
-    if (value === undefined || value === null || value === '') return;
-    rows.push(`<div class="row"><span class="k">${key}</span><span class="v">${escapeHtml(value)}</span></div>`);
-  };
+  // 精简：分级 / AI / 类型做成胶囊，去掉来源和裸链接行
+  const chips = [];
+  if (Number(record.x_restrict) === 1) chips.push('<span class="chip-tag r18">R-18</span>');
+  if (Number(record.x_restrict) === 2) chips.push('<span class="chip-tag r18">R-18G</span>');
+  if (Number(record.ai_type) > 0) chips.push('<span class="chip-tag ai">AI 生成</span>');
+  if (record.type === 'manga') chips.push('<span class="chip-tag type">漫画</span>');
+  if (record.type === 'ugoira') chips.push('<span class="chip-tag type">动图</span>');
+  if (record.removed === 'yes') chips.push('<span class="chip-tag">已取消收藏</span>');
+  else if (record.status === 'unavailable') chips.push('<span class="chip-tag">作品已失效</span>');
 
-  addRow('pid', record.pid);
-  if (record.width && record.height) addRow('尺寸', `${record.width} × ${record.height}`);
-  addRow('页数', record.pages);
-  if (record.published) addRow('发布', String(record.published).slice(0, 10));
-  addRow('类型', record.type);
-  if (Number(record.x_restrict) > 0) addRow('分级', Number(record.x_restrict) === 1 ? 'R-18' : 'R-18G');
-  if (record.ai_type !== undefined && Number(record.ai_type) > 0) addRow('AI', '是');
-  if (record.removed === 'yes') addRow('状态', '已取消收藏');
-  else if (record.status === 'unavailable') addRow('状态', '作品已失效');
-  addRow('来源', state.sources.find((s) => s.key === record.source)?.label);
-
-  let html = `<h3>${escapeHtml(record.title || '(无题)')}</h3>`;
-  if (record.author) html += `<div class="sub">${escapeHtml(record.author)}</div>`;
-  html += rows.join('');
+  const dims = record.width && record.height ? `${record.width} × ${record.height}` : '';
+  const pagesText = Number(record.pages) > 1 ? `${record.pages} 页` : '';
+  const pub = record.published ? String(record.published).slice(0, 10) : '';
+  const metaLine = [dims, pagesText, pub].filter(Boolean).join(' · ');
 
   const owned = record.bookmark_tags ?? [];
   const tags = record.tags ?? [];
 
-  if (owned.length > 0) {
+  let html = `<h3 data-open="${escapeHtml(record.url ?? '')}" title="在 pixiv 打开">${escapeHtml(
+    record.title || '(无题)',
+  )}</h3>`;
+
+  if (record.author) {
+    html += `<span class="author" data-author-page="${
+      record.author_id ? `https://www.pixiv.net/users/${record.author_id}` : ''
+    }">${escapeHtml(record.author)}</span>`;
+  }
+
+  if (chips.length) html += `<div class="chips">${chips.join('')}</div>`;
+  if (metaLine) html += `<div style="color:var(--muted);margin-bottom:10px">${escapeHtml(metaLine)}</div>`;
+
+  if (record.description) html += `<div class="desc">${escapeHtml(record.description)}</div>`;
+
+  if (owned.length) {
     html += `<div class="section">我的收藏标签</div><div class="taglist">${owned
-      .map((tag) => `<span class="tag owned">${escapeHtml(tag)}</span>`)
+      .map((t) => `<span class="tag owned">${escapeHtml(t)}</span>`)
       .join('')}</div>`;
   }
 
-  if (tags.length > 0) {
+  if (tags.length) {
     html += `<div class="section">作品标签 ${tags.length}</div><div class="taglist">${tags
-      .map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`)
+      .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
       .join('')}</div>`;
   }
 
   if (record.url) {
-    html += `<div class="section">链接</div><div><a href="${escapeHtml(
-      record.url,
-    )}" target="_blank" rel="noopener">${escapeHtml(record.url)}</a></div>`;
+    html += `<a class="pid-link" href="${escapeHtml(record.url)}" target="_blank" rel="noopener">pid ${escapeHtml(
+      record.pid,
+    )} →</a>`;
   }
 
   els.lbPanel.innerHTML = html;
 }
 
+els.lbPanel.addEventListener('click', (event) => {
+  const title = event.target.closest('h3[data-open]');
+  if (title && title.dataset.open) {
+    window.open(title.dataset.open, '_blank', 'noopener');
+    return;
+  }
+  const author = event.target.closest('[data-author-page]');
+  if (author && author.dataset.authorPage) {
+    window.open(author.dataset.authorPage, '_blank', 'noopener');
+  }
+});
+
 function showLightboxPage() {
   const record = lb.record;
   if (!record) return;
 
-  // 默认只下了首张，所以页数要用记录里的总页数，而不是本地已有文件数。
-  // 缺的页由服务端的 /api/full 现场补下。
   const totalPages = Math.max(1, Number(record.pages) || 1);
   const page = lb.index;
 
-  els.lbTitle.textContent = `#${record.id} 《${record.title || '无题'}》 — ${record.author || '未知'}`;
-
+  els.lbTitle.textContent = `《${record.title || '无题'}》`;
   const bits = [`pid ${record.pid}`];
-  if (totalPages > 1) bits.push(`第 ${lb.index + 1}/${totalPages} 页`);
-  if (record.width && record.height) bits.push(`${record.width}×${record.height}`);
-  const metaText = bits.join(' · ');
+  if (totalPages > 1) bits.push(`${lb.index + 1}/${totalPages}`);
+  els.lbMeta.textContent = bits.join(' · ');
 
   const hasLocal = (record.localPages ?? []).includes(page);
-  els.lbMeta.textContent = hasLocal ? metaText : `${metaText} · 正在取这一页…`;
+  if (!hasLocal) els.lbMeta.textContent += ' · 正在取这一页…';
 
   els.lbImage.onload = () => {
-    els.lbMeta.textContent = metaText;
+    els.lbMeta.textContent = bits.join(' · ');
   };
   els.lbImage.onerror = () => {
-    els.lbMeta.textContent = `${metaText} · 这一页获取失败`;
+    els.lbMeta.textContent = `${bits.join(' · ')} · 获取失败`;
   };
 
   els.lbImage.src = `/api/full/${record.pid}/${page}?t=${Date.now()}`;
@@ -641,7 +892,6 @@ function showLightboxPage() {
 
   els.lbPrev.disabled = lb.index === 0 && !hasPrevRecord();
   els.lbNext.disabled = lb.index === totalPages - 1 && !hasNextRecord();
-  updateZoomLabel();
   resetTransform();
 }
 
@@ -663,10 +913,6 @@ function resetTransform() {
 
 function applyTransform() {
   els.lbImage.style.transform = `translate(${lb.tx}px, ${lb.ty}px) scale(${lb.scale})`;
-  updateZoomLabel();
-}
-
-function updateZoomLabel() {
   els.lbZoom.textContent = `${Math.round(lb.scale * 100)}%`;
 }
 
@@ -682,13 +928,12 @@ function stepPage(delta) {
     return;
   }
 
-  // 跨作品翻页
   const currentIndex = state.records.indexOf(record);
   const target = state.records[currentIndex + delta];
-  const targetCard = els.grid.querySelector(`.card[data-pid="${target?.pid}"]`);
   if (!target) return;
+  const targetCard = state.cardMap.get(String(target.pid));
   closeLightbox();
-  openLightbox(target, targetCard ?? document.createElement('div'));
+  openLightbox(target, targetCard);
 }
 
 function closeLightbox() {
@@ -698,16 +943,13 @@ function closeLightbox() {
   document.body.style.overflow = '';
 }
 
-// 滚轮缩放。用指数映射而不是固定倍数：触控板的小 delta 得到微调，
-// 鼠标滚轮的大 delta 得到明显变化，不会一格一格地跳。
 els.lbStage.addEventListener(
   'wheel',
   (event) => {
     event.preventDefault();
-
     let delta = event.deltaY;
-    if (event.deltaMode === 1) delta *= 16; // 按行
-    else if (event.deltaMode === 2) delta *= 400; // 按页
+    if (event.deltaMode === 1) delta *= 16;
+    else if (event.deltaMode === 2) delta *= 400;
 
     const factor = Math.exp(-delta * 0.0016);
     const next = Math.min(8, Math.max(0.15, lb.scale * factor));
@@ -733,10 +975,8 @@ els.lbStage.addEventListener('mousedown', (event) => {
   lb.originY = event.clientY;
   lb.startX = event.clientX - lb.tx;
   lb.startY = event.clientY - lb.ty;
-  els.lbStage.classList.add('dragging');
 });
 
-// 点空白关闭：必须排除「刚才是拖图」的情况，否则拖动后松手会误关
 els.lbStage.addEventListener('click', (event) => {
   if (event.target !== els.lbStage) return;
   if (lb.moved) return;
@@ -745,7 +985,6 @@ els.lbStage.addEventListener('click', (event) => {
 
 window.addEventListener('mousemove', (event) => {
   if (!lb.dragging) return;
-  // 超过 4px 才算拖动，避免手抖把点击当成拖拽
   if (Math.hypot(event.clientX - lb.originX, event.clientY - lb.originY) > 4) lb.moved = true;
   lb.tx = event.clientX - lb.startX;
   lb.ty = event.clientY - lb.startY;
@@ -754,14 +993,22 @@ window.addEventListener('mousemove', (event) => {
 
 window.addEventListener('mouseup', () => {
   lb.dragging = false;
-  els.lbStage.classList.remove('dragging');
 });
 
-els.lbImage.addEventListener('dblclick', () => {
-  if (lb.scale > 1) resetTransform();
-  else {
-    lb.scale = 2.2;
-    applyTransform();
+// 双击：适应屏幕 ↔ 1:1（按原图像素）
+els.lbImage.addEventListener('dblclick', (event) => {
+  event.stopPropagation();
+  if (Math.abs(lb.scale - 1) < 0.02) {
+    const fitWidth = els.lbImage.clientWidth; // 不受 transform 影响
+    const natural = els.lbImage.naturalWidth;
+    if (fitWidth > 0 && natural > 0) {
+      lb.scale = Math.min(8, Math.max(1.01, natural / fitWidth));
+      lb.tx = 0;
+      lb.ty = 0;
+      applyTransform();
+    }
+  } else {
+    resetTransform();
   }
 });
 
@@ -769,70 +1016,180 @@ els.lbClose.addEventListener('click', closeLightbox);
 els.lbPrev.addEventListener('click', () => stepPage(-1));
 els.lbNext.addEventListener('click', () => stepPage(1));
 
-els.lightbox.addEventListener('click', (event) => {
-  if (event.target === els.lightbox) closeLightbox();
-});
+// ---------- 小说阅读器 ----------
 
-window.addEventListener('keydown', (event) => {
-  if (els.lightbox.hidden) return;
-  if (event.key === 'Escape') closeLightbox();
-  else if (event.key === 'ArrowLeft') stepPage(-1);
-  else if (event.key === 'ArrowRight') stepPage(1);
-  else if (event.key === '0') resetTransform();
-  else if (event.key === '+' || event.key === '=') {
-    lb.scale = Math.min(8, lb.scale * 1.2);
-    applyTransform();
-  } else if (event.key === '-') {
-    lb.scale = Math.max(0.2, lb.scale / 1.2);
-    applyTransform();
+async function openReader(record, card) {
+  els.reader.hidden = false;
+  document.body.style.overflow = 'hidden';
+
+  els.rdTitle.textContent = record.title || '(无题)';
+  els.rdAuthor.textContent = record.author || '未知作者';
+  els.rdTags.innerHTML = (record.bookmark_tags ?? [])
+    .map((t) => `<span>${escapeHtml(t)}</span>`)
+    .join('');
+  els.rdLink.href = record.url || '#';
+  els.rdCoverBox.innerHTML = '<span>加载中…</span>';
+  els.rdBody.innerHTML = '<div class="rd-loading">正在读取正文…</div>';
+
+  setStatus(`正在准备《${record.title || '无题'}》…`);
+
+  try {
+    const data = await api(`/api/novel/${record.pid}`);
+    els.rdCoverBox.innerHTML = data.cover ? `<img src="/api/cover/${record.pid}" alt="">` : '<span>无封面</span>';
+    els.rdBody.textContent = data.content || '（正文为空）';
+    els.rdBody.scrollTop = 0;
+    record.hasCover = Boolean(data.cover);
+    record.localNovel = true;
+    if (card) refreshCard(card, record);
+    setStatus(`已打开《${record.title || '无题'}》`);
+  } catch (err) {
+    els.rdBody.innerHTML = `<div class="rd-loading">读取失败：${escapeHtml(err.message)}</div>`;
+    setStatus(`读取失败：${err.message}`);
   }
-});
+}
 
-// ---------- 筛选与滚动 ----------
+function closeReader() {
+  els.reader.hidden = true;
+  els.rdBody.textContent = '';
+  document.body.style.overflow = '';
+}
+
+els.rdClose.addEventListener('click', closeReader);
+
+// ---------- 单张下载 ----------
+
+async function ensureDownloaded(record, card) {
+  if (record.hasImage) return true;
+  if (record.error) {
+    setStatus(`之前下载失败：${record.error}`);
+    return false;
+  }
+
+  record.downloading = true;
+  if (card) refreshCard(card, record);
+  setStatus(`正在下载《${record.title || '无题'}》…`);
+  startPolling();
+
+  try {
+    const data = await api('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pid: record.pid }),
+    });
+    record.hasImage = true;
+    record.localPages = Array.from({ length: data.files || 1 }, (_, i) => i);
+    state.submitted.add(String(record.pid));
+    return true;
+  } catch (err) {
+    record.error = err.message;
+    return false;
+  } finally {
+    record.downloading = false;
+    if (card) refreshCard(card, record);
+  }
+}
+
+// ---------- 顶栏交互 ----------
 
 let searchTimer = null;
 els.search.addEventListener('input', () => {
   state.query = els.search.value.trim();
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(reloadAll, 260);
-});
-
-els.tagFilter.addEventListener('change', () => {
-  state.tag = els.tagFilter.value;
-  reloadAll();
+  searchTimer = setTimeout(reloadAll, 280);
 });
 
 els.sortMode.addEventListener('change', () => {
-  state.sort = els.sortMode.value;
-  // 每次切到随机都换一个种子，否则还是上次那个顺序
-  if (state.sort === 'random') state.seed = Math.floor(Math.random() * 1e9);
+  settings.sort = els.sortMode.value;
+  if (settings.sort === 'random') state.seed = Math.floor(Math.random() * 1e9);
+  saveSettings();
   reloadAll();
 });
 
-els.missingOnly.addEventListener('change', () => {
-  state.missingOnly = els.missingOnly.checked;
-  reloadAll();
+els.btnView.addEventListener('click', (event) => {
+  event.stopPropagation();
+  els.viewPopover.hidden = !els.viewPopover.hidden;
 });
 
-els.showRemoved.addEventListener('change', () => {
-  state.showRemoved = els.showRemoved.checked;
-  reloadAll();
+document.addEventListener('click', (event) => {
+  if (els.viewPopover.hidden) return;
+  if (els.viewPopover.contains(event.target) || event.target === els.btnView) return;
+  els.viewPopover.hidden = true;
 });
 
-// 重新打开开关时，把当前已经渲染的卡片重新过一遍可见性判断
-els.autoDownload.addEventListener('change', () => {
-  state.autoDownload = els.autoDownload.checked;
-  if (!state.autoDownload) {
-    setStatus('已暂停自动下载，队列中已有的作品仍会完成。');
-    return;
-  }
-  for (const card of state.cardMap.values()) state.observer?.observe(card);
+els.optRatio.addEventListener('change', () => {
+  settings.ratio = els.optRatio.value;
+  saveSettings();
+  applySettings();
+});
+
+els.optWidth.addEventListener('input', () => {
+  settings.cardWidth = Number(els.optWidth.value);
+  els.optWidthVal.textContent = `${settings.cardWidth}px`;
+  document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
+  saveSettings();
+});
+
+els.optShowOwnTags.addEventListener('change', () => {
+  settings.showOwnTags = els.optShowOwnTags.checked;
+  saveSettings();
+  applySettings();
+});
+
+els.optShowTags.addEventListener('change', () => {
+  settings.showTags = els.optShowTags.checked;
+  saveSettings();
+  applySettings();
+});
+
+els.optAutoDownload.addEventListener('change', () => {
+  settings.autoDownload = els.optAutoDownload.checked;
+  saveSettings();
+});
+
+els.optReset.addEventListener('click', () => {
+  settings = { ...DEFAULT_SETTINGS, leftOpen: settings.leftOpen, rightOpen: settings.rightOpen };
+  saveSettings();
+  applySettings();
+  setStatus('视图设置已恢复默认');
+});
+
+els.btnLeft.addEventListener('click', () => {
+  settings.leftOpen = !settings.leftOpen;
+  saveSettings();
+  applySettings();
+});
+
+els.btnRight.addEventListener('click', () => {
+  settings.rightOpen = !settings.rightOpen;
+  saveSettings();
+  applySettings();
 });
 
 els.reload.addEventListener('click', async () => {
+  state.authorId = '';
   await loadState();
-  await loadTags();
+  await loadSidePanel();
   reloadAll();
+});
+
+window.addEventListener('keydown', (event) => {
+  if (!els.reader.hidden) {
+    if (event.key === 'Escape') closeReader();
+    return;
+  }
+  if (els.lightbox.hidden) return;
+  if (event.key === 'Escape') closeLightbox();
+  else if (event.key === 'ArrowLeft') stepPage(-1);
+  else if (event.key === 'ArrowRight') stepPage(1);
+  else if (event.key === '0') resetTransform();
+});
+
+// 滚动加载
+const gridWrap = document.querySelector('.grid-wrap');
+gridWrap.addEventListener('scroll', () => {
+  if (gridWrap.scrollTop + gridWrap.clientHeight > gridWrap.scrollHeight - 700) {
+    if (state.offset < state.total && !state.loading) loadPage(false);
+  }
 });
 
 new IntersectionObserver(
@@ -841,22 +1198,46 @@ new IntersectionObserver(
       loadPage(false);
     }
   },
-  { root: null, rootMargin: '600px' },
+  { rootMargin: '600px' },
 ).observe(els.sentinel);
-
-// 网格滚动到底时兜底加载（IntersectionObserver 在某些缩放比例下可能漏触发）
-els.grid.addEventListener('scroll', () => {
-  const nearBottom = els.grid.scrollTop + els.grid.clientHeight > els.grid.scrollHeight - 700;
-  if (nearBottom && state.offset < state.total && !state.loading) loadPage(false);
-});
 
 // ---------- 启动 ----------
 
+async function loadState() {
+  const data = await api('/api/state');
+  state.sources = data.sources;
+
+  const params = new URLSearchParams(location.search);
+
+  const fromUrl = params.get('source');
+  if (fromUrl && data.sources.some((s) => s.key === fromUrl)) state.current = fromUrl;
+
+  const qParam = params.get('q');
+  if (qParam) {
+    state.query = qParam;
+    els.search.value = qParam;
+  }
+
+  const sortParam = params.get('sort');
+  if (sortParam && ['asc', 'desc', 'random'].includes(sortParam)) settings.sort = sortParam;
+
+  const authorParam = params.get('author_id');
+  if (authorParam) state.authorId = authorParam;
+
+  if (!state.current) {
+    const first = data.sources.find((s) => s.count > 0) ?? data.sources[0];
+    state.current = first?.key ?? 'illustPublic';
+  }
+  renderTabs();
+}
+
 (async function init() {
+  applySettings();
   try {
     await loadState();
-    await loadTags();
+    await loadSidePanel();
     await loadPage(true);
+    await pollQueue();
   } catch (err) {
     setStatus(`初始化失败：${err.message}`);
   }

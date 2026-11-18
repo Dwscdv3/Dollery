@@ -31,6 +31,7 @@ export const FIELD_ORDER = [
   'pid',
   'type',
   'title',
+  'description',
   'author',
   'author_id',
   'published',

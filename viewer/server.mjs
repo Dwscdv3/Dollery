@@ -20,7 +20,7 @@ import { spawn } from 'node:child_process';
 import { readDocument } from '../src/store.mjs';
 import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
-import { RateLimiter } from '../src/http.mjs';
+import { RateLimiter, httpsGetWithRetry } from '../src/http.mjs';
 import { compileQuery, matches as matchQuery } from './query.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -254,6 +254,13 @@ async function downloadByPid(pid) {
     throw new Error(summary.errors[0]?.message ?? '下载失败');
   }
   indexDownloadedFiles(summary.filePaths ?? []);
+
+  // 下载完立刻把缩略图各档都生成好并永久保存，之后浏览不再触发转换
+  for (const file of summary.filePaths ?? []) {
+    const match = path.basename(file).match(/^(\d+)_p(\d+)\.avif$/);
+    if (match) await generateThumbLevels(match[1], Number(match[2]));
+  }
+
   return summary;
 }
 
@@ -290,6 +297,8 @@ async function ensurePage(pid, page) {
     const entry = state.imageIndex.get(key) ?? { pages: new Set(), ugoira: false };
     entry.pages.add(page);
     state.imageIndex.set(key, entry);
+
+    await generateThumbLevels(key, page);
 
     return target;
   })().finally(() => state.thumbJobs.delete(jobKey));
@@ -491,26 +500,54 @@ async function withThumbSlot(task) {
   }
 }
 
-/** 缩略图路径；不存在就现场生成。同一个文件的并发请求合并成一次转换。 */
-async function ensureThumb(pid, page) {
-  const target = path.join(THUMB_DIR, `${pid}_p${page}.jpg`);
+/**
+ * 缩略图级别。下载时就把 256 / 512 两档生成好并永久保存；
+ * 请求时按目标宽度挑不小于它的最小级别，都不够就直接给原图（原图是最高层级）。
+ */
+const THUMB_SIZES = [256, 512];
+
+async function ensureThumbSize(pid, page, size) {
+  const target = path.join(THUMB_DIR, `${pid}_p${page}_${size}.jpg`);
   if (fs.existsSync(target)) return target;
 
   const source = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
   if (!fs.existsSync(source)) return null;
 
-  const jobKey = `${pid}_p${page}`;
+  const jobKey = `${pid}_${page}_${size}`;
   if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
 
   const job = withThumbSlot(async () => {
     await fsp.mkdir(THUMB_DIR, { recursive: true });
-    // -thumbnail 会按需缩小但不会放大，320px 足够网格用
-    await runProcess('magick', [source, '-thumbnail', '320x320', '-quality', '82', target]);
+    await runProcess('magick', [source, '-thumbnail', `${size}x${size}`, '-quality', '82', target]);
     return target;
   }).finally(() => state.thumbJobs.delete(jobKey));
 
   state.thumbJobs.set(jobKey, job);
   return job;
+}
+
+/** 把一张图的所有级别都生成好。下载完成后调用，这样后续请求全部命中缓存。 */
+async function generateThumbLevels(pid, page) {
+  for (const size of THUMB_SIZES) {
+    try {
+      await ensureThumbSize(pid, page, size);
+    } catch {
+      /* 单档失败不影响其他档 */
+    }
+  }
+}
+
+/** 按目标宽度选级别；都不够就退回原图。 */
+async function pickThumb(pid, page, wantWidth) {
+  for (const size of THUMB_SIZES) {
+    if (size < wantWidth) continue;
+    const got = await ensureThumbSize(pid, page, size);
+    if (got) return { filePath: got, contentType: 'image/jpeg' };
+  }
+
+  const original = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
+  if (fs.existsSync(original)) return { filePath: original, contentType: 'image/avif' };
+  return null;
 }
 
 // ---- HTTP ----
@@ -580,6 +617,123 @@ function orderRecords(list, sort, seed) {
   return list.slice().sort((a, b) => Number(a.id) - Number(b.id));
 }
 
+/** 确保小说正文和封面在本地，缺就现抓。封面来自详情接口的 coverUrl。 */
+async function ensureNovel(pid) {
+  const key = String(pid);
+  const txtPath = path.join(IMAGES_DIR, `${key}.txt`);
+  const coverPath = path.join(IMAGES_DIR, `${key}_cover.jpg`);
+  const needText = !fs.existsSync(txtPath);
+  const needCover = !fs.existsSync(coverPath);
+
+  // 正文和封面都可能单独缺失（老数据只有 txt），所以按需取详情
+  if (needText || needCover) {
+    const body = await state.client.ajax(`/ajax/novel/${key}`, { lang: 'zh' });
+
+    if (needText) {
+      const content = body.content ?? '';
+      const wordCount = body.textCount || content.replace(/\s/g, '').length;
+
+      const header = [
+        `# ${body.title ?? ''}`,
+        `# 作者: ${body.userName ?? ''}`,
+        `# 作品: https://www.pixiv.net/novel/show.php?id=${key}`,
+        `# 字数: ${wordCount}`,
+        '',
+      ].join('\n');
+
+      await fsp.writeFile(txtPath, `${header}${content}\n`, 'utf8');
+
+      const entry = state.imageIndex.get(key) ?? { pages: new Set(), ugoira: false };
+      entry.novel = true;
+      state.imageIndex.set(key, entry);
+    }
+
+    if (needCover && body.coverUrl) {
+      try {
+        const res = await state.imageLimiter.run(() =>
+          httpsGetWithRetry(body.coverUrl, {
+            proxy: state.config?.proxy,
+            binary: true,
+            timeoutMs: 60000,
+            headers: { Referer: 'https://www.pixiv.net/', 'User-Agent': 'Mozilla/5.0' },
+          }),
+        );
+        if (res.status === 200) await fsp.writeFile(coverPath, res.buffer);
+      } catch {
+        /* 封面失败不影响阅读 */
+      }
+    }
+  }
+
+  return { txtPath, coverPath };
+}
+
+/**
+ * 简介（description）只能从详情接口拿。
+ *
+ * 收藏列表接口虽然也带 description 字段，但实测前 100 条里只有 3 条非空，
+ * 而且都是失效作品的 "-----" 占位符。真正的简介在 /ajax/illust/{pid} 里。
+ *
+ * 逐个补全要 1.5 万次请求（约 8.5 小时），所以改成按需：你打开哪个作品才抓哪个，
+ * 结果存进 .cache/descriptions.json，下次直接命中。
+ */
+const DESC_CACHE = path.join(ROOT, '.cache', 'descriptions.json');
+let descCache = new Map();
+let descSaveTimer = null;
+
+async function loadDescCache() {
+  try {
+    descCache = new Map(Object.entries(JSON.parse(await fsp.readFile(DESC_CACHE, 'utf8'))));
+  } catch {
+    descCache = new Map();
+  }
+}
+
+function scheduleDescSave() {
+  if (descSaveTimer) return;
+  descSaveTimer = setTimeout(async () => {
+    descSaveTimer = null;
+    try {
+      await fsp.mkdir(path.dirname(DESC_CACHE), { recursive: true });
+      await fsp.writeFile(DESC_CACHE, JSON.stringify(Object.fromEntries(descCache)), 'utf8');
+    } catch {
+      /* 缓存写失败不影响阅读 */
+    }
+  }, 2000);
+}
+
+/** 简介里可能带 <br> 和 <a>，转成纯文本再给前端。 */
+function cleanDescription(raw) {
+  return String(raw ?? '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function ensureDescription(pid) {
+  const key = String(pid);
+  if (descCache.has(key)) return descCache.get(key);
+
+  const body = await state.client.ajax(`/ajax/illust/${key}`, { lang: 'zh' });
+  const text = cleanDescription(body.illustComment ?? body.description ?? '');
+
+  descCache.set(key, text);
+  scheduleDescSave();
+
+  const record = state.records.find((r) => String(r.pid) === key);
+  if (record) record.description = text;
+
+  return text;
+}
+
 function decorate(record) {
   const entry = state.imageIndex.get(String(record.pid));
   const pages = entry ? [...entry.pages].sort((a, b) => a - b) : [];
@@ -588,6 +742,7 @@ function decorate(record) {
     pid: record.pid,
     type: record.type,
     title: record.title ?? '',
+    description: cleanDescription(record.description) === '-----' ? '' : cleanDescription(record.description),
     author: record.author ?? '',
     author_id: record.author_id ?? '',
     published: record.published ?? '',
@@ -596,6 +751,7 @@ function decorate(record) {
     height: record.height ?? '',
     x_restrict: record.x_restrict ?? 0,
     ai_type: record.ai_type ?? 0,
+    text_length: record.text_length ?? '',
     tags: record.tags ?? [],
     bookmark_tags: record.bookmark_tags ?? [],
     status: record.status ?? '',
@@ -603,6 +759,7 @@ function decorate(record) {
     url: record.url ?? '',
     source: record.source,
     hasImage: pages.length > 0 || Boolean(entry?.ugoira),
+    hasCover: record.type === 'novel' ? fs.existsSync(path.join(IMAGES_DIR, `${record.pid}_cover.jpg`)) : false,
     localPages: pages,
     localNovel: Boolean(entry?.novel),
     localUgoira: Boolean(entry?.ugoira),
@@ -612,6 +769,48 @@ function decorate(record) {
 
 async function handleApi(req, res, url) {
   const params = searchParams(url);
+
+  // 简介：按需从详情接口补一条
+  if (url.startsWith('/api/description/')) {
+    const pid = url.replace(/^\/api\/description\//, '').split('?')[0];
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+    try {
+      const description = await ensureDescription(pid);
+      return sendJson(res, 200, { pid, description });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  // 小说正文（缺就现抓，含封面）
+  if (url.startsWith('/api/novel/')) {
+    const pid = url.replace(/^\/api\/novel\//, '').split('?')[0];
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+    try {
+      const { txtPath, coverPath } = await ensureNovel(pid);
+      const raw = await fsp.readFile(txtPath, 'utf8');
+      // 去掉开头那几行 # 抬头，正文单独返回
+      const content = raw.replace(/^#[^\n]*\n/gm, '').trim();
+      return sendJson(res, 200, { pid, content, cover: fs.existsSync(coverPath) });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  // 封面：小说用抓下来的 jpg，插画退回首图缩略图
+  if (url.startsWith('/api/cover/')) {
+    const pid = url.replace(/^\/api\/cover\//, '').split('?')[0];
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+
+    const coverPath = path.join(IMAGES_DIR, `${pid}_cover.jpg`);
+    if (fs.existsSync(coverPath)) {
+      return sendFile(res, coverPath, 'image/jpeg', 'public, max-age=604800');
+    }
+
+    const picked = await pickThumb(pid, 0, 512);
+    if (picked) return sendFile(res, picked.filePath, picked.contentType, 'public, max-age=604800');
+    return sendJson(res, 404, { error: '没有封面' });
+  }
 
   // 列表：支持按来源、布尔查询、标签、作者、缺图筛选，以及三种排序
   if (url.startsWith('/api/records')) {
@@ -712,7 +911,9 @@ async function handleApi(req, res, url) {
   }
 
   // 批量入队：前端滚动时把视口内未下载的作品扔进来
-  if (url.startsWith('/api/enqueue') && req.method === 'POST') {
+  // 注意必须精确匹配 —— 用 startsWith 会把 /api/enqueue-all 也拦下来，
+  // 导致「一键下载全部」一直报「缺少 pids」
+  if ((url === '/api/enqueue' || url.startsWith('/api/enqueue?')) && req.method === 'POST') {
     const body = await readBody(req);
     const pids = Array.isArray(body.pids) ? body.pids : [];
     if (pids.length === 0) return sendJson(res, 400, { error: '缺少 pids' });
@@ -866,10 +1067,11 @@ async function serveImage(req, res, url, kind) {
   const page = Number(pageText);
 
   if (kind === 'thumb') {
+    const wantWidth = Number(searchParams(url).get('w') ?? 0) || 256;
     try {
-      const thumb = await ensureThumb(pid, page);
-      if (!thumb) return sendJson(res, 404, { error: '尚无原图' });
-      return sendFile(res, thumb, 'image/jpeg', 'public, max-age=604800');
+      const picked = await pickThumb(pid, page, wantWidth);
+      if (!picked) return sendJson(res, 404, { error: '尚无原图' });
+      return sendFile(res, picked.filePath, picked.contentType, 'public, max-age=604800');
     } catch (err) {
       return sendJson(res, 500, { error: err.message });
     }
@@ -973,6 +1175,7 @@ async function main() {
   state.config = await loadConfig();
   await loadRecords();
   await refreshIndex();
+  await loadDescCache();
 
   const cookieFile = path.join(ROOT, state.config.cookieFile ?? '.secrets/cookies.txt');
   let cookie = state.config.cookie ?? '';

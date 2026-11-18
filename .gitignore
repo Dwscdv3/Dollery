@@ -9,7 +9,7 @@ cookies.txt
 viewer/.thumbs/
 
 # 查看器的临时产物（调试截图、临时浏览器 profile）
-viewer/.edgeprofile/
+viewer/.edgeprofile*/
 viewer/_shot.png
 viewer/_dom.html
 viewer/_cdp.mjs
