@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
 
@@ -25,8 +25,6 @@
   <div class="meta">
     <span id="queueState" class="queue-state"></span>
     <span id="counter">—</span>
-    <button id="btnLeft" class="icon-btn" title="左侧栏（作者 / 标签）">◧</button>
-    <button id="btnRight" class="icon-btn" title="右侧栏（下载管理）">◨</button>
     <button id="reload" class="icon-btn" title="刷新">⟳</button>
   </div>
 </header>
@@ -66,26 +64,46 @@
 
 <div class="popover" id="viewPopover" hidden>
   <div class="pop-title">视图设置</div>
-  <div class="pop-row">
-    <label for="optRatio">封面比例</label>
-    <select id="optRatio">
-      <option value="auto">跟随原图</option>
-      <option value="3:4">3 : 4</option>
-      <option value="1:1">1 : 1</option>
-      <option value="4:3">4 : 3</option>
-      <option value="16:9">16 : 9</option>
-    </select>
+
+  <div class="pop-field">
+    <span class="pop-label">封面比例</span>
+    <div class="seg" id="optRatio">
+      <button data-v="auto" class="on">原图</button>
+      <button data-v="3:4">3:4</button>
+      <button data-v="1:1">1:1</button>
+      <button data-v="4:3">4:3</button>
+      <button data-v="16:9">16:9</button>
+    </div>
   </div>
-  <div class="pop-row">
-    <label for="optWidth">卡片宽度</label>
+
+  <div class="pop-field">
+    <span class="pop-label">卡片宽度 <b id="optWidthVal">210px</b></span>
     <input type="range" id="optWidth" min="140" max="340" step="10">
-    <span id="optWidthVal" class="pop-val"></span>
   </div>
-  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optShowOwnTags"> 显示收藏标签</label></div>
-  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optShowTags"> 显示作品标签</label></div>
-  <div class="pop-row"><label class="pop-check"><input type="checkbox" id="optAutoDownload"> 可见即下载</label></div>
+
+  <label class="switch">
+    <input type="checkbox" id="optShowOwnTags">
+    <span class="track"></span>
+    <span class="switch-text">显示收藏标签</span>
+  </label>
+
+  <label class="switch">
+    <input type="checkbox" id="optShowTags">
+    <span class="track"></span>
+    <span class="switch-text">显示作品标签</span>
+  </label>
+
+  <label class="switch">
+    <input type="checkbox" id="optAutoDownload">
+    <span class="track"></span>
+    <span class="switch-text">可见即下载</span>
+  </label>
+
   <div class="pop-foot"><button id="optReset">恢复默认</button></div>
 </div>
+
+<button class="edge-toggle edge-left" id="edgeLeft" title="作者 / 标签">›</button>
+<button class="edge-toggle edge-right" id="edgeRight" title="下载管理">‹</button>
 
 <div id="lightbox" class="lightbox" hidden>
   <div class="lb-stage" id="lbStage">
@@ -120,6 +138,6 @@
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=4"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>

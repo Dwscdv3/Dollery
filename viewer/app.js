@@ -15,8 +15,8 @@ const DEFAULT_SETTINGS = {
   showOwnTags: false,
   showTags: false,
   autoDownload: true,
-  leftOpen: true,
-  rightOpen: true,
+  leftOpen: false,
+  rightOpen: false,
 };
 
 function loadSettings() {
@@ -65,7 +65,7 @@ const PAGE_SIZE = 120;
 const els = {};
 for (const id of [
   'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
-  'btnLeft', 'btnRight', 'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList',
+  'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'edgeLeft', 'edgeRight',
   'grid', 'sentinel', 'statusbar',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
@@ -100,7 +100,9 @@ function applySettings() {
   document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
 
   els.sortMode.value = settings.sort;
-  els.optRatio.value = settings.ratio;
+  for (const btn of els.optRatio.querySelectorAll('button')) {
+    btn.classList.toggle('on', btn.dataset.v === settings.ratio);
+  }
   els.optWidth.value = String(settings.cardWidth);
   els.optWidthVal.textContent = `${settings.cardWidth}px`;
   els.optShowOwnTags.checked = settings.showOwnTags;
@@ -112,10 +114,10 @@ function applySettings() {
   document.getElementById('btnLeft')?.classList.toggle('on', settings.leftOpen);
   document.getElementById('btnRight')?.classList.toggle('on', settings.rightOpen);
 
-  // 标签显示开关切换后要重渲染已渲染的卡片
+  // 重渲染卡片后必须重新 observe，否则新生成的 img[data-src] 不会被触发加载
   for (const record of state.records) {
     const card = state.cardMap.get(String(record.pid));
-    if (card) renderCardInner(card, record);
+    if (card) refreshCard(card, record);
   }
 }
 
@@ -186,6 +188,7 @@ function renderAuthors() {
       <div class="side-item${a.author_id === state.authorId ? ' active' : ''}" data-author="${escapeHtml(
         a.author_id,
       )}" title="${escapeHtml(a.name)}">
+        <img class="avatar" src="/api/avatar/${encodeURIComponent(a.author_id)}" loading="lazy" alt="">
         <span class="name">${escapeHtml(a.name)}</span>
         <span class="cnt">${a.count}</span>
       </div>`,
@@ -913,7 +916,17 @@ function resetTransform() {
 
 function applyTransform() {
   els.lbImage.style.transform = `translate(${lb.tx}px, ${lb.ty}px) scale(${lb.scale})`;
-  els.lbZoom.textContent = `${Math.round(lb.scale * 100)}%`;
+  const ratio = lb.scale / oneToOneScale();
+  els.lbZoom.textContent = `${Math.round(ratio * 100)}%`;
+}
+
+/** 1:1 显示真实像素时的 scale —— 百分比以它为 100%。 */
+function oneToOneScale() {
+  const img = els.lbImage;
+  const fitWidth = img.clientWidth;
+  const natural = img.naturalWidth;
+  if (!fitWidth || !natural) return 1;
+  return natural / fitWidth;
 }
 
 function stepPage(delta) {
@@ -999,10 +1012,9 @@ window.addEventListener('mouseup', () => {
 els.lbImage.addEventListener('dblclick', (event) => {
   event.stopPropagation();
   if (Math.abs(lb.scale - 1) < 0.02) {
-    const fitWidth = els.lbImage.clientWidth; // 不受 transform 影响
-    const natural = els.lbImage.naturalWidth;
-    if (fitWidth > 0 && natural > 0) {
-      lb.scale = Math.min(8, Math.max(1.01, natural / fitWidth));
+    const target = oneToOneScale();
+    if (target > 1.01) {
+      lb.scale = Math.min(8, target);
       lb.tx = 0;
       lb.ty = 0;
       applyTransform();
@@ -1116,8 +1128,10 @@ document.addEventListener('click', (event) => {
   els.viewPopover.hidden = true;
 });
 
-els.optRatio.addEventListener('change', () => {
-  settings.ratio = els.optRatio.value;
+els.optRatio.addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-v]');
+  if (!btn) return;
+  settings.ratio = btn.dataset.v;
   saveSettings();
   applySettings();
 });
@@ -1153,13 +1167,15 @@ els.optReset.addEventListener('click', () => {
   setStatus('视图设置已恢复默认');
 });
 
-els.btnLeft.addEventListener('click', () => {
+els.edgeLeft.addEventListener('click', () => {
   settings.leftOpen = !settings.leftOpen;
   saveSettings();
   applySettings();
+  // 栏刚打开且还没加载过，才去拉作者/标签（连带头像）
+  if (settings.leftOpen && state.authors.length === 0 && state.tags.length === 0) loadSidePanel();
 });
 
-els.btnRight.addEventListener('click', () => {
+els.edgeRight.addEventListener('click', () => {
   settings.rightOpen = !settings.rightOpen;
   saveSettings();
   applySettings();
@@ -1235,7 +1251,7 @@ async function loadState() {
   applySettings();
   try {
     await loadState();
-    await loadSidePanel();
+    if (settings.leftOpen) await loadSidePanel();
     await loadPage(true);
     await pollQueue();
   } catch (err) {

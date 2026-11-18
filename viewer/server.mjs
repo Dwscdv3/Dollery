@@ -234,7 +234,17 @@ async function downloadByPid(pid) {
   const record = state.records.find((r) => String(r.pid) === key);
   if (!record) throw new Error('记录不存在');
   if (record.status === 'unavailable') throw new Error('作品已失效');
-  if (state.imageIndex.has(key)) return { skipped: true, files: 0 };
+  const hasImage = state.imageIndex.has(key);
+
+  // 图片已下载时不再重复下，但简介可能还缺，所以仍然要走一遍下面的简介抓取
+  if (hasImage) {
+    try {
+      await ensureDescription(key);
+    } catch {
+      /* 简介失败不影响结果 */
+    }
+    return { skipped: true, files: 0, filePaths: [] };
+  }
 
   const summary = await downloadRecords(state.client, {
     records: [record],
@@ -259,6 +269,13 @@ async function downloadByPid(pid) {
   for (const file of summary.filePaths ?? []) {
     const match = path.basename(file).match(/^(\d+)_p(\d+)\.avif$/);
     if (match) await generateThumbLevels(match[1], Number(match[2]));
+  }
+
+  // 批量下载时顺带把简介也补上，省得以后逐个打开才抓
+  try {
+    await ensureDescription(key);
+  } catch {
+    /* 简介失败不影响图片下载 */
   }
 
   return summary;
@@ -344,7 +361,10 @@ function enqueue(pids, { manual = false } = {}) {
       queue.failed.set(pid, '作品已失效');
       continue;
     }
-    if (state.imageIndex.has(pid)) continue;
+    // 图片和简介都齐了才算「已完成」，只缺简介也要入队
+    const hasImage = state.imageIndex.has(pid);
+    const hasDesc = Boolean(record.description) || descCache.has(pid) || record.type === 'novel';
+    if (hasImage && hasDesc) continue;
 
     const pageCount = Number(record.pages) || 0;
     if (AUTO_MAX_PAGES > 0 && !manual && pageCount > AUTO_MAX_PAGES) {
@@ -503,22 +523,27 @@ async function withThumbSlot(task) {
 /**
  * 缩略图级别。下载时就把 256 / 512 两档生成好并永久保存；
  * 请求时按目标宽度挑不小于它的最小级别，都不够就直接给原图（原图是最高层级）。
+ *
+ * 关键是按**短边**缩放（`256x256^`）：网格用的是 object-fit: cover，
+ * 只保证长边够大时短边会被放大而发虚，所以要让短边达到目标尺寸。
+ * 文件名带 `s` 后缀标记新算法，旧缓存自然失效、按需重建。
  */
 const THUMB_SIZES = [256, 512];
 
 async function ensureThumbSize(pid, page, size) {
-  const target = path.join(THUMB_DIR, `${pid}_p${page}_${size}.jpg`);
+  const target = path.join(THUMB_DIR, `${pid}_p${page}_${size}s.jpg`);
   if (fs.existsSync(target)) return target;
 
   const source = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
   if (!fs.existsSync(source)) return null;
 
-  const jobKey = `${pid}_${page}_${size}`;
+  const jobKey = `${pid}_${page}_${size}s`;
   if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
 
   const job = withThumbSlot(async () => {
     await fsp.mkdir(THUMB_DIR, { recursive: true });
-    await runProcess('magick', [source, '-thumbnail', `${size}x${size}`, '-quality', '82', target]);
+    // ^ 表示「填满」：短边缩到 size，长边按比例更大
+    await runProcess('magick', [source, '-thumbnail', `${size}x${size}^`, '-quality', '82', target]);
     return target;
   }).finally(() => state.thumbJobs.delete(jobKey));
 
@@ -722,16 +747,87 @@ async function ensureDescription(pid) {
   const key = String(pid);
   if (descCache.has(key)) return descCache.get(key);
 
+  const record = state.records.find((r) => String(r.pid) === key);
+  if (!record) return '';
+
+  // 小说和部分作品的简介在同步时就拿到了，不用再请求
+  if (record.description) {
+    descCache.set(key, record.description);
+    return record.description;
+  }
+
+  // 详情接口只对插画有效；小说走 /ajax/novel（正文那边已经带了）
+  if (record.type === 'novel') return '';
+  if (record.status === 'unavailable') return '';
+
   const body = await state.client.ajax(`/ajax/illust/${key}`, { lang: 'zh' });
   const text = cleanDescription(body.illustComment ?? body.description ?? '');
 
   descCache.set(key, text);
   scheduleDescSave();
-
-  const record = state.records.find((r) => String(r.pid) === key);
-  if (record) record.description = text;
+  record.description = text;
 
   return text;
+}
+
+/** 把缓存里的简介回填进内存记录，重启后也能直接显示。 */
+function applyDescCache() {
+  let filled = 0;
+  for (const record of state.records) {
+    if (record.description) continue;
+    const cached = descCache.get(String(record.pid));
+    if (cached) {
+      record.description = cached;
+      filled += 1;
+    }
+  }
+  return filled;
+}
+
+/** 作者头像：按需拉一次，存到 .thumbs/avatar-{uid}.jpg 永久复用。 */
+async function ensureAvatar(uid) {
+  const key = String(uid);
+  if (!/^\d+$/.test(key)) return null;
+
+  const target = path.join(THUMB_DIR, `avatar-${key}.jpg`);
+  if (fs.existsSync(target)) return target;
+
+  const jobKey = `avatar:${key}`;
+  if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
+
+  const job = withThumbSlot(async () => {
+    const body = await state.client.ajax(`/ajax/user/${key}`, { lang: 'zh' });
+    const url = body.imageBig ?? body.image;
+    if (!url) return null;
+
+    const res = await state.imageLimiter.run(() =>
+      httpsGetWithRetry(url, {
+        proxy: state.config?.proxy,
+        binary: true,
+        timeoutMs: 30000,
+        headers: { Referer: 'https://www.pixiv.net/', 'User-Agent': 'Mozilla/5.0' },
+      }),
+    );
+    if (res.status !== 200) return null;
+
+    await fsp.mkdir(THUMB_DIR, { recursive: true });
+    await fsp.writeFile(target, res.buffer);
+    return target;
+  }).finally(() => state.thumbJobs.delete(jobKey));
+
+  state.thumbJobs.set(jobKey, job);
+  return job;
+}
+
+/** 拿不到头像时给个灰色人形占位，避免列表里出现破图。 */
+function serveFallbackAvatar(res) {
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+    '<rect width="64" height="64" fill="#2b3038"/>' +
+    '<circle cx="32" cy="25" r="11" fill="#4a5160"/>' +
+    '<ellipse cx="32" cy="58" rx="19" ry="14" fill="#4a5160"/></svg>';
+  res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=3600' });
+  res.end(svg);
 }
 
 function decorate(record) {
@@ -769,6 +865,18 @@ function decorate(record) {
 
 async function handleApi(req, res, url) {
   const params = searchParams(url);
+
+  // 作者头像
+  if (url.startsWith('/api/avatar/')) {
+    const uid = url.replace(/^\/api\/avatar\//, '').split('?')[0];
+    try {
+      const file = await ensureAvatar(uid);
+      if (file) return sendFile(res, file, 'image/jpeg', 'public, max-age=86400');
+    } catch {
+      /* 落到占位图 */
+    }
+    return serveFallbackAvatar(res);
+  }
 
   // 简介：按需从详情接口补一条
   if (url.startsWith('/api/description/')) {
@@ -988,7 +1096,10 @@ async function handleApi(req, res, url) {
       if (record.removed === 'yes') continue;
       if (record.status === 'unavailable') continue;
       if (record.type === 'novel') continue; // 小说没有图片，不参与图片批量下载
-      if (state.imageIndex.has(String(record.pid))) continue;
+      const pid = String(record.pid);
+      const hasImg = state.imageIndex.has(pid);
+      const hasDesc = Boolean(record.description) || descCache.has(pid);
+      if (hasImg && hasDesc) continue;
       pids.push(record.pid);
     }
 
@@ -1176,6 +1287,8 @@ async function main() {
   await loadRecords();
   await refreshIndex();
   await loadDescCache();
+  const filled = applyDescCache();
+  if (filled > 0) console.log(`已从缓存回填 ${filled} 条简介。`);
 
   const cookieFile = path.join(ROOT, state.config.cookieFile ?? '.secrets/cookies.txt');
   let cookie = state.config.cookie ?? '';

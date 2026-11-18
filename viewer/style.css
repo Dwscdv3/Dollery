@@ -243,6 +243,17 @@ body {
   white-space: nowrap;
 }
 
+/* 作者头像：懒加载，拿到之前先占位 */
+.side-item .avatar {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--panel-2);
+  display: block;
+}
+
 .side-item .cnt {
   flex: 0 0 auto;
   color: var(--muted);
@@ -580,48 +591,133 @@ body {
 
 .popover {
   position: fixed;
-  top: 56px;
+  top: 54px;
   right: 14px;
-  width: 260px;
-  background: var(--panel);
+  width: 270px;
+  background: #1d2129;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
-  padding: 12px;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .6);
+  padding: 14px;
   z-index: 40;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
 }
 
 .popover[hidden] { display: none; }
 
-.pop-title { font-size: 12px; color: var(--muted); letter-spacing: .5px; }
+.pop-title { font-size: 11px; color: var(--muted); letter-spacing: 1px; }
 
-.pop-row {
+.pop-field { display: flex; flex-direction: column; gap: 7px; }
+
+.pop-label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
   font-size: 12px;
+  color: #b3bbc8;
 }
 
-.pop-row > label:first-child { flex: 0 0 62px; color: var(--muted); }
+.pop-label b {
+  color: var(--accent);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 
-.pop-row select {
-  flex: 1 1 auto;
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  color: var(--text);
-  padding: 5px 7px;
-  border-radius: 6px;
+/* 分段按钮组，替代原生 select */
+.seg {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 3px;
+  background: #161a20;
+  padding: 3px;
+  border-radius: 8px;
+}
+
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
   font: inherit;
-  outline: none;
+  font-size: 11px;
+  padding: 6px 0;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s, color .15s;
 }
 
-.pop-row input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); }
-.pop-val { flex: 0 0 34px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-.pop-check { display: flex; align-items: center; gap: 7px; cursor: pointer; }
-.pop-check input { accent-color: var(--accent); }
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--accent); color: #0b1220; font-weight: 600; }
+
+/* 滑块 */
+.pop-field input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: #161a20;
+  outline: none;
+  cursor: pointer;
+}
+
+.pop-field input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #1d2129;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, .5);
+}
+
+/* 开关，替代原生 checkbox */
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #b3bbc8;
+  user-select: none;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch .track {
+  position: relative;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 19px;
+  background: #2b3038;
+  border-radius: 10px;
+  transition: background .18s;
+}
+
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #8e97a5;
+  transition: transform .18s, background .18s;
+}
+
+.switch:hover .track { background: #353b45; }
+.switch input:checked + .track { background: rgba(106, 169, 255, .3); }
+.switch input:checked + .track::after { transform: translateX(15px); background: var(--accent); }
+.switch input:checked:hover + .track { background: rgba(106, 169, 255, .42); }
+.switch-text { flex: 1 1 auto; }
 
 .pop-foot { display: flex; justify-content: flex-end; }
 
@@ -636,6 +732,40 @@ body {
   font-size: 12px;
 }
 
+.pop-foot button:hover { border-color: var(--accent); }
+
+/* ---------- 屏幕两侧的栏切换按钮 ---------- */
+
+.edge-toggle {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 30;
+  width: 20px;
+  height: 72px;
+  background: rgba(48, 55, 68, .96);
+  border: 1px solid var(--line);
+  color: #c3ccda;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: .85;
+  transition: opacity .15s, background .15s, color .15s, left .2s, right .2s;
+  padding: 0;
+}
+
+.edge-toggle:hover { opacity: 1; color: var(--text); background: var(--panel-2); }
+
+.edge-left { left: 0; border-left: 0; border-radius: 0 7px 7px 0; }
+.edge-right { right: 0; border-right: 0; border-radius: 7px 0 0 7px; }
+
+/* 侧栏展开时按钮贴着栏的外沿 */
+body.left-open .edge-left { left: var(--side-left); }
+body.right-open .edge-right { right: var(--side-right); }
+
 /* ---------- 大图（铺满 + 半透明浮栏） ---------- */
 
 .lightbox {
@@ -643,18 +773,28 @@ body {
   inset: 0;
   background: #05070a;
   z-index: 50;
+  /* 适应屏幕时要避开左右浮栏，不然图会被压在面板底下 */
+  --lb-left: 0px;
+  --lb-right: 0px;
 }
+
+.lightbox:has(.lb-pages:not(:empty)) { --lb-left: 200px; }
+.lightbox:has(.lb-panel:not(:empty)) { --lb-right: 340px; }
 
 .lightbox[hidden] { display: none; }
 
 .lb-stage {
   position: absolute;
-  inset: 0;
+  top: 0;
+  bottom: 0;
+  left: var(--lb-left, 0px);
+  right: var(--lb-right, 0px);
   overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: grab;
+  transition: left .2s, right .2s;
 }
 
 .lb-stage img {
@@ -850,19 +990,15 @@ body {
 
 .lb-btn:hover { background: rgba(255, 255, 255, .2); }
 .lb-close { top: 12px; right: 12px; }
-.lb-prev { left: 212px; top: 50%; margin-top: -19px; }
-.lb-next { right: 352px; top: 50%; margin-top: -19px; }
-
-.lightbox:has(.lb-pages:empty) .lb-prev { left: 12px; }
-.lightbox:has(.lb-panel:empty) .lb-next { right: 12px; }
-.lightbox:has(.lb-panel:empty) .lb-close { right: 12px; }
+.lb-prev { left: calc(var(--lb-left, 0px) + 12px); top: 50%; margin-top: -19px; }
+.lb-next { right: calc(var(--lb-right, 0px) + 12px); top: 50%; margin-top: -19px; }
 
 .lb-bar {
   position: absolute;
-  left: 0;
-  right: 0;
+  left: var(--lb-left, 0px);
+  right: var(--lb-right, 0px);
   bottom: 0;
-  padding: 10px 200px;
+  padding: 10px 24px;
   background: linear-gradient(transparent, rgba(0, 0, 0, .85));
   color: #cfd6e2;
   font-size: 12px;
