@@ -125,7 +125,8 @@ export class PixivClient {
    * 最近收到的站内信。
    *
    * 防封号守卫用它判断有没有「过度访问警告」。注意这是 rpc 接口而不是 ajax，
-   * 返回的 JSON 外层没有 body 包装字段（结构见 notes/过度访问警告）。
+   * 返回的 JSON 外层没有 body 包装字段，结构见 PixivBatchDownloader 的笔记：
+   * https://github.com/xuejianxianzun/PixivBatchDownloader/blob/master/notes/过度访问警告.md
    * 拿不到就返回 null，让调用方当作「这次没查到」而不是「没有警告」。
    */
   async fetchRecentMessages(num = 3) {
