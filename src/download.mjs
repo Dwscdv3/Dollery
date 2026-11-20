@@ -251,7 +251,7 @@ export async function downloadRecords(client, options) {
       const record = records[i];
       const label = `#${record.id} pid=${record.pid}`;
 
-      if (onProgress) onProgress({ phase: 'start', index: i, total: records.length, record, label });
+      if (onProgress) await onProgress({ phase: 'start', index: i, total: records.length, record, label });
 
       try {
         const result = await downloadOne(client, record, {
@@ -273,13 +273,17 @@ export async function downloadRecords(client, options) {
         summary.finalBytes += result.finalBytes;
 
         if (onProgress) {
-          onProgress({ phase: 'done', index: i, total: records.length, record, label, result });
+          await onProgress({ phase: 'done', index: i, total: records.length, record, label, result });
         }
       } catch (err) {
+        // 守卫的拦截是「整个任务必须停」，不能被当成单个作品的失败吞掉：
+        // 否则每日上限会用「每个作品都失败一次」的方式跑完剩余队列。
+        if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') throw err;
+
         summary.failed += 1;
         summary.errors.push({ record, message: err.message });
         if (onProgress) {
-          onProgress({ phase: 'fail', index: i, total: records.length, record, label, message: err.message });
+          await onProgress({ phase: 'fail', index: i, total: records.length, record, label, message: err.message });
         }
       }
     }

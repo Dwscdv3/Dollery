@@ -194,7 +194,7 @@ export async function updateBookmarkTagMap(client, options) {
     scannedPids += pids.length;
 
     if (onProgress) {
-      onProgress({
+      await onProgress({
         index: index + 1,
         total: totalPending,
         tag,
@@ -386,7 +386,7 @@ export async function refreshBookmarkTags(client, options) {
     }
 
     if (onProgress) {
-      onProgress({ index: index + 1, total: targets.length, pid, tags, changed, failed });
+      await onProgress({ index: index + 1, total: targets.length, pid, tags, changed, failed });
     }
   }
 

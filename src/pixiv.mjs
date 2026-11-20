@@ -121,6 +121,29 @@ export class PixivClient {
     );
   }
 
+  /**
+   * 最近收到的站内信。
+   *
+   * 防封号守卫用它判断有没有「过度访问警告」。注意这是 rpc 接口而不是 ajax，
+   * 返回的 JSON 外层没有 body 包装字段（结构见 notes/过度访问警告）。
+   * 拿不到就返回 null，让调用方当作「这次没查到」而不是「没有警告」。
+   */
+  async fetchRecentMessages(num = 3) {
+    const res = await this.html(`/rpc/index.php?mode=latest_message_threads2&num=${num}&offset=0`);
+
+    // 账号被删除时所有接口都是 403，这里单独点出来
+    if (res.status === 403) {
+      throw new PixivError('站内信接口返回 403，账号可能已被限制或删除', { status: 403 });
+    }
+    if (res.status !== 200) return null;
+
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      return null;
+    }
+  }
+
   parseAjax(res, url) {
     let payload;
     try {

@@ -130,7 +130,7 @@ export async function syncKind(client, options) {
     consecutiveKnownPages = allKnownInPage ? consecutiveKnownPages + 1 : 0;
 
     if (onProgress) {
-      onProgress({
+      await onProgress({
         label,
         page,
         offset,

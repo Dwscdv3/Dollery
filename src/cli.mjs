@@ -17,10 +17,25 @@ import { readRecords } from './store.mjs';
 import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
 import { downloadRecords, formatBytes } from './download.mjs';
 import { updateBookmarkTagMap, applyBookmarkTags, refreshBookmarkTags } from './bookmark-tags.mjs';
+import { createGuard, GuardTripped, DailyLimitReached } from './guard.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
 const EXAMPLE_PATH = path.join(PROJECT_ROOT, 'config.example.json');
+
+const GUARD_STATE_PATH = path.join(PROJECT_ROOT, '.secrets', 'guard-state.json');
+
+/**
+ * 建一个守卫。client 可以为 null（只查状态 / 解除禁令时不需要发请求）。
+ */
+function makeGuard(config, client = null) {
+  return createGuard({
+    client,
+    statePath: GUARD_STATE_PATH,
+    thresholds: config?.guard ?? {},
+    log: (text) => console.log(`    ${text}`),
+  });
+}
 
 const DEFAULT_CONFIG = {
   proxy: 'http://127.0.0.1:7897',
@@ -48,6 +63,16 @@ const DEFAULT_CONFIG = {
   bookmarkTags: {
     enabled: true,
     cacheDir: '.cache',
+  },
+
+  // 防封号守卫：默认开启，额度按天算
+  guard: {
+    enabled: true,
+    checkEveryFiles: 100,
+    checkEveryRequests: 300,
+    minCheckIntervalMs: 200000,
+    dailyFileLimit: 2000,
+    dailyByteLimit: 0,
   },
 };
 
@@ -97,6 +122,7 @@ async function loadConfig() {
     pageSize: { ...DEFAULT_CONFIG.pageSize, ...(raw.pageSize ?? {}) },
     download: { ...DEFAULT_CONFIG.download, ...(raw.download ?? {}) },
     bookmarkTags: { ...DEFAULT_CONFIG.bookmarkTags, ...(raw.bookmarkTags ?? {}) },
+    guard: { ...DEFAULT_CONFIG.guard, ...(raw.guard ?? {}) },
     // 兼容旧版配置：以前只有 illust / novel 两个输出路径，全部对应到公开收藏。
     output: {
       ...DEFAULT_CONFIG.output,
@@ -138,6 +164,8 @@ function printHelp() {
     '  node src/cli.mjs download --id 1-5    下载指定序号的作品',
     '  node src/cli.mjs status               查看本地备份概况',
     '  node src/cli.mjs check                检查代理与 cookie 是否可用',
+    '  node src/cli.mjs guard                查看防封号守卫状态',
+    '  node src/cli.mjs resume               解除「检测到警告」的禁令',
     '',
     'sync 选项:',
     '  --full               全量同步：翻完所有页，能发现取消收藏与字段变更',
@@ -166,6 +194,11 @@ function printHelp() {
     '  把浏览器登录 pixiv 后的 cookie 写入 .secrets/cookies.txt，',
     '  或设置环境变量 PIXIV_COOKIE，或在 config.json 里填 cookie。',
     '  最省事的写法是只放 PHPSESSID 的值，程序会自动补全。',
+    '',
+    '防封号:',
+    '  每累计 100 个文件 / 300 次请求会查一次站内信（间隔 ≥200 秒），',
+    '  一旦发现「过度访问警告」就停止任务并落盘禁令，需 guard / resume 处理。',
+    '  每日下载量上限见 config.json 的 guard.dailyFileLimit。',
   ];
   console.log(lines.join('\n'));
 }
@@ -335,7 +368,7 @@ function printSummary(result) {
  * 标签和元数据分两步走：元数据靠翻收藏列表，标签只能靠「逐标签反查」，
  * 两者成本差一个数量级，所以有缓存、有单独的开关。
  */
-async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal, result }) {
+async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal, result, guard }) {
   const meta = {
     kindLabel: entry.label,
     lastSync: new Date().toISOString().replace('T', ' ').slice(0, 19),
@@ -357,10 +390,12 @@ async function syncTagsForChannel(client, { entry, config, filePath, flags, sour
       kind: entry.kind,
       pids,
       meta,
-      onProgress: (event) => {
+      onProgress: async (event) => {
         if (event.index % 10 === 0 || event.index === event.total) {
           console.log(`    逐个检查标签 ${event.index}/${event.total}（已改 ${event.changed}）`);
         }
+        // 一个作品一次请求
+        await guard.bump({ requests: 1 });
       },
     });
 
@@ -381,13 +416,14 @@ async function syncTagsForChannel(client, { entry, config, filePath, flags, sour
     cacheDir,
     limit: Number(config.pageSize[entry.kind] ?? 100),
     force: Boolean(flags['rebuild-tags']),
-    onProgress: (event) => {
+    onProgress: async (event) => {
       // 868 个标签逐个打印太吵，每 20 个报一次进度
       if (event.index % 20 === 0 || event.index === event.total) {
         console.log(
           `    标签扫描 ${event.index}/${event.total}（当前「${event.tag}」）已映射 ${event.mapped} 个作品`,
         );
       }
+      await guard.bump({ requests: 1 });
     },
   });
 
@@ -415,6 +451,11 @@ async function syncTagsForChannel(client, { entry, config, filePath, flags, sour
 async function commandSync(flags) {
   const config = await loadConfig();
   const { client, intervalMs } = await buildClient(config, flags);
+  const guard = makeGuard(config, client);
+
+  // 上一次运行留下的禁令要先拦住，别一上来就继续发请求
+  await guard.assertAllowed();
+
   const full = Boolean(flags.full);
   const dryRun = Boolean(flags['dry-run']);
 
@@ -447,7 +488,11 @@ async function commandSync(flags) {
       full,
       dryRun,
       maxPages: Number(flags['max-pages'] ?? config.maxPagesPerRun ?? 0),
-      onProgress: printProgress,
+      // 每翻一页就是一次请求，顺便记账（达到阈值会在这里巡检一次站内信）
+      onProgress: async (event) => {
+        printProgress(event);
+        await guard.bump({ requests: 1 });
+      },
     });
     results.push(result);
 
@@ -459,6 +504,7 @@ async function commandSync(flags) {
         flags,
         sourceTotal: result.total,
         result,
+        guard,
       });
     }
   }
@@ -519,6 +565,8 @@ const DOWNLOAD_TARGETS = {
 async function commandDownload(flags) {
   const config = await loadConfig();
   const { client } = await buildClient(config, flags);
+  const guard = makeGuard(config, client);
+  await guard.assertAllowed();
 
   const idText = flags.id;
   if (!idText || idText === true) {
@@ -603,7 +651,7 @@ async function commandDownload(flags) {
     dryRun,
     imageLimiter,
     proxy: config.proxy,
-    onProgress: (event) => {
+    onProgress: async (event) => {
       const title = event.record.title || '无题';
       if (event.phase === 'start') {
         process.stdout.write(`  [${event.index + 1}/${event.total}] ${event.label} 《${title}》 … `);
@@ -614,6 +662,8 @@ async function commandDownload(flags) {
         if (dryRun) console.log('演练');
         else if (result.skipped > 0 && result.files.length === 0) console.log(`已存在，跳过 ${result.skipped} 个文件`);
         else console.log(`完成 ${result.files.length} 个文件`);
+        // 真正落盘的文件才计入额度：跳过的不算，否则额度会被重复跑消耗掉
+        if (!dryRun) await guard.bump({ files: result.files.length, bytes: result.finalBytes });
         return;
       }
       if (event.phase === 'fail') {
@@ -725,6 +775,71 @@ async function commandCheck(flags) {
   return 0;
 }
 
+/**
+ * 查看防封号守卫的状态。不发任何请求，随便跑。
+ */
+async function commandGuard() {
+  const config = await loadConfig();
+  const guard = makeGuard(config);
+  await guard.load();
+
+  const status = guard.status();
+  const limits = status.limits;
+  const daily = status.daily;
+
+  console.log('');
+  console.log('── 防封号守卫 ──');
+  console.log(`  状态         : ${guard.settings.enabled ? '开启' : '关闭（config.json 里 guard.enabled = false）'}`);
+  console.log(
+    `  巡检阈值     : 每 ${guard.settings.checkEveryFiles} 个文件 / ${guard.settings.checkEveryRequests} 次请求` +
+      `（两次间隔 ≥ ${Math.round(guard.settings.minCheckIntervalMs / 1000)} 秒）`,
+  );
+  console.log(`  上次巡检     : ${status.lastCheckAt ? new Date(status.lastCheckAt).toLocaleString('zh-CN') : '还没查过'}`);
+  console.log(
+    `  今日下载     : ${daily.files} 个文件 / ${(daily.bytes / 1024 ** 3).toFixed(2)} GB` +
+      `${limits.dailyFileLimit > 0 ? `（上限 ${limits.dailyFileLimit} 个）` : '（不限量）'}`,
+  );
+  console.log(`  自上次巡检   : ${status.overall.files} 个文件 / ${status.overall.requests} 次请求`);
+
+  if (status.blocked) {
+    console.log('');
+    console.log(`  ⚠️  当前有禁令，所有任务都会被拒绝执行`);
+    console.log(`     检测到警告 : ${new Date(status.warnedAt).toLocaleString('zh-CN')}`);
+    if (status.warning?.excerpt) console.log(`     站内信摘要 : ${status.warning.excerpt}`);
+    console.log('');
+    console.log('     确认已经谨慎处理过（比如隔了几天、调大了请求间隔）后，执行：');
+    console.log('       node src/cli.mjs resume');
+  } else {
+    console.log(`  当前禁令     : 无`);
+  }
+  console.log('');
+
+  return 0;
+}
+
+/**
+ * 手动解除禁令。
+ */
+async function commandResume() {
+  const config = await loadConfig();
+  const guard = makeGuard(config);
+  await guard.load();
+
+  const before = guard.status();
+  if (!before.blocked) {
+    console.log('当前没有禁令，不需要解除。');
+    return 0;
+  }
+
+  await guard.resume();
+  console.log(`已解除禁令（原警告时间 ${new Date(before.warnedAt).toLocaleString('zh-CN')}）。`);
+  console.log('');
+  console.log('建议同时做两件事，别让它再触发：');
+  console.log('  1. config.json 里把 intervalMs 调大（比如 3000~5000）');
+  console.log('  2. guard.dailyFileLimit 调小，先少量跑几天');
+  return 0;
+}
+
 async function main() {
   const flags = parseArgs(process.argv.slice(2));
   const command = flags._[0] ?? 'help';
@@ -755,6 +870,10 @@ async function main() {
       return commandStatus();
     case 'check':
       return commandCheck(flags);
+    case 'guard':
+      return commandGuard();
+    case 'resume':
+      return commandResume();
     default:
       console.error(`未知命令: ${command}`);
       printHelp();
@@ -772,6 +891,15 @@ main()
     if (err instanceof SyncAbort) {
       console.error(`\n已中止：${err.message}`);
       process.exit(2);
+    }
+    // 守卫拦截要排在 PixivError 前面：它更具体，提示也更重要
+    if (err instanceof GuardTripped) {
+      console.error(`\n${err.message}`);
+      process.exit(2);
+    }
+    if (err instanceof DailyLimitReached) {
+      console.error(`\n${err.message}`);
+      process.exit(3);
     }
     if (err instanceof PixivError) {
       console.error(`\nPixiv 接口出错：${err.message}`);
