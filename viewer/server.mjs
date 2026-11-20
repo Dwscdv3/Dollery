@@ -22,6 +22,7 @@ import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
 import { RateLimiter, httpsGetWithRetry } from '../src/http.mjs';
 import { compileQuery, matches as matchQuery } from './query.mjs';
+import { createGuard, DEFAULT_GUARD } from '../src/guard.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IMAGES_DIR = path.join(ROOT, 'images');
@@ -60,6 +61,7 @@ const state = {
   client: null,
   imageLimiter: null,
   config: null,
+  guard: null, // 防封号守卫，见 src/guard.mjs
 };
 
 /**
@@ -347,6 +349,13 @@ function queueSnapshot() {
  * 反过来 full 下完的作品，再收到 first 请求直接忽略。
  */
 function enqueue(pids, { mode = 'first', priority = false } = {}) {
+  // 守卫拦着的时候一个都不放行，前端据此显示提示
+  if (state.guard) {
+    const g = state.guard.status();
+    if (g.blocked) return { added: 0, upgraded: 0, blocked: 'guard' };
+    if (g.dailyExhausted) return { added: 0, upgraded: 0, blocked: 'daily' };
+  }
+
   const wants = (m) => (m === 'full' ? 'full' : 'first');
 
   // 某个 pid 是否已经满足了这次请求的范围
@@ -416,10 +425,28 @@ function enqueue(pids, { mode = 'first', priority = false } = {}) {
     runQueue();
   }
 
-  return { added, upgraded };
+  return { added, upgraded, blocked: null };
 }
 
 const QUEUE_CONCURRENCY = 2;
+
+/**
+ * 守卫触发后清空待办。已经在跑的几个任务会自然结束，但不会再取新任务。
+ */
+function stopQueueByGuard(err) {
+  const cleared = queue.pending.length;
+  queue.pending.length = 0;
+
+  for (const pid of [...queue.queued]) {
+    if (queue.actives.has(pid)) continue;
+    queue.queued.delete(pid);
+    queue.modes.delete(pid);
+  }
+
+  const headline = String(err.message).split('\n').find((line) => line.trim()) ?? err.message;
+  console.warn(`\n[防封号] ${headline.trim()}`);
+  if (cleared > 0) console.warn(`[防封号] 已清空队列里剩余的 ${cleared} 个任务\n`);
+}
 
 /** 两个 worker 并行：下载受 1 秒限速约束，但 AVIF 压制是 CPU 活，能重叠起来。 */
 async function runQueue() {
@@ -442,11 +469,24 @@ async function queueWorker() {
 
     queue.actives.add(pid);
     try {
-      await downloadByPid(pid, mode);
+      const summary = await downloadByPid(pid, mode);
       queue.done.add(pid);
       queue.doneMode.set(pid, mode);
+
+      // 记账：真正落盘的文件才算额度，跳过已存在的不算
+      if (state.guard) {
+        await state.guard.bump({
+          files: Number(summary?.files) || 0,
+          bytes: Number(summary?.finalBytes) || 0,
+        });
+      }
     } catch (err) {
-      queue.failed.set(pid, err.message);
+      if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
+        // 守卫拦截是「整条队列都要停」，不能只把这个作品记成失败然后接着跑
+        stopQueueByGuard(err);
+      } else {
+        queue.failed.set(pid, err.message);
+      }
     } finally {
       const upgradedWhileRunning = queue.modes.get(pid) === 'full' && mode === 'first';
       queue.queued.delete(pid);
@@ -1137,8 +1177,8 @@ async function handleApi(req, res, url) {
     if (pids.length === 0) return sendJson(res, 400, { error: '缺少 pids' });
     if (pids.length > 500) return sendJson(res, 400, { error: '一次最多 500 个' });
 
-    const { added } = enqueue(pids);
-    return sendJson(res, 200, { added, queue: queueSnapshot() });
+    const { added, blocked } = enqueue(pids);
+    return sendJson(res, 200, { added, blocked: blocked ?? null, queue: queueSnapshot() });
   }
 
   // 队列状态：前端轮询这个来更新卡片
@@ -1157,9 +1197,21 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, queueSnapshot());
   }
 
+  // 解除「过度访问警告」的禁令（界面横幅上的按钮走这里）
+  if (url.startsWith('/api/guard/resume') && req.method === 'POST') {
+    if (!state.guard) return sendJson(res, 503, { error: '守卫未初始化' });
+    const before = state.guard.status();
+    await state.guard.resume();
+    console.log(`[防封号] 用户手动解除了禁令（原警告 ${before.warnedAt ?? '无'}）`);
+    return sendJson(res, 200, { ok: true, guard: state.guard.status() });
+  }
+
   // 统计：给下载管理器用的总览。作品数和页数各算一套 ——
   // 「已下载 120 个作品」和「已下载 300 / 4200 页」是两回事，后者才反映真实进度。
   if (url.startsWith('/api/stats')) {
+    // 命令行那边可能刚写了禁令，先把磁盘状态同步进来
+    if (state.guard) await state.guard.refresh();
+
     let allPagesTotal = 0;
     let allPagesDone = 0;
 
@@ -1210,6 +1262,7 @@ async function handleApi(req, res, url) {
       verify: verifyState,
       records: state.records.length,
       downloaded: state.imageIndex.size,
+      guard: state.guard ? state.guard.status() : null,
       pages: { total: allPagesTotal, done: allPagesDone, missing: allPagesTotal - allPagesDone },
     });
   }
@@ -1231,8 +1284,8 @@ async function handleApi(req, res, url) {
       pids.push(record.pid);
     }
 
-    const { added } = enqueue(pids, { mode: 'full' });
-    return sendJson(res, 200, { candidates: pids.length, added, queue: queueSnapshot() });
+    const { added, blocked } = enqueue(pids, { mode: 'full' });
+    return sendJson(res, 200, { candidates: pids.length, added, blocked: blocked ?? null, queue: queueSnapshot() });
   }
 
   // 手动触发全量完整性校验
@@ -1258,7 +1311,16 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { status: 'already', files: 0 });
     }
 
-    enqueue([pid], { mode: 'full', priority: true });
+    const queued = enqueue([pid], { mode: 'full', priority: true });
+    // 守卫拦着就别让它干等 180 秒了，直接把原因说清楚
+    if (queued.blocked) {
+      return sendJson(res, 429, {
+        error:
+          queued.blocked === 'guard'
+            ? '检测到 pixiv 的过度访问警告，下载已停用。确认风险后可点顶部的「恢复运行」解除。'
+            : '今日下载额度已用完，明天会自动恢复，或调大 config.json 里 guard.dailyFileLimit。',
+      });
+    }
 
     const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {
@@ -1432,7 +1494,24 @@ async function main() {
   });
   state.imageLimiter = new RateLimiter(state.config.download?.imageIntervalMs ?? 1000);
 
+  state.guard = createGuard({
+    client: state.client,
+    statePath: path.join(ROOT, '.secrets', 'guard-state.json'),
+    thresholds: { ...DEFAULT_GUARD, ...(state.config.guard ?? {}) },
+    log: (text) => console.log(`  ${text}`),
+  });
+
   console.log(`已加载 ${state.records.length} 条记录，${state.imageIndex.size} 个作品已下载。`);
+
+  const guardStatus = state.guard.status();
+  if (guardStatus.blocked) {
+    console.warn(
+      '\n⚠️  上次检测到 pixiv 的「过度访问警告」，下载队列已停用。' +
+        '\n   在界面点「恢复运行」，或执行 node src/cli.mjs resume。\n',
+    );
+  } else if (guardStatus.dailyExhausted) {
+    console.warn(`\n⚠️  今日下载额度已用完（${guardStatus.daily.files} 个文件），明天自动恢复。\n`);
+  }
   listen(BASE_PORT);
 }
 

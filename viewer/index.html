@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=10">
+<link rel="stylesheet" href="style.css?v=11">
 </head>
 <body>
 
@@ -33,6 +33,12 @@
     <button id="btnRight" class="icon-btn edge-in-toolbar" title="下载管理">▤</button>
   </div>
 </header>
+
+<div class="guard-banner" id="guardBanner" hidden>
+  <span class="guard-icon">⚠</span>
+  <div class="guard-text" id="guardText"></div>
+  <button id="guardResume" class="guard-resume">我已了解，恢复运行</button>
+</div>
 
 <div class="app-body">
   <aside class="side side-left" id="sideLeft">
@@ -143,6 +149,6 @@
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=15"></script>
+<script src="app.js?v=16"></script>
 </body>
 </html>

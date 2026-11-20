@@ -69,7 +69,7 @@ for (const id of [
   'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
   'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
   'searchSuggest', 'tagIncludeWrap', 'tagIncludeWork',
-  'grid', 'sentinel',
+  'grid', 'sentinel', 'guardBanner', 'guardText', 'guardResume',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
   'optAutoDownload', 'optOverlayInfo', 'optReset',
@@ -593,6 +593,8 @@ function applyQueueState(snapshot) {
 // ---------- 右栏：下载管理 ----------
 
 function renderDownloadPanel(data) {
+  renderGuardBanner(data.guard);
+
   const sum = data.sources.reduce(
     (acc, s) => {
       acc.total += s.total;
@@ -657,6 +659,8 @@ els.dlAll.addEventListener('click', async () => {
   els.dlAll.disabled = true;
   try {
     const data = await api('/api/enqueue-all', { method: 'POST' });
+    // 被守卫拦下时队列不会动，直接刷新一次状态好把横幅显示出来
+    if (data.blocked) { els.dlAll.disabled = false; await pollQueue(); return; }
     startPolling();
   } catch (err) {
     els.dlAll.disabled = false;
@@ -689,6 +693,7 @@ els.dlSources.addEventListener('click', async (event) => {
     const data = await api(`/api/enqueue-all?source=${encodeURIComponent(btn.dataset.source)}`, {
       method: 'POST',
     });
+    if (data.blocked) { btn.disabled = false; await pollQueue(); return; }
     startPolling();
   } catch (err) {
     btn.disabled = false;
@@ -1183,6 +1188,49 @@ async function ensureDownloaded(record, card) {
     if (card) refreshCard(card, record);
   }
 }
+
+// ---------- 防封号横幅 ----------
+
+function renderGuardBanner(guard) {
+  if (!els.guardBanner) return;
+
+  if (!guard || (!guard.blocked && !guard.dailyExhausted)) {
+    els.guardBanner.hidden = true;
+    return;
+  }
+
+  els.guardBanner.hidden = false;
+
+  if (guard.blocked) {
+    const when = guard.warnedAt ? new Date(guard.warnedAt).toLocaleString('zh-CN') : '未知时间';
+    els.guardBanner.classList.remove('warn');
+    els.guardText.innerHTML =
+      `<b>检测到 pixiv 的「过度访问警告」（${when}）</b>，下载已全部停止。` +
+      `<br><span class="muted">继续跑下去可能被冻结关注/收藏，甚至删号。确认已经收手后再恢复，建议先把请求间隔调大。</span>`;
+    els.guardResume.hidden = false;
+    return;
+  }
+
+  const limits = guard.limits ?? {};
+  els.guardBanner.classList.add('warn');
+  els.guardText.innerHTML =
+    `<b>今日下载额度已用完</b>（${guard.daily.files} 个文件${limits.dailyFileLimit ? ` / 上限 ${limits.dailyFileLimit}` : ''}）。` +
+    `<br><span class="muted">明天 0 点自动恢复，或调大 config.json 里 guard.dailyFileLimit。</span>`;
+  els.guardResume.hidden = true;
+}
+
+els.guardResume?.addEventListener('click', async () => {
+  els.guardResume.disabled = true;
+  try {
+    const data = await api('/api/guard/resume', { method: 'POST' });
+    renderGuardBanner(data.guard);
+    await pollQueue();
+  } catch (err) {
+    els.guardText.innerHTML = `解除失败：${escapeHtml(err.message)}`;
+  } finally {
+    els.guardResume.disabled = false;
+  }
+});
 
 // ---------- 顶栏交互 ----------
 

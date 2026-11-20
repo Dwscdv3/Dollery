@@ -13,6 +13,8 @@ viewer/.edgeprofile*/
 viewer/_shot.png
 viewer/_dom.html
 viewer/_cdp.mjs
+viewer/_guard.mjs
+viewer/_guard*.png
 
 # 依赖与运行产物
 node_modules/

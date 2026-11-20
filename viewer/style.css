@@ -37,6 +37,52 @@ body {
 
 /* ---------- 工具栏 ---------- */
 
+/* 防封号横幅：顶栏下方常驻一条，警告时红色，额度用完时橙色 */
+.guard-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #ffe9e9;
+  background: linear-gradient(90deg, rgba(180, 46, 56, .95), rgba(140, 30, 40, .95));
+  border-bottom: 1px solid rgba(255, 255, 255, .14);
+}
+
+.guard-banner[hidden] { display: none; }
+
+.guard-banner.warn {
+  color: #2a1d05;
+  background: linear-gradient(90deg, rgba(224, 164, 88, .96), rgba(198, 136, 60, .96));
+}
+
+.guard-icon {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.guard-text { flex: 1 1 auto; min-width: 0; }
+
+.guard-text b { font-weight: 600; }
+.guard-text .muted { opacity: .78; }
+
+.guard-resume {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, .35);
+  background: rgba(255, 255, 255, .14);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.guard-resume:hover { background: rgba(255, 255, 255, .24); }
+.guard-resume[hidden] { display: none; }
+
 .toolbar {
   flex: 0 0 auto;
   display: flex;
