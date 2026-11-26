@@ -182,6 +182,63 @@
 
 ---
 
+## 9. 给源文件加 GPL 版权声明头
+
+**为什么值得做**：不是「不写就没授权」，而是防止**单个文件被摘出去后失去许可语境**。
+有人把 `viewer/server.mjs` 单独拷进自己项目，那文件自身没有任何许可信息，事后主张「我不知道是 GPL」就有空间。
+顺带把 `GPL-3.0-or-later` 的「or later」写清楚 —— 这条目前只体现在 `package.json` 字段里。
+
+**范围**（2026-11-27 实测）：`src/` 13 个 + `viewer/` 3 个 `.mjs`，共 16 个。
+`viewer/_guard.mjs` 虽然在 `.gitignore` 里（调试探针，不在仓库），跳过；`.bat` 不必加。
+
+**模板**（GPL 原文 `LICENSE` 末尾 "How to Apply These Terms" 给的写法）
+```js
+// Copyright (C) 2026 <作者名>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+```
+
+**坑**
+- `src/cli.mjs` 第 1 行是 `#!/usr/bin/env node`，声明必须插在 shebang **之后**，否则命令直接跑不起来。全仓唯一一个带 shebang 的文件。
+- 现有文件顶部都有 `/** ... */` 模块说明，声明放最前面、空一行，别把说明挤掉或合并进去。
+- 一次改 16 个文件会让 `git blame` 大面积指向这次提交；可把该提交写进 `.git-blame-ignore-revs`，GitHub 也认这个文件。
+- 待定：版权行写 `Dwscdv3` 还是真名。
+
+---
+
+## 10. README 加免责声明 + 封号风险告知
+
+**背景**：仓库已公开。抓取类工具公开后可能招来站点 ToS 层面的投诉；而「封号」是这个项目最真实的风险，
+应该在显眼处讲清楚，而不是藏在配置说明里。等 README 定稿后再动笔。
+
+**要写的内容**（草稿，措辞由用户定）
+- **非官方**：与 pixiv / ピクシブ株式会社 无任何关联，未获其授权或认可。
+- **自动化访问可能违反服务条款**，后果由使用者自行承担。
+- **封号风险**（重点）：本项目会用自动化方式访问 pixiv。已内置的防护 —— 站内信巡检 + 「过度访问警告」检测 +
+  每日下载额度、概率触发的随机长休息（pacer，默认平均每个请求多等约 5 秒）—— 只是**降低**触发概率，
+  **不保证**不触发。账号风险永远是概率问题，不是「开了防护就安全」。
+- **边界**：不做验证码 / 风控 / 付费内容的绕过；只处理**自己账号有权访问**的收藏；
+  不要用于批量抓取他人内容或再分发作品。
+- **免责**：作者与贡献者对账号受限、数据丢失、法律后果不承担责任。
+  （与 `LICENSE` 里的 GPL 无担保条款一致，README 只是写人话版。）
+
+**位置**：放在「这是什么」之后单独一节（`## 免责声明`），太靠后等于没写。
+
+**顺带**：README 里还有 3 处 `pixiv-export`，改名那轮按约定没动，重写时一并处理。
+
+---
+
 ## 命名（已定的记录，不是待办）
 
 - **中文名：色廊**。取「画廊」之形，换「画」为「色」：读音结构保留，一秒说明这是看画的地方；
