@@ -9,7 +9,7 @@
  * 因此无法用时间戳做增量断点，改用「整页 id 是否都已在本地」来判断是否追平
  * （列表按收藏时间倒序，所以一旦出现整页已知，后面只会更旧）。
  */
-import { httpsGetWithRetry } from './http.mjs';
+import { httpsGetWithRetry, httpsRequestWithRetry } from './http.mjs';
 
 const ORIGIN = 'https://www.pixiv.net';
 
@@ -55,10 +55,18 @@ export class PixivClient {
     this.userId = String(userId || '');
     this.userAgent = userAgent;
     this.verbose = verbose;
+    // CSRF token 跟 PHPSESSID 同一个会话周期，读过一次就能复用。
+    // 缓存它等于省掉一次「读 120KB 编辑页」——改收藏时那是最贵的一步。
+    this.csrfToken = '';
   }
 
-  /** 统一的 ajax 请求入口：限速由 limiter 统一管，这里不自己 sleep。 */
-  async ajax(pathname, params = {}, { allowRetry = true } = {}) {
+  /**
+   * 统一的 ajax 请求入口：限速由 limiter 统一管，这里不自己 sleep。
+   *
+   * bypassPacer 只给「用户手动触发、正盯着结果」的那一次用（点开大图翻页），
+   * 让它不必等队列的随机休息。
+   */
+  async ajax(pathname, params = {}, { allowRetry = true, bypassPacer = false, fast = false } = {}) {
     const url = `${ORIGIN}${pathname}?${buildQuery(params)}`;
     const headers = {
       Cookie: this.cookie,
@@ -89,7 +97,7 @@ export class PixivClient {
           )
         : httpsGetWithRetry(url, { headers, proxy: this.proxy, timeoutMs: 30000 }, { retries: 0 });
 
-    const res = await this.limiter.run(request);
+    const res = await this.limiter.run(request, { bypassPacer, fast });
     return this.parseAjax(res, url);
   }
 
@@ -104,7 +112,7 @@ export class PixivClient {
    *
    * 不走 JSON 解析，也不把非 200 当异常 —— 失效时由调用方降级。
    */
-  async html(pathname, { allowRetry = true } = {}) {
+  async html(pathname, { allowRetry = true, bypassPacer = false, fast = false } = {}) {
     const url = pathname.startsWith('http') ? pathname : `${ORIGIN}${pathname}`;
     const headers = {
       Cookie: this.cookie,
@@ -116,9 +124,67 @@ export class PixivClient {
     if (this.userId) headers['x-user-id'] = this.userId;
 
     const options = { headers, proxy: this.proxy, timeoutMs: 30000 };
-    return this.limiter.run(() =>
-      allowRetry ? httpsGetWithRetry(url, options, { retries: 2 }) : httpsGetWithRetry(url, options, { retries: 0 }),
+    return this.limiter.run(
+      () =>
+        allowRetry
+          ? httpsGetWithRetry(url, options, { retries: 2 })
+          : httpsGetWithRetry(url, options, { retries: 0 }),
+      { bypassPacer, fast },
     );
+  }
+
+  /**
+   * 写操作入口：POST 一个 JSON 体到 ajax 接口。
+   *
+   * 目前只服务于「编辑收藏」——`/ajax/{illusts|novels}/bookmarks/add`。
+   * 这条接口是 **upsert**：作品已收藏时再调一次等于覆盖标签和可见性，
+   * 不会变成重复收藏，所以重试是安全的（这也是敢于 retries>0 的前提）。
+   *
+   * 必须带 `x-csrf-token`，值就是旧版编辑页表单里 `name="tt"` 的隐藏字段。
+   * 拿不到 token 时直接报错，不要发一个注定 400 的请求。
+   */
+  async ajaxPost(pathname, payload, { token = '', retries = 2, bypassPacer = true, fast = true } = {}) {
+    if (!token) throw new PixivError('缺少 CSRF token，无法写入收藏（请先读取一次编辑页）');
+
+    const url = `${ORIGIN}${pathname}`;
+    const headers = {
+      Cookie: this.cookie,
+      Referer: `${ORIGIN}/`,
+      Origin: ORIGIN,
+      Accept: 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'User-Agent': this.userAgent,
+      'x-csrf-token': token,
+    };
+    if (this.userId) headers['x-user-id'] = this.userId;
+
+    const res = await this.limiter.run(
+      () =>
+        httpsRequestWithRetry(
+          url,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+            proxy: this.proxy,
+            timeoutMs: 30000,
+          },
+          {
+            retries,
+            onRetry: (n, delay, err) => {
+              if (this.verbose) {
+                process.stderr.write(
+                  `  ! 写入重试 ${n}（${Math.round(delay / 1000)}s 后）：${err?.message ?? ''}\n`,
+                );
+              }
+            },
+          },
+        ),
+      { bypassPacer, fast },
+    );
+
+    return this.parseAjax(res, url);
   }
 
   /**

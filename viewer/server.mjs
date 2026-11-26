@@ -20,9 +20,21 @@ import { spawn } from 'node:child_process';
 import { readDocument } from '../src/store.mjs';
 import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
+import {
+  BOOKMARK_TAG_LIMIT,
+  BookmarkTagsFullError,
+  editBookmark,
+  normalizeTags,
+  readEditorState,
+  setBookmarkRating,
+  sourceKeyOf,
+} from '../src/bookmark-edit.mjs';
 import { RateLimiter, httpsGetWithRetry } from '../src/http.mjs';
 import { compileQuery, matches as matchQuery } from './query.mjs';
+import { createTagGroupStore } from './tag-groups.mjs';
+import { planTagConversion } from '../src/tag-convert.mjs';
 import { createGuard, DEFAULT_GUARD } from '../src/guard.mjs';
+import { RequestPacer, DEFAULT_PACER } from '../src/pacer.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IMAGES_DIR = path.join(ROOT, 'images');
@@ -31,6 +43,7 @@ const TMP_DIR = path.join(IMAGES_DIR, '.tmp');
 const THUMB_DIR = path.join(ROOT, 'viewer', '.thumbs');
 const VIEWER_DIR = path.join(ROOT, 'viewer');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
+const TAG_GROUPS_PATH = path.join(ROOT, 'data', 'tag-groups.json');
 
 const BASE_PORT = 7788;
 
@@ -51,6 +64,11 @@ const SOURCES = [
   { key: 'novelPrivate', file: 'bookmarks-novel-private.json', label: '小说·私密', kind: 'novel' },
 ];
 
+/** 来源键 → 数据文件的绝对路径。写回本地时用，和读入用的是同一份映射。 */
+const DATA_FILES = Object.fromEntries(
+  SOURCES.map((source) => [source.key, path.join(ROOT, 'data', source.file)]),
+);
+
 // ---- 状态 ----
 
 const state = {
@@ -62,29 +80,36 @@ const state = {
   imageLimiter: null,
   config: null,
   guard: null, // 防封号守卫，见 src/guard.mjs
+  pacer: null, // 请求节奏（随机长休息），见 src/pacer.mjs
+  tagGroups: null, // 标签组，见 viewer/tag-groups.mjs
+  convert: null, // 正在跑的「组内标签批量转换」任务
 };
 
 /**
  * 下载队列。
  *
+ * 队列里放的是「任务」，只有一种调度、一套计数：
+ *   · 作品任务：{ key: pid, pid, mode }  —— mode=first 只下首张，full 补齐所有页
+ *   · 单页任务：{ key: "pid#page", pid, page, resolve, reject }  —— 大图翻页时现取一页
+ *
  * 前端滚动时会把「视口内且未下载」的作品扔进来，这里串行处理。串行是必须的：
  * 下载本身已经带着 2 秒接口限速和 1 秒图片限速，并发只会让两边互相抢配额。
  *
- * `queued` 是去重的关键 —— 它同时覆盖「排队中」和「正在下载」，前端即使重复提交
- * 同一个 pid 也只会被接受一次。
+ * `queued` 是作品任务的去重表 —— 它同时覆盖「排队中」和「正在下载」，
+ * 前端即使重复提交同一个 pid 也只会被接受一次。单页任务按 "pid#page" 去重，
+ * 靠 `pageJobs` 里的 Promise 合并同一页的并发请求。
  */
 const queue = {
-  pending: [],
-  queued: new Set(),
-  actives: new Set(),
-  done: new Set(),
-  failed: new Map(),
+  pending: [], // 任务数组（作品 + 单页），单页任务会被插到队首
+  queued: new Map(), // 作品 key(pid) -> 任务
+  actives: new Map(), // key -> 任务
+  done: new Set(), // 已完成的作品 pid（只记作品，卡片状态要用）
+  failed: new Map(), // key -> 错误信息
   running: false,
-  processed: 0,
+  processed: 0, // 已完成任务数（作品和单页一起算，不再分两本账）
   pageCount: new Map(), // pid -> 页数，用于让短作品先下
-  // 每个任务的下载范围：first = 只下首张（滚动触发），full = 补齐所有页（点开 / 全部下载）
-  modes: new Map(), // pid -> 'first' | 'full'
   doneMode: new Map(), // pid -> 完成时的模式，决定还能不能因为「要全页」再入队一次
+  pageJobs: new Map(), // "pid#page" -> Promise，同一页的并发请求合并
 };
 
 async function loadConfig() {
@@ -193,6 +218,227 @@ async function refreshIndex() {
   state.imageIndex = await scanImages();
 }
 
+/** 按 pid 找内存记录。给了 source 就按来源精确定位 —— 同一个 pid 两边都可能有。 */
+function findRecord(pid, source) {
+  const key = String(pid);
+
+  if (source) {
+    const exact = state.records.find((r) => String(r.pid) === key && r.source === source);
+    if (exact) return exact;
+  }
+
+  return (
+    state.records.find(
+      (r) => String(r.pid) === key && r.removed !== 'yes' && r.status !== 'unavailable',
+    ) ??
+    state.records.find((r) => String(r.pid) === key) ??
+    null
+  );
+}
+
+/** 编辑跨文件搬迁后来源计数会变，重算一遍（只动计数，不重读文件）。 */
+function reindexSources() {
+  const counts = new Map();
+  for (const record of state.records) {
+    counts.set(record.source, (counts.get(record.source) ?? 0) + 1);
+  }
+  state.bySource = counts;
+}
+
+/**
+ * 收藏编辑的串行闸门。
+ *
+ * 「写 pixiv → 写本地」不是一个原子操作，两个请求并发跑会互相覆盖
+ * 同一个 JSON 文件。这里一次只放一个过去，代价是编辑时要排队，可以接受。
+ */
+let bookmarkEditTail = Promise.resolve();
+
+function withBookmarkLock(task) {
+  const run = bookmarkEditTail.then(task, task);
+  bookmarkEditTail = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+function kindOf(record) {
+  return record.type === 'novel' ? 'novel' : 'illust';
+}
+
+/**
+ * 把写入结果吸收进内存索引，取代原来那条记录。
+ * 返回合并后的新对象（界面直接用，不必重新拉列表）。
+ */
+function absorbEditResult(record, result) {
+  const merged = { ...record, ...result.record, source: result.source };
+  // 空标签在磁盘上是「删字段」，展开运算不会覆盖旧值，得显式清空
+  merged.bookmark_tags = result.record.bookmark_tags ?? [];
+  merged.private_bookmark = /Private$/.test(result.source) ? 'yes' : 'no';
+  delete merged.removed;
+
+  const index = state.records.indexOf(record);
+  if (index >= 0) state.records[index] = merged;
+  reindexSources();
+  return merged;
+}
+
+/* ── 组内标签批量转换 ────────────────────────────────────────
+ * 把「同组其它成员标签」统一换成一个目标标签。
+ *
+ * 几条硬约束：
+ *   · 只在当前来源里找作品，只动 bookmark_tags，不碰公开/私密；
+ *   · 一条条写，走普通限速通道（fast:false），200 且 error:false 才算成功；
+ *   · 每条都过 withBookmarkLock，和手动编辑不会互相覆盖本地文件；
+ *   · 连续 3 条都是鉴权 / 限流类错误就停手，免得空转几百次。
+ */
+
+const CONVERT_MAX_STREAK = 3;
+
+function convertSnapshot() {
+  const job = state.convert;
+  if (!job) return null;
+  return {
+    id: job.id,
+    running: job.running,
+    source: job.source,
+    target: job.target,
+    groupId: job.groupId,
+    total: job.total,
+    done: job.done,
+    ok: job.ok,
+    failedCount: job.failed.length,
+    failed: job.failed.slice(-8),
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    aborted: job.aborted,
+    stopRequested: job.stopRequested,
+  };
+}
+
+function startConversion({ source, target, group, items }) {
+  const job = {
+    id: `c${Date.now().toString(36)}`,
+    running: true,
+    source,
+    target,
+    groupId: group.id,
+    total: items.length,
+    done: 0,
+    ok: 0,
+    failed: [],
+    startedAt: Date.now(),
+    finishedAt: null,
+    aborted: '',
+    stopRequested: false,
+  };
+  state.convert = job;
+
+  (async () => {
+    let streak = 0;
+
+    for (const item of items) {
+      if (job.stopRequested) {
+        job.aborted = 'stopped';
+        break;
+      }
+
+      const record = findRecord(item.pid, source);
+      if (!record) {
+        job.failed.push({ pid: item.pid, error: '本地记录已不存在' });
+        job.done += 1;
+        continue;
+      }
+
+      try {
+        const result = await withBookmarkLock(() =>
+          editBookmark({
+            client: state.client,
+            files: DATA_FILES,
+            kind: item.kind,
+            pid: item.pid,
+            tags: item.after,
+            isPrivate: item.isPrivate,
+            source,
+            fast: false,
+          }),
+        );
+        absorbEditResult(record, result);
+        job.ok += 1;
+        streak = 0;
+      } catch (err) {
+        job.failed.push({ pid: item.pid, error: err?.message ?? String(err) });
+        streak += 1;
+
+        const fatal =
+          err?.status === 401 ||
+          err?.status === 403 ||
+          err?.status === 429 ||
+          /登录|cookie|token|未授权|禁止访问/i.test(String(err?.message ?? ''));
+
+        if (streak >= CONVERT_MAX_STREAK && fatal) {
+          job.aborted = 'auth';
+          break;
+        }
+      }
+
+      job.done += 1;
+    }
+
+    job.running = false;
+    job.finishedAt = Date.now();
+    console.log(
+      `  [转换] 结束：成功 ${job.ok} / 共 ${job.total}，失败 ${job.failed.length}` +
+        `${job.aborted ? `（${job.aborted}）` : ''}`,
+    );
+  })().catch((err) => {
+    job.running = false;
+    job.finishedAt = Date.now();
+    job.aborted = 'error';
+    job.failed.push({ pid: '', error: err?.message ?? String(err) });
+    console.error('  [转换] 任务异常结束:', err);
+  });
+}
+
+/**
+ * 用系统默认浏览器打开一个链接。
+ *
+ * 为什么要绕到后端：查看器是用 Edge 的 `--app` 模式跑的，页面里 `window.open`
+ * 只会在 Edge 里再开一个无地址栏窗口，而不是用户真正想要的那个浏览器。
+ *
+ * Windows 走 `rundll32 url.dll,FileProtocolHandler`：它不经过 cmd 解析，
+ * URL 里的 `&`、`|` 这些不会被当成命令分隔符（`cmd /c start` 就有这个坑）。
+ * 调用方必须先把 URL 限定在 pixiv 域内 —— 这个函数本身不做校验。
+ */
+function openInDefaultBrowser(target) {
+  const options = { detached: true, stdio: 'ignore', windowsHide: true };
+
+  let child;
+  if (process.platform === 'win32') {
+    child = spawn('rundll32', ['url.dll,FileProtocolHandler', target], options);
+  } else if (process.platform === 'darwin') {
+    child = spawn('open', [target], options);
+  } else {
+    child = spawn('xdg-open', [target], options);
+  }
+
+  // 系统里没有对应命令时只记一笔，别把服务弄崩
+  child.on('error', (err) => {
+    process.stderr.write(`打开浏览器失败: ${err.message}\n`);
+  });
+  child.unref();
+}
+
+/** 只允许打开 pixiv 自己的页面，避免这个接口被当成万能命令执行器。 */
+function isPixivUrl(raw) {
+  try {
+    const target = new URL(String(raw));
+    return target.protocol === 'https:' && ['www.pixiv.net', 'pixiv.net'].includes(target.hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** 把刚下载的文件登记进索引，避免每下完一个就重扫整个 images 目录。 */
 function indexDownloadedFiles(files) {
   for (const file of files) {
@@ -282,7 +528,8 @@ async function downloadByPid(pid, mode = 'full') {
 /**
  * 确保某一页在本地存在，没有就现下。
  *
- * 供大图翻页用：默认只下首张，翻到第 N 页时才走这里补那一页。
+ * 供大图翻页用：默认只下首张，翻到第 N 页时才走这里取那一页。
+ * 和作品下载是同一条队列 —— 单页任务插到队首，所以不会被几千个批量任务堵住。
  */
 async function ensurePage(pid, page) {
   const target = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
@@ -294,40 +541,69 @@ async function ensurePage(pid, page) {
   if (record.status === 'unavailable') return null;
   if (record.type === 'novel' || record.type === 'ugoira') return null;
 
-  // 同一页的并发请求合并
-  const jobKey = `page:${key}:${page}`;
-  if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
+  return enqueuePage(key, page);
+}
 
-  const job = (async () => {
-    await downloadSinglePage(state.client, {
-      pid: key,
-      page,
-      outDir: IMAGES_DIR,
-      tmpDir: TMP_DIR,
-      imageLimiter: state.imageLimiter,
-      proxy: state.config?.proxy,
-      quality: state.config?.download?.avifQuality ?? 50,
-    });
+/** 入队一个单页任务；同一页的并发请求共享同一个 Promise，不会重复下载。 */
+function enqueuePage(pid, page) {
+  const jobKey = `${pid}#${page}`;
+  const existing = queue.pageJobs.get(jobKey);
+  if (existing) return existing;
 
-    const entry = state.imageIndex.get(key) ?? { pages: new Set(), ugoira: false };
-    entry.pages.add(page);
-    state.imageIndex.set(key, entry);
+  const job = new Promise((resolve, reject) => {
+    queue.pending.unshift({ key: jobKey, pid, page, resolve, reject });
+    runQueue();
+  }).finally(() => queue.pageJobs.delete(jobKey));
 
-    await generateThumbLevels(key, page);
-
-    return target;
-  })().finally(() => state.thumbJobs.delete(jobKey));
-
-  state.thumbJobs.set(jobKey, job);
+  queue.pageJobs.set(jobKey, job);
   return job;
 }
 
+/** 真正下载一页：落盘 → 更新索引 → 生成缩略图。额度记账交给 worker 统一做。 */
+async function downloadPageNow(pid, page) {
+  await downloadSinglePage(state.client, {
+    pid,
+    page,
+    outDir: IMAGES_DIR,
+    tmpDir: TMP_DIR,
+    imageLimiter: state.imageLimiter,
+    proxy: state.config?.proxy,
+    quality: state.config?.download?.avifQuality ?? 50,
+    // 用户就盯着这一页，不等随机休息；其它排队的任务照旧等着
+    bypassPacer: true,
+  });
+
+  const entry = state.imageIndex.get(pid) ?? { pages: new Set(), ugoira: false };
+  entry.pages.add(page);
+  state.imageIndex.set(pid, entry);
+
+  await generateThumbLevels(pid, page);
+
+  const filePath = path.join(IMAGES_DIR, `${pid}_p${page}.avif`);
+  let bytes = 0;
+  try {
+    bytes = (await fsp.stat(filePath)).size;
+  } catch {
+    /* 读不到大小就只记文件数 */
+  }
+  return { filePath, bytes };
+}
+
+/** 所有任务完成后统一记额度，作品和单页不再各记一套。 */
+async function bumpQuota({ files = 0, bytes = 0 } = {}) {
+  if (!state.guard) return;
+  await state.guard.bump({ files: Number(files) || 0, bytes: Number(bytes) || 0 });
+}
+
 function queueSnapshot() {
+  const actives = [...queue.actives.values()];
+
   return {
     pending: queue.pending.length,
-    active: [...queue.actives][0] ?? null,
-    activeCount: queue.actives.size,
-    activeList: [...queue.actives],
+    active: actives[0]?.pid ?? null,
+    activeCount: actives.length,
+    // 只回作品 pid：卡片上的「下载中」角标要用，单页任务不算作品在下载
+    activeList: [...new Set(actives.filter((t) => t.page === undefined).map((t) => t.pid))],
     running: queue.running,
     processed: queue.processed,
     doneCount: queue.done.size,
@@ -335,6 +611,8 @@ function queueSnapshot() {
     // 只回传近期的，够前端把卡片状态对上就行
     doneList: [...queue.done].slice(-300),
     failedList: [...queue.failed.entries()].slice(-50),
+    // 随机休息的倒计时：前端据此显示「还剩 12 分钟」和「立即继续」按钮
+    pacer: state.pacer ? state.pacer.status() : null,
   };
 }
 
@@ -374,9 +652,10 @@ function enqueue(pids, { mode = 'first', priority = false } = {}) {
     if (!pid) continue;
 
     // 已在队列里：如果这次要得更全，就地升级（正在跑的那个跑完会再看一次）
-    if (queue.queued.has(pid)) {
-      if (wants(mode) === 'full' && queue.modes.get(pid) !== 'full') {
-        queue.modes.set(pid, 'full');
+    const pendingTask = queue.queued.get(pid);
+    if (pendingTask) {
+      if (wants(mode) === 'full' && pendingTask.mode !== 'full') {
+        pendingTask.mode = 'full';
         upgraded += 1;
       }
       continue;
@@ -406,22 +685,26 @@ function enqueue(pids, { mode = 'first', priority = false } = {}) {
     }
 
     const pageCount = Number(record.pages) || 0;
+    const task = { key: pid, pid, mode: wants(mode) };
 
-    queue.queued.add(pid);
+    queue.queued.set(pid, task);
     queue.pageCount.set(pid, pageCount);
-    queue.modes.set(pid, wants(mode));
     // priority 是「用户点开的这一个」，插到队首；其余一律追加，
     // 避免一次性入队几千个时反复 unshift 变成 O(n²)
-    if (priority) queue.pending.unshift(pid);
-    else queue.pending.push(pid);
+    if (priority) queue.pending.unshift(task);
+    else queue.pending.push(task);
     added += 1;
   }
 
-  // 短作品优先：让用户尽快看到更多图，而不是被一个大合集堵住
-  if (added > 0 && !priority) {
-    queue.pending.sort((a, b) => (queue.pageCount.get(a) ?? 0) - (queue.pageCount.get(b) ?? 0));
-    runQueue();
-  } else if (added > 0) {
+  if (added > 0) {
+    // 短作品优先：让用户尽快看到更多图，而不是被一个大合集堵住。
+    // 单页任务始终留在队首 —— 用户正盯着那一页，不能排到批量任务后面。
+    if (!priority) {
+      const pages = queue.pending.filter((task) => task.page !== undefined);
+      const works = queue.pending.filter((task) => task.page === undefined);
+      works.sort((a, b) => (queue.pageCount.get(a.pid) ?? 0) - (queue.pageCount.get(b.pid) ?? 0));
+      queue.pending = [...pages, ...works];
+    }
     runQueue();
   }
 
@@ -434,18 +717,21 @@ const QUEUE_CONCURRENCY = 2;
  * 守卫触发后清空待办。已经在跑的几个任务会自然结束，但不会再取新任务。
  */
 function stopQueueByGuard(err) {
-  const cleared = queue.pending.length;
-  queue.pending.length = 0;
+  const dropped = queue.pending.splice(0);
 
-  for (const pid of [...queue.queued]) {
-    if (queue.actives.has(pid)) continue;
-    queue.queued.delete(pid);
-    queue.modes.delete(pid);
+  // 单页任务的 Promise 必须结掉，否则大图那边的请求会一直挂着等一个不会来的响应
+  for (const task of dropped) {
+    if (task.page !== undefined) task.reject(err);
+  }
+
+  for (const key of [...queue.queued.keys()]) {
+    if (queue.actives.has(key)) continue;
+    queue.queued.delete(key);
   }
 
   const headline = String(err.message).split('\n').find((line) => line.trim()) ?? err.message;
   console.warn(`\n[防封号] ${headline.trim()}`);
-  if (cleared > 0) console.warn(`[防封号] 已清空队列里剩余的 ${cleared} 个任务\n`);
+  if (dropped.length > 0) console.warn(`[防封号] 已清空队列里剩余的 ${dropped.length} 个任务\n`);
 }
 
 /** 两个 worker 并行：下载受 1 秒限速约束，但 AVIF 压制是 CPU 活，能重叠起来。 */
@@ -453,52 +739,68 @@ async function runQueue() {
   if (queue.running) return;
   queue.running = true;
 
-  const workers = Array.from({ length: QUEUE_CONCURRENCY }, () => queueWorker());
-  await Promise.all(workers);
-
-  queue.running = false;
+  try {
+    // 队列刚跑空时可能刚好又有新任务进来（比如翻页触发的单页任务），
+    // 再兜一圈，避免任务被落在 pending 里没人处理
+    do {
+      await Promise.all(Array.from({ length: QUEUE_CONCURRENCY }, () => queueWorker()));
+    } while (queue.pending.length > 0);
+  } finally {
+    queue.running = false;
+  }
 }
 
+/**
+ * 队列里只有一种 worker：作品任务和单页任务都在这里跑，
+ * 区别只在分派到哪个下载函数，记账、计数、失败处理都走同一段代码。
+ */
 async function queueWorker() {
   for (;;) {
-    const pid = queue.pending.shift();
-    if (!pid) return;
+    const task = queue.pending.shift();
+    if (!task) return;
 
-    // 排队期间可能被升级成 full（用户点开了它），出队时以最新的为准
-    const mode = queue.modes.get(pid) ?? 'first';
+    // 排队期间作品任务可能被升级成 full（用户点开了它），出队时以最新的为准
+    const mode = task.mode ?? 'first';
+    queue.actives.set(task.key, task);
 
-    queue.actives.add(pid);
     try {
-      const summary = await downloadByPid(pid, mode);
-      queue.done.add(pid);
-      queue.doneMode.set(pid, mode);
-
-      // 记账：真正落盘的文件才算额度，跳过已存在的不算
-      if (state.guard) {
-        await state.guard.bump({
-          files: Number(summary?.files) || 0,
-          bytes: Number(summary?.finalBytes) || 0,
-        });
+      if (task.page !== undefined) {
+        const { filePath, bytes } = await downloadPageNow(task.pid, task.page);
+        // 先把结果交出去再记账：额度这会儿刚好超了，也不该让已经下好的这一页变破图
+        task.resolve(filePath);
+        await bumpQuota({ files: 1, bytes });
+      } else {
+        const summary = await downloadByPid(task.pid, mode);
+        queue.done.add(task.pid);
+        queue.doneMode.set(task.pid, mode);
+        // 记账：真正落盘的文件才算额度，跳过已存在的不算
+        await bumpQuota({ files: summary?.files, bytes: summary?.finalBytes });
       }
     } catch (err) {
-      if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
-        // 守卫拦截是「整条队列都要停」，不能只把这个作品记成失败然后接着跑
-        stopQueueByGuard(err);
+      if (task.page !== undefined) {
+        task.reject(err);
+        queue.failed.set(`${task.pid} 第 ${task.page + 1} 页`, err.message);
       } else {
-        queue.failed.set(pid, err.message);
+        queue.failed.set(task.pid, err.message);
+      }
+
+      // 守卫拦截是「整条队列都要停」，不能只把这个任务记成失败然后接着跑
+      if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
+        stopQueueByGuard(err);
       }
     } finally {
-      const upgradedWhileRunning = queue.modes.get(pid) === 'full' && mode === 'first';
-      queue.queued.delete(pid);
-      queue.actives.delete(pid);
-      queue.modes.delete(pid);
+      const upgradedWhileRunning =
+        task.page === undefined && task.mode === 'full' && mode === 'first';
+
+      queue.queued.delete(task.key);
+      queue.actives.delete(task.key);
       queue.processed += 1;
 
       // 跑的过程中用户点开了它，但这次只下了首张 —— 再排一次补齐后续页
       if (upgradedWhileRunning) {
-        queue.queued.add(pid);
-        queue.modes.set(pid, 'full');
-        queue.pending.push(pid);
+        const next = { key: task.pid, pid: task.pid, mode: 'full' };
+        queue.queued.set(task.pid, next);
+        queue.pending.push(next);
       }
     }
   }
@@ -1046,6 +1348,8 @@ async function handleApi(req, res, url) {
   if (url.startsWith('/api/records')) {
     const source = params.get('source') ?? 'illustPublic';
     const queryText = (params.get('q') ?? '').trim();
+    // 默认过滤器（f）：与 q 各自编译后 AND，避免 `a OR b` 被外层 AND 改掉优先级
+    const filterText = (params.get('f') ?? '').trim();
     const tag = (params.get('tag') ?? '').trim();
     const authorId = (params.get('author_id') ?? '').trim();
     const missingOnly = params.get('missing') === '1';
@@ -1058,9 +1362,17 @@ async function handleApi(req, res, url) {
     let list = state.records.filter((r) => r.source === source);
     if (!showRemoved) list = list.filter((r) => r.removed !== 'yes');
 
+    // 标签组：搜索词命中组员时展开成同义词的 OR
+    const groups = state.tagGroups ? state.tagGroups.list() : [];
+
     if (queryText) {
-      const ast = compileQuery(queryText);
+      const ast = compileQuery(queryText, { groups });
       if (ast) list = list.filter((r) => matchQuery(ast, r));
+    }
+
+    if (filterText) {
+      const filterAst = compileQuery(filterText, { groups });
+      if (filterAst) list = list.filter((r) => matchQuery(filterAst, r));
     }
 
     if (tag) list = list.filter((r) => (r.bookmark_tags ?? []).includes(tag));
@@ -1125,16 +1437,35 @@ async function handleApi(req, res, url) {
   // 当前来源用到的标签及数量，用于左栏的标签面板
   // include=1 时把作品本身的标签也算进来；同一作品上的同名标签只计一次，
   // 否则「收藏标签和作品标签重名」会被算成两个作品。
+  //
+  // 标签组：
+  //   · 组内成员按「成员计数之和」排序，并保证挨在一起；
+  //   · 组的 union 是去重后的作品数（同一作品打了多个成员标签只算一次），
+  //     用来显示；排序仍用 total，两者口径不同，前端会在 title 里注明。
+  //   · 两个统计都跟随 include 开关，和单个标签的计数口径一致。
   if (url.startsWith('/api/tags')) {
     const source = params.get('source') ?? 'illustPublic';
     const includeWork = params.get('include') === '1';
-    const counter = new Map(); // tag -> { count, own }
+    const counter = new Map(); // 原始标签 -> { count, own }
+    const byNorm = new Map(); // 归一化标签 -> 次数（处理大小写不一致）
+    const groupDocs = state.tagGroups ? state.tagGroups.list() : [];
+    const groupSets = new Map(); // 组 id -> Set(pid)
+
+    const norm = (tag) => String(tag ?? '').trim().toLowerCase();
+
+    const groupOfTag = new Map();
+    for (const group of groupDocs) {
+      groupSets.set(group.id, new Set());
+      for (const tag of group.tags) groupOfTag.set(norm(tag), group);
+    }
 
     const bump = (tag, isOwn) => {
       const item = counter.get(tag) ?? { count: 0, own: 0 };
       item.count += 1;
       if (isOwn) item.own += 1;
       counter.set(tag, item);
+      const key = norm(tag);
+      byNorm.set(key, (byNorm.get(key) ?? 0) + 1);
     };
 
     for (const record of state.records) {
@@ -1142,13 +1473,19 @@ async function handleApi(req, res, url) {
 
       // 同一作品上的同名标签只算一次；大小写不同视为同一个（和卡片上的去重一致）
       const seen = new Set();
-      const norm = (tag) => String(tag ?? '').trim().toLowerCase();
+      const pid = String(record.pid ?? '');
+
+      const hit = (tag, isOwn) => {
+        bump(tag, isOwn);
+        const group = groupOfTag.get(norm(tag));
+        if (group) groupSets.get(group.id)?.add(pid);
+      };
 
       for (const tag of record.bookmark_tags ?? []) {
         const key = norm(tag);
         if (!key || seen.has(key)) continue;
         seen.add(key);
-        bump(tag, true);
+        hit(tag, true);
       }
 
       if (!includeWork) continue;
@@ -1157,15 +1494,366 @@ async function handleApi(req, res, url) {
         const key = norm(tag);
         if (!key || seen.has(key)) continue;
         seen.add(key);
-        bump(tag, false);
+        hit(tag, false);
       }
     }
 
-    const list = [...counter.entries()]
-      .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0], 'zh'))
-      .map(([tag, item]) => ({ tag, count: item.count, own: item.own }));
+    const groups = groupDocs
+      .map((group) => {
+        const members = group.tags.map((tag) => ({
+          tag,
+          count: byNorm.get(norm(tag)) ?? 0,
+        }));
+        const total = members.reduce((sum, member) => sum + member.count, 0);
+        // 代表名 = 计数最多的成员；并列时取组内靠前的那个（先加入的）
+        const representative = members.reduce(
+          (best, member) => (member.count > best.count ? member : best),
+          members[0],
+        );
+        return {
+          id: group.id,
+          tags: [...group.tags],
+          members,
+          total,
+          union: groupSets.get(group.id)?.size ?? 0,
+          representative: representative?.tag ?? group.tags[0],
+        };
+      })
+      .sort(
+        (a, b) =>
+          b.total - a.total || b.union - a.union || a.representative.localeCompare(b.representative, 'zh'),
+      );
 
-    return sendJson(res, 200, { tags: list, includeWork });
+    const summaryOf = new Map(groups.map((group) => [group.id, group]));
+
+    const list = [...counter.entries()]
+      .map(([tag, item]) => {
+        const group = groupOfTag.get(norm(tag));
+        const summary = group ? summaryOf.get(group.id) : null;
+        return {
+          tag,
+          count: item.count,
+          own: item.own,
+          groupId: group?.id ?? null,
+          group: summary
+            ? {
+                id: summary.id,
+                representative: summary.representative,
+                size: summary.tags.length,
+                total: summary.total,
+                union: summary.union,
+              }
+            : null,
+          // 同组成员共用一个排序键，组内再按自身计数排
+          sortKey: summary ? summary.total : item.count,
+        };
+      })
+      .sort((a, b) => {
+        if (a.sortKey !== b.sortKey) return b.sortKey - a.sortKey;
+        if (a.groupId !== b.groupId) {
+          // 成员必须相邻：组间按 id 排，未分组的沉到同分值的后面
+          if (!a.groupId) return 1;
+          if (!b.groupId) return -1;
+          return a.groupId.localeCompare(b.groupId);
+        }
+        return b.count - a.count || a.tag.localeCompare(b.tag, 'zh');
+      });
+
+    return sendJson(res, 200, { tags: list, includeWork, groups });
+  }
+
+  /* ── 标签组 ────────────────────────────────────────────────
+   * GET 返回当前定义；POST 整体替换（编辑器保存就是一次整体提交）。
+   * 校验和归一化都在 tag-groups.mjs 里，这里只负责搬进搬出。
+   */
+  if (url === '/api/tag-groups' || url.startsWith('/api/tag-groups?')) {
+    if (!state.tagGroups) return sendJson(res, 503, { error: '标签组未初始化' });
+
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      try {
+        const result = await state.tagGroups.replace(body.groups ?? []);
+        return sendJson(res, 200, { ok: true, ...result });
+      } catch (err) {
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    return sendJson(res, 200, { groups: state.tagGroups.list() });
+  }
+
+  /* ── 批量转换：启动 / 停止 ────────────────────────────────── */
+
+  // 预览：确认框里要告诉用户会影响多少作品（只算当前来源的收藏标签）
+  if (url === '/api/tag-convert/plan' || url.startsWith('/api/tag-convert/plan?')) {
+    if (!state.tagGroups) return sendJson(res, 503, { error: '标签组未初始化' });
+
+    const source = params.get('source') ?? 'illustPublic';
+    const target = (params.get('target') ?? '').trim();
+
+    if (!SOURCES.some((item) => item.key === source)) {
+      return sendJson(res, 400, { error: '来源不合法' });
+    }
+
+    const group = target ? state.tagGroups.groupOf(target) : null;
+    if (!group) return sendJson(res, 200, { total: 0, target, groupId: null });
+
+    const items = planTagConversion({
+      records: state.records,
+      source,
+      members: group.tags,
+      target,
+    });
+
+    return sendJson(res, 200, { total: items.length, target, groupId: group.id });
+  }
+
+  if (url === '/api/tag-convert/start' && req.method === 'POST') {
+    if (!state.tagGroups) return sendJson(res, 503, { error: '标签组未初始化' });
+
+    const body = await readBody(req);
+    const source = String(body.source ?? '').trim();
+    const target = String(body.target ?? '').trim();
+
+    if (!SOURCES.some((item) => item.key === source)) {
+      return sendJson(res, 400, { error: '来源不合法' });
+    }
+    if (!target) return sendJson(res, 400, { error: '缺少目标标签' });
+    if (state.convert?.running) {
+      return sendJson(res, 409, { error: '已经有一个转换任务在跑，等它结束或先停止' });
+    }
+
+    const group = state.tagGroups.groupOf(target);
+    if (!group) return sendJson(res, 400, { error: '这个标签不在任何标签组里' });
+
+    const items = planTagConversion({
+      records: state.records,
+      source,
+      members: group.tags,
+      target,
+    });
+
+    if (items.length === 0) {
+      return sendJson(res, 200, { started: false, total: 0, reason: '没有需要转换的作品' });
+    }
+
+    startConversion({ source, target, group, items });
+    return sendJson(res, 200, { started: true, total: items.length, job: convertSnapshot() });
+  }
+
+  if (url === '/api/tag-convert/stop' && req.method === 'POST') {
+    if (!state.convert?.running) {
+      return sendJson(res, 200, { ok: true, stopping: false, job: convertSnapshot() });
+    }
+    // 只置标记：当前这一条写完才收手，已经成功的不会回退
+    state.convert.stopRequested = true;
+    return sendJson(res, 200, { ok: true, stopping: true, job: convertSnapshot() });
+  }
+
+  // 收藏标签的全局使用次数。卡片上的标签位按它排序，把最常用的几个优先露出来。
+  // 只在启动和每次改完收藏时取一次，15k 条扫一遍是几毫秒的量级。
+  if (url.startsWith('/api/tag-usage')) {
+    const usage = new Map();
+
+    for (const record of state.records) {
+      const seen = new Set();
+      for (const tag of record.bookmark_tags ?? []) {
+        const key = String(tag ?? '').trim().toLowerCase();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        usage.set(key, (usage.get(key) ?? 0) + 1);
+      }
+    }
+
+    return sendJson(res, 200, { usage: Object.fromEntries(usage) });
+  }
+
+  // 交给系统默认浏览器打开。Edge 的 --app 模式里 window.open 只会在 Edge 里再开一窗，
+  // 所以链接点击统一走这里。
+  if (url === '/api/open' && req.method === 'POST') {
+    const body = await readBody(req);
+    const target = String(body.url ?? '');
+
+    if (!isPixivUrl(target)) {
+      return sendJson(res, 400, { error: '只允许打开 pixiv 的链接' });
+    }
+
+    openInDefaultBrowser(new URL(target).toString());
+    return sendJson(res, 200, { ok: true });
+  }
+
+  /* ── 编辑收藏 ──────────────────────────────────────────────
+   * 三个接口：本地选项、从 pixiv 读最新状态、保存。
+   * 保存的顺序由 src/bookmark-edit.mjs 保证：写 pixiv 成功 → 改本地。
+   */
+
+  // 对话框打开时用：当前标签 / 作品标签 / 我的标签（公开+私密合并），全部来自本地
+  if (url.startsWith('/api/bookmark/meta')) {
+    const pid = params.get('pid') ?? '';
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+
+    const record = findRecord(pid, params.get('source') ?? '');
+    if (!record) return sendJson(res, 404, { error: '找不到这条收藏' });
+
+    const kind = kindOf(record);
+    const counter = new Map();
+    for (const item of state.records) {
+      if (item.source !== sourceKeyOf(kind, false) && item.source !== sourceKeyOf(kind, true)) continue;
+      for (const tag of item.bookmark_tags ?? []) {
+        counter.set(tag, (counter.get(tag) ?? 0) + 1);
+      }
+    }
+
+    const myTags = [...counter.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh'))
+      .map(([tag, count]) => ({ tag, count }));
+
+    return sendJson(res, 200, {
+      pid: record.pid,
+      kind,
+      source: record.source,
+      private: record.source === sourceKeyOf(kind, true),
+      tags: record.bookmark_tags ?? [],
+      workTags: record.tags ?? [],
+      myTags,
+      limit: BOOKMARK_TAG_LIMIT,
+      editable: record.removed !== 'yes' && record.status !== 'unavailable',
+    });
+  }
+
+  // 「从 pixiv 读取」按钮：拿网站上此刻的真实标签和可见性（1 次请求）
+  if (url.startsWith('/api/bookmark/state')) {
+    const pid = params.get('pid') ?? '';
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+
+    const record = findRecord(pid, params.get('source') ?? '');
+    if (!record) return sendJson(res, 404, { error: '找不到这条收藏' });
+
+    try {
+      const snapshot = await readEditorState(state.client, kindOf(record), pid, { fast: true });
+      if (!snapshot) {
+        return sendJson(res, 502, { error: '读不到 pixiv 上的收藏信息（编辑页不可用）' });
+      }
+      return sendJson(res, 200, { pid, tags: snapshot.tags, private: snapshot.isPrivate });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  // 保存。必须精确匹配，否则 /api/bookmark/xxx 也会掉进这里
+  if ((url === '/api/bookmark' || url.startsWith('/api/bookmark?')) && req.method === 'POST') {
+    const body = await readBody(req);
+    const pid = String(body.pid ?? '');
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+
+    const record = findRecord(pid, String(body.source ?? ''));
+    if (!record) return sendJson(res, 404, { error: '找不到这条收藏' });
+    if (record.status === 'unavailable') {
+      return sendJson(res, 400, { error: '作品已失效，不能编辑收藏' });
+    }
+    if (record.removed === 'yes') {
+      return sendJson(res, 400, { error: '这条收藏已经取消，不能再编辑' });
+    }
+
+    const { tags, error } = normalizeTags(body.tags);
+    if (error) return sendJson(res, 400, { error });
+
+    const isPrivate = Boolean(body.private);
+    const kind = kindOf(record);
+
+    try {
+      const result = await withBookmarkLock(() =>
+        editBookmark({
+          client: state.client,
+          files: DATA_FILES,
+          kind,
+          pid,
+          tags,
+          isPrivate,
+          source: record.source,
+        }),
+      );
+
+      // 内存同步成刚写入磁盘的样子，界面不必重新拉一整页
+      const merged = absorbEditResult(record, result);
+
+      return sendJson(res, 200, {
+        ok: true,
+        pid,
+        moved: result.moved,
+        id: result.id,
+        source: result.source,
+        private: isPrivate,
+        tags: result.tags,
+        record: decorate(merged),
+      });
+    } catch (err) {
+      return sendJson(res, 502, { error: err.message });
+    }
+  }
+
+  /* ── 快速改评分 ────────────────────────────────────────────
+   * 评分就是 `n/10` 这个收藏标签，所以走同一条「写 pixiv → 改本地」的链路。
+   * 差别只在：以网站上此刻的标签为基准替换，而不是用本地缓存（否则会误删别的标签）。
+   */
+  if (url === '/api/bookmark/rating' && req.method === 'POST') {
+    const body = await readBody(req);
+    const pid = String(body.pid ?? '');
+    if (!/^\d+$/.test(pid)) return sendJson(res, 400, { error: 'pid 不合法' });
+
+    const rating = Number(body.rating);
+    if (!Number.isInteger(rating) || rating < 0 || rating > 10) {
+      return sendJson(res, 400, { error: '评分必须是 1~10 的整数（0 表示清除）' });
+    }
+
+    const record = findRecord(pid, String(body.source ?? ''));
+    if (!record) return sendJson(res, 404, { error: '找不到这条收藏' });
+    if (record.status === 'unavailable') {
+      return sendJson(res, 400, { error: '作品已失效，不能评分' });
+    }
+    if (record.removed === 'yes') {
+      return sendJson(res, 400, { error: '这条收藏已经取消，不能评分' });
+    }
+
+    const kind = kindOf(record);
+
+    try {
+      const result = await withBookmarkLock(() =>
+        setBookmarkRating({
+          client: state.client,
+          files: DATA_FILES,
+          kind,
+          pid,
+          rating,
+          source: record.source,
+          drop: String(body.drop ?? ''),
+        }),
+      );
+
+      const merged = absorbEditResult(record, result);
+
+      return sendJson(res, 200, {
+        ok: true,
+        pid,
+        rating: result.rating,
+        tags: result.tags,
+        moved: result.moved,
+        id: result.id,
+        source: result.source,
+        record: decorate(merged),
+      });
+    } catch (err) {
+      // 标签满了不是错误，是需要用户做一个选择：把当前的标签列表原样带回去
+      if (err instanceof BookmarkTagsFullError) {
+        return sendJson(res, 409, {
+          error: err.message,
+          code: err.code,
+          tags: err.tags,
+          rating: err.rating,
+        });
+      }
+      return sendJson(res, 502, { error: err.message });
+    }
   }
 
   // 批量入队：前端滚动时把视口内未下载的作品扔进来
@@ -1183,18 +1871,28 @@ async function handleApi(req, res, url) {
 
   // 队列状态：前端轮询这个来更新卡片
   if (url.startsWith('/api/queue/clear')) {
-    const cleared = queue.pending.length;
-    for (const pid of queue.pending) {
-      queue.queued.delete(pid);
-      queue.pageCount.delete(pid);
-      queue.modes.delete(pid);
+    const dropped = queue.pending.splice(0);
+    for (const task of dropped) {
+      if (task.page !== undefined) {
+        // 单页任务的 Promise 得结掉，否则等这一页的请求会一直挂着
+        task.reject(new Error('队列已清空'));
+      } else {
+        queue.queued.delete(task.key);
+        queue.pageCount.delete(task.pid);
+      }
     }
-    queue.pending = [];
-    return sendJson(res, 200, { cleared, queue: queueSnapshot() });
+    return sendJson(res, 200, { cleared: dropped.length, queue: queueSnapshot() });
   }
 
   if (url.startsWith('/api/queue')) {
     return sendJson(res, 200, queueSnapshot());
+  }
+
+  // 跳过本轮的随机休息（界面横幅上的「立即继续」）
+  if (url.startsWith('/api/pacer/skip') && req.method === 'POST') {
+    if (!state.pacer) return sendJson(res, 503, { error: '节奏控制器未初始化' });
+    const result = state.pacer.skip();
+    return sendJson(res, 200, { ...result, pacer: state.pacer.status(), queue: queueSnapshot() });
   }
 
   // 解除「过度访问警告」的禁令（界面横幅上的按钮走这里）
@@ -1222,6 +1920,7 @@ async function handleApi(req, res, url) {
       let unavailable = 0;
       let pagesTotal = 0;
       let pagesDone = 0;
+      let firstMissing = 0; // 一张图都还没有的作品数，用来判断「只下首页」还有没有活干
 
       for (const record of state.records) {
         if (record.source !== source.key) continue;
@@ -1239,6 +1938,8 @@ async function handleApi(req, res, url) {
         pagesTotal += stats.total;
         pagesDone += stats.have;
         if (stats.have >= stats.total) done += 1;
+        // 小说没有图片，不参与批量下首页
+        if (record.type !== 'novel' && stats.have === 0) firstMissing += 1;
       }
 
       allPagesTotal += pagesTotal;
@@ -1252,6 +1953,7 @@ async function handleApi(req, res, url) {
         removed,
         unavailable,
         missing: total - done - removed - unavailable,
+        firstMissing,
         pages: { total: pagesTotal, done: pagesDone, missing: pagesTotal - pagesDone },
       };
     });
@@ -1263,6 +1965,7 @@ async function handleApi(req, res, url) {
       records: state.records.length,
       downloaded: state.imageIndex.size,
       guard: state.guard ? state.guard.status() : null,
+      convert: convertSnapshot(),
       pages: { total: allPagesTotal, done: allPagesDone, missing: allPagesTotal - allPagesDone },
     });
   }
@@ -1270,6 +1973,8 @@ async function handleApi(req, res, url) {
   // 把「所有还没下载的」一次性塞进队列
   if (url.startsWith('/api/enqueue-all')) {
     const source = params.get('source');
+    // mode=first：每个作品只补首张，不给没图的作品排队补简介
+    const wantMode = params.get('mode') === 'first' ? 'first' : 'full';
     const pids = [];
 
     for (const record of state.records) {
@@ -1278,14 +1983,28 @@ async function handleApi(req, res, url) {
       if (record.status === 'unavailable') continue;
       if (record.type === 'novel') continue; // 小说没有图片，不参与图片批量下载
       const pid = String(record.pid);
-      // 页数补齐 + 简介齐全才算完成，只差其中一项也要入队
-      const hasDesc = Boolean(record.description) || descCache.has(pid);
-      if (isComplete(record) && hasDesc) continue;
+      const stats = pageStats(record);
+
+      if (wantMode === 'first') {
+        // 已经有任意一页就等于「首张已下」，不用再排
+        if (stats.have > 0) continue;
+      } else {
+        // 页数补齐 + 简介齐全才算完成，只差其中一项也要入队
+        const hasDesc = Boolean(record.description) || descCache.has(pid);
+        if (isComplete(record) && hasDesc) continue;
+      }
+
       pids.push(record.pid);
     }
 
-    const { added, blocked } = enqueue(pids, { mode: 'full' });
-    return sendJson(res, 200, { candidates: pids.length, added, blocked: blocked ?? null, queue: queueSnapshot() });
+    const { added, blocked } = enqueue(pids, { mode: wantMode });
+    return sendJson(res, 200, {
+      candidates: pids.length,
+      added,
+      mode: wantMode,
+      blocked: blocked ?? null,
+      queue: queueSnapshot(),
+    });
   }
 
   // 手动触发全量完整性校验
@@ -1482,17 +2201,31 @@ async function main() {
   const filled = applyDescCache();
   if (filled > 0) console.log(`已从缓存回填 ${filled} 条简介。`);
 
+  state.tagGroups = createTagGroupStore(TAG_GROUPS_PATH, {
+    log: (text) => console.log(`  [标签组] ${text}`),
+  });
+
   const cookieFile = path.join(ROOT, state.config.cookieFile ?? '.secrets/cookies.txt');
   let cookie = state.config.cookie ?? '';
   if (!cookie && fs.existsSync(cookieFile)) cookie = (await fsp.readFile(cookieFile, 'utf8')).trim();
 
+  // 节奏控制要在两个限速器之前建好：接口和图片共用同一本账，
+  // 休息时整条下载线一起停，而不是各停各的。
+  state.pacer = new RequestPacer({ ...DEFAULT_PACER, ...(state.config.pacer ?? {}) }, {
+    log: (text) => console.log(`  [节奏] ${text}`),
+  });
+
   state.client = new PixivClient({
     cookie,
     proxy: state.config.proxy,
-    limiter: new RateLimiter(state.config.intervalMs ?? 2000),
+    limiter: new RateLimiter(state.config.intervalMs ?? 2000, 250, state.pacer),
     userId: state.config.userId,
   });
-  state.imageLimiter = new RateLimiter(state.config.download?.imageIntervalMs ?? 1000);
+  state.imageLimiter = new RateLimiter(
+    state.config.download?.imageIntervalMs ?? 1000,
+    250,
+    state.pacer,
+  );
 
   state.guard = createGuard({
     client: state.client,
@@ -1512,6 +2245,14 @@ async function main() {
   } else if (guardStatus.dailyExhausted) {
     console.warn(`\n⚠️  今日下载额度已用完（${guardStatus.daily.files} 个文件），明天自动恢复。\n`);
   }
+
+  // 预热到 pixiv 的连接：走代理建隧道 + TLS 要三秒左右，不预热的话
+  // 「第一次编辑收藏 / 打开第一张封面」都得先付这笔握手钱。
+  // 不 await —— 启动不等它；失败也无所谓（没代理或 cookie 过期时本地浏览照常可用）。
+  if (state.client.cookie) {
+    state.client.ajax('/ajax/user/extra', { lang: 'zh' }).catch(() => {});
+  }
+
   listen(BASE_PORT);
 }
 

@@ -13,10 +13,71 @@
  * 所有词项对「标题 / 作者 / pid / 作品标签 / 收藏标签」做统一的不区分大小写包含匹配。
  * 中文没有空格分词，所以一个 WORD 常常就是一整个中文短语，直接 includes 即可。
  *
+ * 标签组：词项与某个组员完全相等时，自动展开成 (a OR b OR c)，
+ * 组员内部仍按上面的全文口径匹配。
+ *
  * 解析失败不抛错：宁可返回一个宽松的 AST，也不要让用户的半截输入把整个列表打成空白。
  */
 
 const KEYWORDS = new Set(['AND', 'OR', 'NOT']);
+
+/**
+ * matchField 认识的字段名。展开标签组时要跳过这些词：
+ * `type:novel` 不是标签，不该被同义词表影响。
+ */
+const FIELD_KEYS = new Set(['type', 'ai', 'r18', 'pages', 'ratio', 'date', 'is']);
+
+/**
+ * 归一化标签 → 该组全部成员。组只有 1 个成员时没有意义，直接忽略。
+ *
+ * 值为「成员原串」而不是小写串：matchWord 自己会做不区分大小写的比较，
+ * 保留原样方便调试时一眼看出是哪个标签。
+ */
+function buildExpander(groups) {
+  const map = new Map();
+
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const members = [];
+    const seen = new Set();
+
+    for (const raw of Array.isArray(group?.tags) ? group.tags : []) {
+      const tag = String(raw ?? '').trim();
+      const key = tag.toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      members.push(tag);
+    }
+
+    if (members.length < 2) continue;
+    for (const key of seen) map.set(key, members);
+  }
+
+  return map;
+}
+
+/**
+ * 把一个词项变成语法树。命中标签组时展开成 (a OR b OR c)。
+ *
+ * 只在词项与成员**完全相等**时展开 —— 用 includes 的话，搜「東方」会把
+ * 「東方Project」那一组也牵进来，搜索范围会莫名其妙地变大。
+ */
+function wordNode(value, expand) {
+  const leaf = { op: 'word', value };
+  if (!expand || expand.size === 0) return leaf;
+
+  const colon = value.indexOf(':');
+  if (colon > 0 && FIELD_KEYS.has(value.slice(0, colon))) return leaf;
+
+  const members = expand.get(value.trim().toLowerCase());
+  if (!members) return leaf;
+
+  let node = null;
+  for (const member of members) {
+    const child = { op: 'word', value: member.toLowerCase() };
+    node = node ? { op: 'or', left: node, right: child } : child;
+  }
+  return node;
+}
 
 function tokenize(text) {
   const tokens = [];
@@ -77,7 +138,7 @@ function tokenize(text) {
   return tokens;
 }
 
-function parse(tokens) {
+function parse(tokens, expand = null) {
   let pos = 0;
 
   const peek = () => tokens[pos];
@@ -140,7 +201,7 @@ function parse(tokens) {
     const token = peek();
     if (token?.type === 'word') {
       pos += 1;
-      return { op: 'word', value: token.value };
+      return wordNode(token.value, expand);
     }
 
     // 容错：跳过一个没法识别的 token，返回「恒真」
@@ -358,11 +419,17 @@ function evaluate(node, record) {
   }
 }
 
-/** 编译查询串；空串返回 null 表示「不过滤」。 */
-export function compileQuery(text) {
+/**
+ * 编译查询串；空串返回 null 表示「不过滤」。
+ *
+ * options.groups 是标签组（`[{ id, tags: [...] }]`）：词项命中组员时会展开成
+ * `(a OR b OR c)`。展开发生在建树阶段，所以 `-词`、`NOT 词`、括号、
+ * 显式 AND/OR 的优先级都由原解析器保证，不需要额外处理。
+ */
+export function compileQuery(text, options = {}) {
   const trimmed = String(text ?? '').trim();
   if (!trimmed) return null;
-  return parse(tokenize(trimmed));
+  return parse(tokenize(trimmed), buildExpander(options.groups));
 }
 
 /** 用编译结果过滤记录。 */

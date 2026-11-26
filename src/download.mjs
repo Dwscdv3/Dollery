@@ -313,9 +313,11 @@ export async function downloadSinglePage(client, options) {
     proxy,
     quality = 50,
     keepOriginal = false,
+    // 用户正盯着这一页看，所以这次请求不等队列的随机休息（其它请求照等）
+    bypassPacer = false,
   } = options;
 
-  const pages = await client.ajax(`/ajax/illust/${pid}/pages`, { lang: 'zh' });
+  const pages = await client.ajax(`/ajax/illust/${pid}/pages`, { lang: 'zh' }, { bypassPacer });
   if (!Array.isArray(pages) || !pages[page]) {
     throw new DownloadError(`第 ${page} 页不存在（共 ${Array.isArray(pages) ? pages.length : 0} 页）`);
   }
@@ -326,13 +328,15 @@ export async function downloadSinglePage(client, options) {
   const target = path.join(outDir, `${pid}_p${page}.avif`);
   const tempFile = path.join(tmpDir, `${pid}_p${page}.${extensionOf(url)}`);
 
-  const res = await imageLimiter.run(() =>
-    httpsGetWithRetry(url, {
-      proxy,
-      binary: true,
-      timeoutMs: 180000,
-      headers: { Referer: REFERER, 'User-Agent': USER_AGENT, Accept: 'image/*,*/*' },
-    }),
+  const res = await imageLimiter.run(
+    () =>
+      httpsGetWithRetry(url, {
+        proxy,
+        binary: true,
+        timeoutMs: 180000,
+        headers: { Referer: REFERER, 'User-Agent': USER_AGENT, Accept: 'image/*,*/*' },
+      }),
+    { bypassPacer },
   );
   if (res.status !== 200) throw new DownloadError(`HTTP ${res.status}`);
 

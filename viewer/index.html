@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=11">
+<link rel="stylesheet" href="style.css?v=20">
 </head>
 <body>
 
@@ -14,6 +14,15 @@
   <div class="tabs" id="tabs"></div>
 
   <div class="filters">
+    <button id="btnFilter" class="icon-btn filter-toggle" title="默认过滤器：与搜索用 AND 连接，点此展开/收起" aria-expanded="false" aria-controls="filterBox">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+        <path d="M2.5 3.5h11l-4.2 4.8v4.2l-2.6 1.3V8.3L2.5 3.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+      </svg>
+    </button>
+    <div class="filter-box" id="filterBox" hidden>
+      <input id="defaultFilter" type="search" placeholder="默认过滤…" autocomplete="off" spellcheck="false" title="默认过滤器：与搜索 AND 连接，留空即不过滤。例如 -is:unavailable">
+      <div class="search-suggest" id="filterSuggest" hidden></div>
+    </div>
     <div class="search-box">
       <input id="search" type="search" placeholder="搜索 / 布尔 / 属性（- 前缀排除）：foo AND is:ai -type:novel" autocomplete="off" spellcheck="false">
       <div class="search-suggest" id="searchSuggest" hidden></div>
@@ -40,6 +49,20 @@
   <button id="guardResume" class="guard-resume">我已了解，恢复运行</button>
 </div>
 
+<div class="pacer-banner" id="pacerBanner" hidden>
+  <div class="banner-fill" id="pacerFill"></div>
+  <span class="pacer-icon">☾</span>
+  <div class="pacer-text" id="pacerText"></div>
+  <button id="pacerSkip" class="pacer-skip">立即继续</button>
+</div>
+
+<div class="pacer-banner convert-banner" id="convertBanner" hidden>
+  <div class="banner-fill" id="convertFill"></div>
+  <span class="pacer-icon">⇄</span>
+  <div class="pacer-text" id="convertText"></div>
+  <button id="convertStop" class="pacer-skip">停止</button>
+</div>
+
 <div class="app-body">
   <aside class="side side-left" id="sideLeft">
     <div class="side-tabs" id="sideTabs">
@@ -50,6 +73,10 @@
     <label class="side-toggle" id="tagIncludeWrap" hidden title="把作者给作品打的标签也算进来（同一作品上的同名标签只算一次）">
       <span class="switch"><input type="checkbox" id="tagIncludeWork"><span class="track"></span></span>
       <span class="switch-text">含作品标签</span>
+    </label>
+    <label class="side-toggle" id="onlyGroupsWrap" hidden title="只列出已建立的标签组，方便集中管理">
+      <span class="switch"><input type="checkbox" id="onlyGroups"><span class="track"></span></span>
+      <span class="switch-text">只看标签组</span>
     </label>
     <div class="side-list" id="sideList"></div>
   </aside>
@@ -66,6 +93,7 @@
     <div class="dl-meta" id="dlMeta">—</div>
     <div class="dl-actions">
       <button id="dlAll" class="primary">全部下载</button>
+      <button id="dlFirst" title="每个作品只下载第一页，已有任意一页的作品跳过">只下首页</button>
       <button id="dlClear">清空</button>
       <button id="dlVerify" title="逐个读取文件头，检查图片是否损坏">校验</button>
     </div>
@@ -112,6 +140,12 @@
     <span class="switch-text">显示作品标签</span>
   </label>
 
+  <label class="switch" title="封面上显示 5 颗星，可直接点星打分；开启时评分标签不再占用卡片的标签位">
+    <input type="checkbox" id="optShowRating">
+    <span class="track"></span>
+    <span class="switch-text">显示评分指示器</span>
+  </label>
+
   <label class="switch">
     <input type="checkbox" id="optAutoDownload">
     <span class="track"></span>
@@ -130,6 +164,12 @@
   <aside class="lb-pages" id="lbPages"></aside>
   <aside class="lb-panel" id="lbPanel"></aside>
 
+  <button class="lb-btn lb-copy" id="lbCopy" title="复制作品链接 (L)">
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+      <path d="M6.2 9.8a2.4 2.4 0 0 0 3.4 0l2.6-2.6a2.4 2.4 0 0 0-3.4-3.4l-1 1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      <path d="M9.8 6.2a2.4 2.4 0 0 0-3.4 0L3.8 8.8a2.4 2.4 0 0 0 3.4 3.4l1-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+    </svg>
+  </button>
   <button class="lb-btn lb-close" id="lbClose" title="关闭 (Esc)">✕</button>
   <button class="lb-btn lb-prev" id="lbPrev" title="上一个作品 (←)">‹</button>
   <button class="lb-btn lb-next" id="lbNext" title="下一个作品 (→)">›</button>
@@ -143,12 +183,153 @@
     <h3 id="rdTitle"></h3>
     <div class="rd-author" id="rdAuthor"></div>
     <div class="rd-tags" id="rdTags"></div>
+    <button id="rdEdit" class="rd-edit" type="button" title="编辑收藏标签与公开状态">编辑收藏</button>
     <a id="rdLink" target="_blank" rel="noopener">在 pixiv 打开 →</a>
   </aside>
   <div class="rd-body" id="rdBody"></div>
   <button class="lb-btn lb-close" id="rdClose" title="关闭 (Esc)">✕</button>
 </div>
 
-<script src="app.js?v=16"></script>
+<div id="bmModal" class="bm-modal" hidden>
+  <div class="bm-dialog" role="dialog" aria-modal="true" aria-labelledby="bmTitle">
+    <header class="bm-head">
+      <h2 id="bmTitle">编辑收藏</h2>
+      <span class="bm-sub" id="bmSub"></span>
+      <button id="bmClose" class="bm-x" type="button" title="关闭 (Esc)">✕</button>
+    </header>
+
+    <div class="bm-work">
+      <div class="bm-thumb" id="bmThumb"></div>
+      <div class="bm-work-meta">
+        <div class="bm-work-title" id="bmWorkTitle"></div>
+        <div class="bm-work-author" id="bmWorkAuthor"></div>
+      </div>
+    </div>
+
+    <div class="bm-body">
+      <section class="bm-field">
+        <div class="bm-label">
+          <span>收藏标签</span>
+          <span class="bm-count" id="bmCount">0 / 10</span>
+          <span class="bm-note">Enter / 空格 / 逗号确认</span>
+        </div>
+        <div class="bm-tag-input" id="bmTagInput">
+          <input id="bmTagEntry" class="bm-tag-entry" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="输入标签后回车" aria-label="添加收藏标签">
+        </div>
+        <div class="bm-hint" id="bmHint" hidden></div>
+      </section>
+
+      <section class="bm-field">
+        <div class="bm-label">
+          <span>作品标签</span>
+          <span class="bm-note">点击加入</span>
+        </div>
+        <div class="bm-cloud" id="bmWorkTags" data-empty="这个作品没有标签"></div>
+      </section>
+
+      <section class="bm-field bm-mine">
+        <div class="bm-label">
+          <span>我的标签</span>
+          <span class="bm-note" id="bmMineCount"></span>
+        </div>
+        <input id="bmTagSearch" class="bm-search" type="search" autocomplete="off" placeholder="筛选我的标签…">
+        <div class="bm-cloud" id="bmMineTags" data-empty="还没有用过别的收藏标签"></div>
+      </section>
+    </div>
+
+    <footer class="bm-foot">
+      <button id="bmFetch" class="bm-btn" type="button" title="从 pixiv 读取这个作品当前的标签和公开状态（1 次请求）">从 pixiv 读取</button>
+      <div class="bm-restrict" id="bmRestrict">
+        <label><input type="radio" name="bm-restrict" value="0" checked><span>公开</span></label>
+        <label><input type="radio" name="bm-restrict" value="1"><span>私密</span></label>
+      </div>
+      <div class="bm-actions">
+        <button id="bmCancel" class="bm-btn" type="button">取消</button>
+        <button id="bmSave" class="bm-btn bm-primary" type="button">保存</button>
+      </div>
+    </footer>
+
+    <div id="bmStatus" class="bm-status" hidden></div>
+  </div>
+</div>
+
+<div id="bmPick" class="bm-modal bm-pick" hidden>
+  <div class="bm-dialog bm-pick-dialog" role="dialog" aria-modal="true" aria-labelledby="bmPickTitle">
+    <header class="bm-head">
+      <h2 id="bmPickTitle">收藏标签已满</h2>
+      <button id="bmPickClose" class="bm-x" type="button" title="取消 (Esc)">✕</button>
+    </header>
+    <div class="bm-pick-body">
+      <p class="bm-pick-lead" id="bmPickLead"></p>
+      <div class="bm-pick-list" id="bmPickList"></div>
+      <p class="bm-pick-note">点一个标签即删除它，同时写入评分。</p>
+    </div>
+    <div id="bmPickStatus" class="bm-status" hidden></div>
+  </div>
+</div>
+
+<div class="side-menu" id="sideMenu" hidden></div>
+
+<div id="tgModal" class="bm-modal" hidden>
+  <div class="bm-dialog tg-dialog" role="dialog" aria-modal="true" aria-labelledby="tgTitle">
+    <header class="bm-head">
+      <h2 id="tgTitle">标签组</h2>
+      <span class="bm-sub" id="tgSub"></span>
+      <button id="tgClose" class="bm-x" type="button" title="关闭 (Esc)">✕</button>
+    </header>
+
+    <div class="bm-body">
+      <section class="bm-field">
+        <div class="bm-label">
+          <span>组内成员</span>
+          <span class="bm-note" id="tgCount">0 个</span>
+        </div>
+        <div class="tg-members" id="tgMembers"></div>
+        <div class="bm-hint" id="tgHint" hidden></div>
+      </section>
+
+      <section class="bm-field">
+        <div class="bm-label">
+          <span>添加标签</span>
+          <span class="bm-note">点击加入</span>
+        </div>
+        <input id="tgSearch" class="bm-search" type="search" autocomplete="off" placeholder="筛选当前来源的标签…">
+        <div class="bm-cloud" id="tgCandidates" data-empty="没有可加入的标签"></div>
+      </section>
+    </div>
+
+    <footer class="bm-foot">
+      <button id="tgDissolve" class="bm-btn" type="button">解散组</button>
+      <div class="bm-actions">
+        <button id="tgCancel" class="bm-btn" type="button">取消</button>
+        <button id="tgSave" class="bm-btn bm-primary" type="button">保存</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<div id="tcModal" class="bm-modal" hidden>
+  <div class="bm-dialog tc-dialog" role="dialog" aria-modal="true" aria-labelledby="tcTitle">
+    <header class="bm-head">
+      <h2 id="tcTitle">批量迁移收藏标签</h2>
+      <button id="tcClose" class="bm-x" type="button" title="取消 (Esc)">✕</button>
+    </header>
+    <div class="bm-body">
+      <p class="tc-lead" id="tcLead"></p>
+      <p class="tc-note">每条都会等上一次写入返回 200 再发下一条，中途可能进入随机长休息，可以随时停止。</p>
+    </div>
+    <footer class="bm-foot">
+      <div class="bm-actions">
+        <button id="tcCancel" class="bm-btn" type="button">取消</button>
+        <button id="tcStart" class="bm-btn bm-primary" type="button">开始迁移</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js?v=27"></script>
 </body>
 </html>

@@ -11,7 +11,14 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { diffRecords, parse, readRecords, serialize, sortRecords, writeRecords } from './store.mjs';
+import { normalizeTags, parseEditorPage, writeLocalBookmark } from './bookmark-edit.mjs';
+import { applyRating, findRating, parseRatingTag, stripRating } from './rating.mjs';
 import { syncKind, SyncAbort } from './sync.mjs';
+import { RequestPacer } from './pacer.mjs';
+import { RateLimiter } from './http.mjs';
+import { planTagConversion } from './tag-convert.mjs';
+import { normalizeGroups } from '../viewer/tag-groups.mjs';
+import { compileQuery, matches as matchQuery } from '../viewer/query.mjs';
 
 let passed = 0;
 const failures = [];
@@ -375,6 +382,397 @@ await test('私密通道确实以 visibility=private 发起请求', async () => 
     visibility: 'private',
   });
   assert.equal(srv.lastVisibility, 'private');
+});
+
+console.log('\npacer —— 概率触发的随机休息\n');
+
+// 概率和时长都压到毫秒级：测的是触发 / 计数 / 放行的逻辑，而不是真的等半小时
+const fastPacer = (over = {}) =>
+  new RequestPacer({
+    pauseChance: 1,
+    perRequestMs: 1000,
+    minPauseMs: 60,
+    maxPauseMs: 60,
+    shape: 1,
+    ...over,
+  });
+
+await test('pauseChance=0 时永不休息', async () => {
+  const pacer = fastPacer({ pauseChance: 0 });
+  const started = Date.now();
+  for (let i = 0; i < 10; i += 1) await pacer.gate();
+  assert.ok(Date.now() - started < 100, '不该有任何等待');
+  assert.equal(pacer.status().paused, false);
+  assert.equal(pacer.status().count, 10);
+  assert.equal(pacer.status().pauses, 0);
+});
+
+await test('命中概率就整队停下，休息完继续', async () => {
+  const pacer = fastPacer();
+  const started = Date.now();
+  await pacer.gate(); // 第一次就命中（pauseChance=1）
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed >= 50, `命中后应该等一段，实际 ${elapsed}ms`);
+  assert.equal(pacer.status().paused, false, '休息结束后不该还挂着暂停');
+  assert.equal(pacer.status().count, 1, '休息后从 0 重算，这次请求算 1');
+  assert.equal(pacer.status().pauses, 1);
+});
+
+await test('期望时长随连续请求数线性增长，并被上下限夹住', async () => {
+  const pacer = new RequestPacer({
+    pauseChance: 0,
+    perRequestMs: 5000,
+    minPauseMs: 60000,
+    maxPauseMs: 5400000,
+  });
+
+  for (let i = 0; i < 100; i += 1) await pacer.gate({ bypass: true });
+  assert.equal(pacer.status().count, 100);
+  assert.equal(pacer.status().expectedPauseMs, 500000, '100 次 × 5 秒');
+  assert.equal(pacer.expectedPauseMs(1), 60000, '低于下限时夹到下限');
+  assert.equal(pacer.expectedPauseMs(5000), 5400000, '超过上限时夹到上限');
+});
+
+await test('抽样均值贴近期望，且不越界', async () => {
+  const pacer = new RequestPacer({
+    pauseChance: 0,
+    perRequestMs: 1000,
+    minPauseMs: 1000,
+    maxPauseMs: 600000,
+    shape: 2,
+  });
+
+  const mean = 120000;
+  const rounds = 3000;
+  let sum = 0;
+  for (let i = 0; i < rounds; i += 1) {
+    const ms = pacer.samplePause(mean);
+    assert.ok(ms >= 1000 && ms <= 600000, `抽样越界: ${ms}`);
+    sum += ms;
+  }
+
+  const avg = sum / rounds;
+  assert.ok(Math.abs(avg - mean) / mean < 0.1, `均值偏离过大: ${Math.round(avg)}`);
+});
+
+await test('skip() 能提前结束休息', async () => {
+  const pacer = fastPacer({ minPauseMs: 20000, maxPauseMs: 20000 });
+  const started = Date.now();
+
+  const pending = pacer.gate(); // 必定命中，开始 20 秒休息
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(pacer.status().paused, true, '这时应该正在休息');
+
+  const result = pacer.skip();
+  await pending;
+
+  assert.equal(result.skipped, true);
+  assert.ok(Date.now() - started < 2000, '跳过之后不该继续等满 20 秒');
+  assert.equal(pacer.status().skips, 1);
+});
+
+await test('bypass 照常计数但不想休息', async () => {
+  const pacer = fastPacer({ minPauseMs: 20000, maxPauseMs: 20000 });
+
+  const started = Date.now();
+  await pacer.gate({ bypass: true });
+  await pacer.gate({ bypass: true });
+  assert.ok(Date.now() - started < 1000, '手动请求不该被休息卡住');
+  assert.equal(pacer.status().paused, false, '手动请求自己不开启休息');
+  assert.equal(pacer.status().total, 2);
+  assert.equal(pacer.status().count, 2, '手动请求照样计入连续请求数');
+
+  // 下一个后台请求才会真的停下来，且期望时长按 2 次算
+  const pending = pacer.gate();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(pacer.status().paused, true);
+  assert.equal(pacer.status().pauseRequests, 2, '触发时已连续请求 2 次');
+  pacer.skip();
+  await pending;
+});
+
+await test('enabled=false 时完全不介入', async () => {
+  const pacer = fastPacer({ enabled: false });
+  for (let i = 0; i < 10; i += 1) await pacer.gate();
+  assert.equal(pacer.status().paused, false);
+  assert.equal(pacer.status().pauses, 0);
+});
+
+await test('限速器把休息挡在串行链里，bypass 的那次能穿过去', async () => {
+  const pacer = new RequestPacer({
+    pauseChance: 1,
+    perRequestMs: 0,
+    minPauseMs: 150,
+    maxPauseMs: 150,
+    shape: 1,
+  });
+  const limiter = new RateLimiter(0, 0, pacer);
+
+  const started = Date.now();
+  await limiter.run(async () => {}); // 第一次就命中，休息 150ms
+  assert.ok(Date.now() - started >= 120, `应该被休息挡住，实际 ${Date.now() - started}ms`);
+
+  // 手动请求不等：pauseChance=1 本该休息，但 bypassPacer 直接放行
+  const manual = Date.now();
+  await limiter.run(async () => {}, { bypassPacer: true });
+  assert.ok(Date.now() - manual < 100, '手动请求不该被挡住');
+});
+
+/* ── 编辑收藏：解析编辑页 + 本地写入 ────────────────────── */
+
+await test('解析旧版编辑页：token、可见性、标签', () => {
+  const html =
+    '<form method="post" action="bookmark_add.php?id=1">' +
+    '<input type="hidden" name="mode" value="add">' +
+    '<input type="hidden" name="tt" value="6fb2caff5ce6566c8f5f2afc0660a161">' +
+    '<input type="radio" name="restrict" value="0" checked>' +
+    '<input type="radio" name="restrict" value="1">' +
+    '<input type="text" name="tag" value="Zwei!! 百合" data-limit="10"></form>';
+
+  const page = parseEditorPage(html);
+  assert.equal(page.token, '6fb2caff5ce6566c8f5f2afc0660a161');
+  assert.equal(page.restrict, 0);
+  assert.equal(page.isPrivate, false);
+  assert.deepEqual(page.tags, ['Zwei!!', '百合']);
+
+  // 不是编辑页（比如被重定向到登录页）必须返回 null，不能当成「没有标签」
+  assert.equal(parseEditorPage('<div>登录</div>'), null);
+});
+
+await test('收藏标签整理：去重、过滤默认分类、超限报错', () => {
+  const result = normalizeTags([' 原神 ', '风景,原神', '未分類']);
+  assert.deepEqual(result.tags, ['原神', '风景']);
+  assert.equal(result.error, '');
+
+  const many = normalizeTags(Array.from({ length: 12 }, (_, i) => `t${i}`));
+  assert.ok(many.error.includes('10'), '超过 10 个应当报错，而不是静默截断');
+});
+
+await test('编辑落盘：同文件改标签不动 id，跨文件按目标 max+1 编号', async () => {
+  const files = {
+    illustPublic: path.join(tempRoot, 'edit-illust.json'),
+    illustPrivate: path.join(tempRoot, 'edit-illust-private.json'),
+    novelPublic: path.join(tempRoot, 'edit-novel.json'),
+    novelPrivate: path.join(tempRoot, 'edit-novel-private.json'),
+  };
+  const meta = { kindLabel: '插画/漫画（公开）', lastSync: '2026-11-01 00:00:00', sourceTotal: 42 };
+
+  await writeRecords(
+    files.illustPublic,
+    [
+      { id: 3, pid: '111', type: 'illust', title: 'A', bookmark_tags: ['旧'], private_bookmark: 'no' },
+      { id: 7, pid: '222', type: 'illust', title: 'B', private_bookmark: 'no' },
+    ],
+    meta,
+  );
+  await writeRecords(files.illustPrivate, [
+    { id: 9, pid: '111', type: 'illust', title: 'A', removed: 'yes', private_bookmark: 'yes', first_seen: '2025-12-01' },
+  ]);
+
+  // 同文件：只改标签，id 与 _meta 都不该动
+  await writeLocalBookmark({
+    files,
+    kind: 'illust',
+    pid: '111',
+    tags: ['新', '标签'],
+    isPrivate: false,
+    source: 'illustPublic',
+  });
+
+  let pub = await readRecords(files.illustPublic);
+  assert.equal(pub.find((r) => r.pid === '111').id, 3);
+  assert.deepEqual(pub.find((r) => r.pid === '111').bookmark_tags, ['新', '标签']);
+
+  // 跨文件：私密侧还留着这条作品的「已取消」旧记录，应当复活它并沿用 id / first_seen
+  const moved = await writeLocalBookmark({
+    files,
+    kind: 'illust',
+    pid: '111',
+    tags: ['新'],
+    isPrivate: true,
+    source: 'illustPublic',
+  });
+
+  pub = await readRecords(files.illustPublic);
+  const priv = await readRecords(files.illustPrivate);
+  const revived = priv.filter((r) => r.pid === '111');
+
+  assert.equal(moved.moved, true);
+  assert.equal(moved.source, 'illustPrivate');
+  assert.equal(pub.some((r) => r.pid === '111'), false, '来源文件里应当已删除');
+  assert.equal(revived.length, 1, '目标文件里不能出现两条同 pid');
+  assert.equal(revived[0].id, 9, '应当沿用旧记录的 id');
+  assert.equal(revived[0].removed, undefined, '重新收藏后要清掉 removed');
+  assert.equal(revived[0].first_seen, '2025-12-01');
+
+  // 再搬回公开：目标里没有记录，编号接在末尾
+  const back = await writeLocalBookmark({
+    files,
+    kind: 'illust',
+    pid: '111',
+    tags: [],
+    isPrivate: false,
+    source: 'illustPrivate',
+  });
+  pub = await readRecords(files.illustPublic);
+  const record = pub.find((r) => r.pid === '111');
+
+  assert.equal(back.moved, true);
+  assert.equal(record.id, 8, '新 id 应该是目标文件的 max+1');
+  assert.equal('bookmark_tags' in record, false, '空标签要把字段删掉');
+
+  const ids = pub.map((r) => Number(r.id));
+  assert.equal(new Set(ids).size, ids.length, '同一文件内 id 必须唯一');
+});
+
+/* ── 评分标签 ───────────────────────────────────────────── */
+
+await test('识别评分标签：只认 1/10 ~ 10/10', () => {
+  assert.equal(parseRatingTag('9/10'), 9);
+  assert.equal(parseRatingTag(' 10/10 '), 10);
+  assert.equal(parseRatingTag('3 / 10'), 3);
+
+  for (const bad of ['0/10', '11/10', '9/10分', '/10', '10/10/', '風景', '']) {
+    assert.equal(parseRatingTag(bad), null, `${bad} 不该被当成评分`);
+  }
+
+  assert.deepEqual(findRating(['風景', '7/10']), { value: 7, tag: '7/10', index: 1 });
+  assert.equal(findRating(['風景']), null);
+});
+
+await test('改评分是「顶替原来那一格」，不是追加到末尾', () => {
+  // 位置不变，git diff 里只是同一行的数字变化
+  assert.deepEqual(applyRating(['a', 'b', '7/10', 'c'], 9), ['a', 'b', '9/10', 'c']);
+  // 原来没有就追加
+  assert.deepEqual(applyRating(['a', 'b'], 4), ['a', 'b', '4/10']);
+  // 0 表示清除
+  assert.deepEqual(applyRating(['a', '7/10'], 0), ['a']);
+  // 历史脏数据里的多个评分一起收掉
+  assert.deepEqual(applyRating(['5/10', 'a', '6/10'], 8), ['8/10', 'a']);
+  assert.deepEqual(stripRating(['5/10', 'a', '6/10']), ['a']);
+  // 非法值不能顺手把已有评分抹掉
+  assert.deepEqual(applyRating(['a', '7/10'], 11), ['a', '7/10']);
+});
+
+await test('标签已满且没有评分时，applyRating 会超到 11 个（由调用方拦下）', () => {
+  const full = Array.from({ length: 10 }, (_, i) => `t${i}`);
+  assert.equal(applyRating(full, 8).length, 11);
+
+  // 已经有评分时不额外占位：替换后仍是 10 个
+  const withRating = [...full.slice(0, 9), '6/10'];
+  assert.equal(applyRating(withRating, 9).length, 10);
+});
+
+await test('快速通道默认完全不排队，但串行仍然成立', async () => {
+  const limiter = new RateLimiter(2000, 0);
+  await limiter.run(async () => {});
+
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  const task = async () => {
+    concurrent += 1;
+    maxConcurrent = Math.max(maxConcurrent, concurrent);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    concurrent -= 1;
+  };
+
+  const started = Date.now();
+  await Promise.all([limiter.run(task, { fast: true }), limiter.run(task, { fast: true })]);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 300, `两次快速请求应该立刻发出去，实际 ${elapsed}ms`);
+  assert.equal(maxConcurrent, 1, '快速通道也不能并发，必须一个接一个');
+});
+
+await test('快速通道：手动写操作不用等满普通间隔', async () => {
+  const limiter = new RateLimiter(400, 0, null, 60);
+
+  await limiter.run(async () => {}); // 第一个普通请求
+
+  const fastStart = Date.now();
+  await limiter.run(async () => {}, { fast: true });
+  const fastElapsed = Date.now() - fastStart;
+  assert.ok(fastElapsed >= 40 && fastElapsed < 300, `快速通道等了 ${fastElapsed}ms，应该只有几十毫秒`);
+
+  // 快速请求之后，普通请求仍然按完整间隔排队
+  const normalStart = Date.now();
+  await limiter.run(async () => {});
+  const normalElapsed = Date.now() - normalStart;
+  assert.ok(normalElapsed >= 380, `普通请求应该等满 400ms，实际 ${normalElapsed}ms`);
+});
+
+/* ── 标签组：归一化、搜索展开、批量迁移计划 ─────────────── */
+
+await test('标签组归一化：去重、短组丢弃、跨组冲突', () => {
+  const result = normalizeGroups([
+    { id: 'g1', tags: ['A', ' a ', 'B'] },
+    { id: 'g2', tags: ['b', 'C'] },
+    { id: 'g3', tags: ['D'] },
+  ]);
+
+  assert.deepEqual(
+    result.groups.map((group) => group.tags),
+    [['A', 'B']],
+  );
+  assert.equal(result.conflicts.length, 1);
+  assert.equal(result.dropped, 2);
+});
+
+await test('标签组 id 自动分配不与已有 id 冲突', () => {
+  const result = normalizeGroups([{ tags: ['a', 'b'] }, { id: 'g1', tags: ['c', 'd'] }]);
+  assert.deepEqual(
+    result.groups.map((group) => group.id),
+    ['g2', 'g1'],
+  );
+});
+
+await test('搜索：命中组员展开成 OR，排除词连整组一起排除', () => {
+  const groups = [{ id: 'g1', tags: ['原神', 'Genshin Impact'] }];
+  const record = { title: '', author: '', pid: '1', tags: [], bookmark_tags: ['Genshin Impact'] };
+
+  assert.equal(matchQuery(compileQuery('原神', { groups }), record), true);
+  assert.equal(matchQuery(compileQuery('genshin impact', { groups }), record), true, '大小写不敏感');
+  assert.equal(matchQuery(compileQuery('-原神', { groups }), record), false);
+  assert.equal(matchQuery(compileQuery('原神', { groups: [] }), record), false);
+});
+
+await test('搜索：不完全相等不展开，字段词不受组影响', () => {
+  const groups = [{ id: 'g1', tags: ['原神', 'Genshin Impact'] }];
+
+  // 「原神启动」不是组员本身，不能因为含子串就把整组牵进来
+  const titled = { title: '原神启动', author: '', pid: '2', tags: [], bookmark_tags: [] };
+  assert.equal(matchQuery(compileQuery('原神启动', { groups }), titled), true);
+
+  const onlyGroup = { title: '', author: '', pid: '3', tags: [], bookmark_tags: ['原神'] };
+  // 「Genshin」只是成员「Genshin Impact」的前缀，不该因此把整组牵进来
+  assert.equal(matchQuery(compileQuery('Genshin', { groups }), onlyGroup), false);
+
+  assert.equal(matchQuery(compileQuery('type:illust', { groups }), { type: 'illust' }), true);
+});
+
+await test('迁移计划：只换组内成员，保留其它标签', () => {
+  const items = planTagConversion({
+    records: [
+      { pid: 1, source: 'illustPublic', bookmark_tags: ['B', 'x'] },
+      { pid: 2, source: 'illustPublic', bookmark_tags: ['A', 'B', 'x'] },
+      { pid: 3, source: 'illustPublic', bookmark_tags: ['A', 'x'] },
+      { pid: 4, source: 'illustPrivate', bookmark_tags: ['B'] },
+      { pid: 5, source: 'illustPublic', bookmark_tags: [], tags: ['B'] },
+      { pid: 6, source: 'illustPublic', bookmark_tags: ['B'], removed: 'yes' },
+    ],
+    source: 'illustPublic',
+    members: ['A', 'B'],
+    target: 'A',
+  });
+
+  assert.deepEqual(
+    items.map((item) => item.pid),
+    ['1', '2'],
+  );
+  assert.deepEqual(items[0].after, ['A', 'x']);
+  assert.deepEqual(items[1].after, ['A', 'x']);
+  assert.equal(items[0].isPrivate, false);
 });
 
 await fs.rm(tempRoot, { recursive: true, force: true });

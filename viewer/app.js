@@ -14,9 +14,14 @@ const DEFAULT_SETTINGS = {
   cardWidth: 210,
   showOwnTags: false,
   showTags: false,
+  // 封面上的 5 颗星。开启时评分标签不再占用卡片的标签位，改用星星表达
+  showRating: true,
   autoDownload: true,
   overlayInfo: false, // 标题 / 作者 / 标签叠在图片上，而不是图片外
   tagIncludeWork: false, // 标签面板是否把作品本身的标签也算进来
+  onlyGroups: false, // 标签面板是否只列标签组
+  defaultFilter: '-is:unavailable', // 默认过滤器：与搜索 AND 连接，默认藏掉已失效的作品
+  filterOpen: false, // 默认过滤器输入框是否展开（纯 UI 状态，不影响过滤是否生效）
   leftOpen: false,
   rightOpen: false,
 };
@@ -60,6 +65,11 @@ const state = {
   sideQuery: '',
   authors: [],
   tags: [],
+  tagGroups: [], // 完整组定义（编辑用）
+  groupSummaries: [], // /api/tags 带回的组汇总（带计数）
+  pendingConvert: null, // 待确认的批量转换
+  lastConvert: null, // 上一次轮询到的转换任务快照
+  finishedConverts: new Set(),
 };
 
 const PAGE_SIZE = 120;
@@ -69,13 +79,25 @@ for (const id of [
   'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
   'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
   'searchSuggest', 'tagIncludeWrap', 'tagIncludeWork',
+  'onlyGroupsWrap', 'onlyGroups', 'sideMenu',
+  'convertBanner', 'convertText', 'convertFill', 'convertStop', 'pacerFill',
+  'tgModal', 'tgTitle', 'tgSub', 'tgClose', 'tgCount', 'tgMembers', 'tgHint',
+  'tgSearch', 'tgCandidates', 'tgDissolve', 'tgCancel', 'tgSave',
+  'tcModal', 'tcTitle', 'tcClose', 'tcLead', 'tcCancel', 'tcStart',
+  'btnFilter', 'filterBox', 'defaultFilter', 'filterSuggest',
   'grid', 'sentinel', 'guardBanner', 'guardText', 'guardResume',
-  'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
+  'pacerBanner', 'pacerText', 'pacerSkip',
+  'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlFirst', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
   'viewPopover', 'optRatio', 'optWidth', 'optWidthVal', 'optShowOwnTags', 'optShowTags',
-  'optAutoDownload', 'optOverlayInfo', 'optReset',
+  'optShowRating', 'optAutoDownload', 'optOverlayInfo', 'optReset',
   'lightbox', 'lbStage', 'lbImage', 'lbPages', 'lbPanel',
-  'lbClose', 'lbPrev', 'lbNext',
-  'reader', 'rdCover', 'rdCoverBox', 'rdTitle', 'rdAuthor', 'rdTags', 'rdLink', 'rdBody', 'rdClose',
+  'lbClose', 'lbPrev', 'lbNext', 'lbCopy',
+  'reader', 'rdCover', 'rdCoverBox', 'rdTitle', 'rdAuthor', 'rdTags', 'rdLink', 'rdBody', 'rdClose', 'rdEdit',
+  'bmModal', 'bmClose', 'bmSub', 'bmThumb', 'bmWorkTitle', 'bmWorkAuthor', 'bmTagInput', 'bmTagEntry',
+  'bmCount', 'bmHint', 'bmWorkTags', 'bmTagSearch', 'bmMineTags', 'bmMineCount', 'bmFetch', 'bmRestrict',
+  'bmSave', 'bmCancel', 'bmStatus',
+  'bmPick', 'bmPickClose', 'bmPickLead', 'bmPickList', 'bmPickStatus',
+  'toast',
 ]) {
   els[id] = document.getElementById(id);
 }
@@ -83,8 +105,34 @@ for (const id of [
 async function api(path, options) {
   const res = await fetch(path, options);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(data.error || `HTTP ${res.status}`);
+    // 业务错误码要能传到调用方（例如 TAGS_FULL 需要弹「挑一个删」的窗）
+    error.status = res.status;
+    error.data = data;
+    throw error;
+  }
   return data;
+}
+
+/**
+ * 用系统默认浏览器打开 pixiv 页面。
+ *
+ * 查看器是 Edge `--app` 模式起的，页面里 window.open 只会在 Edge 里再开一个窗口，
+ * 那就等于「用 Edge 打开」，和用户点链接的预期不符。所以统一走本地服务，
+ * 由它调系统默认浏览器。
+ */
+async function openExternal(url) {
+  if (!url) return;
+  try {
+    await api('/api/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+  } catch (err) {
+    toast(`打开失败：${err.message}`, 'warn');
+  }
 }
 
 function escapeHtml(text) {
@@ -93,7 +141,132 @@ function escapeHtml(text) {
   );
 }
 
+// ---------- 复制 ----------
+
+const COPY_ICON =
+  '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
+  '<path d="M6.2 9.8a2.4 2.4 0 0 0 3.4 0l2.6-2.6a2.4 2.4 0 0 0-3.4-3.4l-1 1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>' +
+  '<path d="M9.8 6.2a2.4 2.4 0 0 0-3.4 0L3.8 8.8a2.4 2.4 0 0 0 3.4 3.4l1-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>' +
+  '</svg>';
+
+let toastTimer = null;
+
+function toast(message, tone = 'ok') {
+  const el = els.toast;
+  if (!el) return;
+  el.textContent = message;
+  el.className = `toast ${tone}`;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.hidden = true;
+  }, 1900);
+}
+
+/** 复制纯文本。局域网 http 下没有 clipboard API，退回 execCommand 老路子。 */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
+}
+
+/** 作品页地址：优先用后端给的 url，没有就按 pid 拼一个（小说走 novel 的路由）。 */
+function recordLink(record) {
+  if (!record) return '';
+  if (record.url) return record.url;
+  if (!record.pid) return '';
+  return record.type === 'novel'
+    ? `https://www.pixiv.net/novel/show.php?id=${record.pid}`
+    : `https://www.pixiv.net/artworks/${record.pid}`;
+}
+
+async function copyLink(record) {
+  const link = recordLink(record);
+  if (!link) {
+    toast('这个作品没有可复制的链接', 'warn');
+    return;
+  }
+  const ok = await copyText(link);
+  toast(ok ? '已复制作品链接' : '复制失败，请手动复制地址栏', ok ? 'ok' : 'warn');
+}
+
+/** 剪贴板只认 image/png，而本地原图多是 avif，所以统一过一遍 canvas 转码。 */
+async function toPngBlob(blob) {
+  if (blob.type === 'image/png') return blob;
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0);
+  bitmap.close?.();
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (out) => (out ? resolve(out) : reject(new Error('图片转码失败'))),
+      'image/png',
+    );
+  });
+}
+
+/**
+ * 把当前页图片塞进剪贴板，可以直接粘到聊天窗口或画图软件里。
+ * 需要安全上下文（localhost 或 https）且浏览器支持写图，失败时退回复制链接，
+ * 不让按钮看起来「点了没反应」。
+ */
+async function copyImage(record, page = 0) {
+  if (!record) return;
+  if (record.type === 'novel') {
+    toast('小说没有图片，已改为复制链接', 'warn');
+    await copyLink(record);
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/full/${record.pid}/${page}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const png = await toPngBlob(await res.blob());
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+    toast(Number(record.pages) > 1 ? `已复制第 ${page + 1} 页图片` : '已复制图片，可直接粘贴');
+  } catch (err) {
+    const ok = await copyText(recordLink(record));
+    toast(
+      ok ? `复制图片失败，已改为复制链接` : `复制失败：${err.message}`,
+      'warn',
+    );
+  }
+}
+
 // ---------- 设置应用 ----------
+
+/** 把默认过滤器的文本 / 展开状态同步到界面（按钮高亮表示「有条件在生效」）。 */
+function syncFilterUI() {
+  const text = String(settings.defaultFilter ?? '');
+  // 正在这个框里打字时别回写，否则 trim 会把刚敲的尾随空格吃掉、光标也会跳
+  if (document.activeElement !== els.defaultFilter && els.defaultFilter.value !== text) {
+    els.defaultFilter.value = text;
+  }
+  els.filterBox.hidden = !settings.filterOpen;
+  els.btnFilter.classList.toggle('on', text.trim() !== '');
+  els.btnFilter.setAttribute('aria-expanded', String(Boolean(settings.filterOpen)));
+  els.btnFilter.title = text.trim()
+    ? `默认过滤器：${text}（与搜索 AND，点此展开/收起）`
+    : '默认过滤器：未设置（点此展开）';
+}
 
 function applySettings({ rerender = true } = {}) {
   document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
@@ -106,6 +279,7 @@ function applySettings({ rerender = true } = {}) {
   els.optWidthVal.textContent = `${settings.cardWidth}px`;
   els.optShowOwnTags.checked = settings.showOwnTags;
   els.optShowTags.checked = settings.showTags;
+  els.optShowRating.checked = settings.showRating;
   els.optAutoDownload.checked = settings.autoDownload;
   els.optOverlayInfo.checked = settings.overlayInfo;
   // 信息叠在图上时，卡片高度只由图片决定，CSS 那边靠这个 class 切换
@@ -115,6 +289,8 @@ function applySettings({ rerender = true } = {}) {
   document.getElementById('sideRight')?.classList.toggle('collapsed', !settings.rightOpen);
   document.getElementById('btnLeft')?.classList.toggle('on', settings.leftOpen);
   document.getElementById('btnRight')?.classList.toggle('on', settings.rightOpen);
+
+  syncFilterUI();
 
   // 重渲染卡片后必须重新 observe，否则新生成的 img[data-src] 不会被触发加载
   if (rerender) {
@@ -159,8 +335,11 @@ function renderSideTabs() {
 
 async function loadSidePanel() {
   renderSideTabs();
-  els.tagIncludeWrap.hidden = state.sidePanel !== 'tags';
+  const isTags = state.sidePanel === 'tags';
+  els.tagIncludeWrap.hidden = !isTags;
+  els.onlyGroupsWrap.hidden = !isTags;
   els.tagIncludeWork.checked = settings.tagIncludeWork;
+  els.onlyGroups.checked = settings.onlyGroups;
   els.sideList.innerHTML = '<div class="side-empty">加载中…</div>';
 
   try {
@@ -172,6 +351,8 @@ async function loadSidePanel() {
       const include = settings.tagIncludeWork ? '&include=1' : '';
       const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}${include}`);
       state.tags = data.tags;
+      state.groupSummaries = data.groups ?? [];
+      state.tagGroups = state.groupSummaries.map((group) => ({ id: group.id, tags: [...group.tags] }));
       renderTags();
     }
   } catch (err) {
@@ -205,6 +386,8 @@ function renderAuthors() {
 
 function renderTags() {
   const filter = state.sideQuery.trim().toLowerCase();
+  if (settings.onlyGroups) return renderGroupList(filter);
+
   const list = filter ? state.tags.filter((t) => t.tag.toLowerCase().includes(filter)) : state.tags;
 
   if (list.length === 0) {
@@ -217,20 +400,50 @@ function renderTags() {
       (t) => `
       <div class="side-item" data-tag="${escapeHtml(t.tag)}" title="${escapeHtml(t.tag)}">
         <span class="name">${escapeHtml(t.tag)}</span>
+        ${
+          t.group
+            ? `<span class="tag-link" title="组内 ${t.group.size} 个成员，组总计 ${t.group.total}">组</span>`
+            : ''
+        }
         <span class="cnt">${t.count}</span>
+        <button class="tag-more" type="button" data-more="${escapeHtml(t.tag)}" title="标签组操作">⋯</button>
       </div>`,
     )
     .join('');
 }
 
-els.sideTabs.addEventListener('click', (event) => {
-  const btn = event.target.closest('button[data-panel]');
-  if (!btn) return;
-  state.sidePanel = btn.dataset.panel;
-  state.sideQuery = '';
-  els.sideQuery.value = '';
-  loadSidePanel();
-});
+/** 只看标签组：每组一行，名字取计数最多的成员。 */
+function renderGroupList(filter) {
+  const groups = state.groupSummaries.slice().sort(
+    (a, b) => b.total - a.total || a.representative.localeCompare(b.representative, 'zh'),
+  );
+
+  const list = filter
+    ? groups.filter(
+        (g) =>
+          g.representative.toLowerCase().includes(filter) ||
+          g.tags.some((tag) => tag.toLowerCase().includes(filter)),
+      )
+    : groups;
+
+  if (list.length === 0) {
+    els.sideList.innerHTML = '<div class="side-empty">还没有标签组，在标签的 ⋯ 菜单里新建</div>';
+    return;
+  }
+
+  els.sideList.innerHTML = list
+    .map(
+      (g) => `
+      <div class="side-item group-item${g.union > 0 ? '' : ' zero'}" data-group="${escapeHtml(g.id)}"
+           title="${escapeHtml(g.tags.join(' / '))}">
+        <span class="name">${escapeHtml(g.representative)}</span>
+        <span class="tag-link" title="组内 ${g.tags.length} 个成员">×${g.tags.length}</span>
+        <span class="cnt" title="去重后 ${g.union} 个作品；成员计数之和 ${g.total}（用于排序）">${g.union}</span>
+        <button class="tag-more" type="button" data-more-group="${escapeHtml(g.id)}" title="标签组操作">⋯</button>
+      </div>`,
+    )
+    .join('');
+}
 
 els.tagIncludeWork.addEventListener('change', () => {
   settings.tagIncludeWork = els.tagIncludeWork.checked;
@@ -238,7 +451,37 @@ els.tagIncludeWork.addEventListener('change', () => {
   loadSidePanel();
 });
 
+els.onlyGroups.addEventListener('change', () => {
+  settings.onlyGroups = els.onlyGroups.checked;
+  saveSettings();
+  renderTags();
+});
+
+els.sideTabs.addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-panel]');
+  if (!btn) return;
+  state.sidePanel = btn.dataset.panel;
+  state.sideQuery = '';
+  els.sideQuery.value = '';
+  closeSideMenu();
+  loadSidePanel();
+});
+
 els.sideList.addEventListener('click', (event) => {
+  const more = event.target.closest('[data-more]');
+  if (more) {
+    event.stopPropagation();
+    openTagMenu(more.dataset.more, more);
+    return;
+  }
+
+  const moreGroup = event.target.closest('[data-more-group]');
+  if (moreGroup) {
+    event.stopPropagation();
+    openGroupMenu(moreGroup.dataset.moreGroup, moreGroup);
+    return;
+  }
+
   const authorItem = event.target.closest('[data-author]');
   if (authorItem) {
     const id = authorItem.dataset.author;
@@ -248,8 +491,26 @@ els.sideList.addEventListener('click', (event) => {
     return;
   }
 
+  // 点组行 = 按整组筛选（代表标签会由服务端展开成全部同义标签）
+  const groupItem = event.target.closest('[data-group]');
+  if (groupItem) {
+    const group = groupSummary(groupItem.dataset.group);
+    if (group) addTagToSearch(group.representative);
+    return;
+  }
+
   const tagItem = event.target.closest('[data-tag]');
   if (tagItem) addTagToSearch(tagItem.dataset.tag);
+});
+
+// 右键和 ⋯ 打开同一份菜单
+els.sideList.addEventListener('contextmenu', (event) => {
+  const tagItem = event.target.closest('[data-tag]');
+  const groupItem = event.target.closest('[data-group]');
+  if (!tagItem && !groupItem) return;
+  event.preventDefault();
+  if (tagItem) openTagMenu(tagItem.dataset.tag, null, event.clientX, event.clientY);
+  else openGroupMenu(groupItem.dataset.group, null, event.clientX, event.clientY);
 });
 
 /** 点标签不是立即筛选，而是把它拼进顶部搜索框（用引号包住，标签里可能有空格）。 */
@@ -261,6 +522,461 @@ function addTagToSearch(tag) {
   state.query = next;
   reloadAll();
 }
+
+// ---------- 标签组：行菜单、编辑器、批量迁移 ----------
+
+const normTag = (tag) => String(tag ?? '').trim().toLowerCase();
+
+function groupOfTag(tag) {
+  const key = normTag(tag);
+  if (!key) return null;
+  return state.tagGroups.find((group) => group.tags.some((member) => normTag(member) === key)) ?? null;
+}
+
+function groupSummary(id) {
+  return state.groupSummaries.find((group) => group.id === id) ?? null;
+}
+
+function closeSideMenu() {
+  if (els.sideMenu.hidden) return;
+  els.sideMenu.hidden = true;
+  els.sideMenu.innerHTML = '';
+}
+
+/**
+ * 菜单统一入口。
+ * items: [{ header } | { empty } | { label, sub, danger, action }]
+ */
+function openSideMenuAt(items, x, y) {
+  els.sideMenu.innerHTML = items
+    .map((item, index) => {
+      if (item.header) return `<div class="sm-title">${escapeHtml(item.header)}</div>`;
+      if (item.empty) return `<div class="sm-empty">${escapeHtml(item.empty)}</div>`;
+      const sub = item.sub ? `<span class="sm-sub">${escapeHtml(item.sub)}</span>` : '';
+      const cls = item.danger ? 'danger' : '';
+      return `<button type="button" data-i="${index}" class="${cls}">${escapeHtml(item.label)}${sub}</button>`;
+    })
+    .join('');
+
+  els.sideMenu.hidden = false;
+  els.sideMenu.style.left = '0px';
+  els.sideMenu.style.top = '0px';
+
+  const rect = els.sideMenu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+  const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+  els.sideMenu.style.left = `${left}px`;
+  els.sideMenu.style.top = `${top}px`;
+
+  els.sideMenu.onclick = (event) => {
+    const btn = event.target.closest('button[data-i]');
+    if (!btn) return;
+    const item = items[Number(btn.dataset.i)];
+    closeSideMenu();
+    if (item?.action) item.action();
+  };
+}
+
+/** ⋯ 按钮点出来的位置，或右键的鼠标位置。 */
+function menuPoint(anchor, x, y) {
+  if (typeof x === 'number' && typeof y === 'number') return { x, y };
+  const rect = anchor.getBoundingClientRect();
+  return { x: rect.left, y: rect.bottom + 4 };
+}
+
+function reopenMenu(items) {
+  const rect = els.sideMenu.getBoundingClientRect();
+  openSideMenuAt(items, rect.left, rect.top);
+}
+
+function openTagMenu(tag, anchor, x, y) {
+  const group = groupOfTag(tag);
+  const items = [];
+
+  if (group) {
+    const summary = groupSummary(group.id);
+    items.push({
+      header: `标签组 · ${summary?.representative ?? group.tags[0]}（${group.tags.length} 个成员）`,
+    });
+    items.push({ label: '编辑成员…', action: () => openGroupEditor(group) });
+    items.push({ label: '移到其它组…', action: () => openGroupPicker(tag) });
+    items.push({ label: '从组中移出', action: () => removeTagFromGroup(tag) });
+    items.push({
+      label: '将所有同组收藏标签迁移到此标签',
+      sub: '批量',
+      action: () => openConvertDialog(tag),
+    });
+    items.push({ label: '解散组', danger: true, action: () => dissolveGroup(group.id) });
+  } else {
+    items.push({ header: tag });
+    items.push({ label: '新建标签组', action: () => openGroupEditor({ tags: [tag] }) });
+    items.push({ label: '添加到组…', action: () => openGroupPicker(tag) });
+  }
+
+  const point = menuPoint(anchor, x, y);
+  openSideMenuAt(items, point.x, point.y);
+}
+
+function openGroupMenu(groupId, anchor, x, y) {
+  const group = state.tagGroups.find((item) => item.id === groupId);
+  if (!group) return;
+  const summary = groupSummary(groupId);
+
+  const items = [
+    { header: summary ? `${summary.representative} · ${group.tags.length} 个成员` : '标签组' },
+    { label: '按整组筛选', action: () => summary && addTagToSearch(summary.representative) },
+    { label: '编辑成员…', action: () => openGroupEditor(group) },
+    { label: '解散组', danger: true, action: () => dissolveGroup(groupId) },
+  ];
+
+  const point = menuPoint(anchor, x, y);
+  openSideMenuAt(items, point.x, point.y);
+}
+
+function openGroupPicker(tag) {
+  const current = groupOfTag(tag);
+  const groups = state.groupSummaries.filter((group) => group.id !== current?.id);
+  const items = [{ header: current ? `移到其它组 · ${tag}` : `添加到组 · ${tag}` }];
+
+  if (groups.length === 0) items.push({ empty: '还没有其它标签组' });
+  for (const group of groups) {
+    items.push({
+      label: group.representative,
+      sub: `${group.tags.length} 个`,
+      action: () => addTagToGroup(tag, group.id),
+    });
+  }
+  items.push({ label: '新建标签组…', action: () => openGroupEditor({ tags: [tag] }) });
+
+  reopenMenu(items);
+}
+
+/** 保存整份组定义；服务端会再做一次归一化与校验。 */
+async function saveTagGroups(nextGroups) {
+  const data = await api('/api/tag-groups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ groups: nextGroups }),
+  });
+
+  state.tagGroups = (data.groups ?? []).map((group) => ({ id: group.id, tags: [...group.tags] }));
+  if (data.conflicts?.length) {
+    toast(`有 ${data.conflicts.length} 个标签同时出现在两组，已保留在前一组`, 'err');
+  }
+
+  await loadSidePanel();
+  // 组变了，搜索展开的结果也变了
+  reloadAll();
+  return data;
+}
+
+async function addTagToGroup(tag, groupId) {
+  // 面板可能是旧数据（另一个窗口改过组），目标组不见了就先别动手，
+  // 否则这个标签会从原组被摘掉却没加到任何地方
+  if (!state.tagGroups.some((group) => group.id === groupId)) {
+    toast('这个标签组已经不存在，刷新面板后再试', 'err');
+    return;
+  }
+
+  const key = normTag(tag);
+  const next = state.tagGroups
+    .map((group) => {
+      const tags = group.tags.filter((member) => normTag(member) !== key);
+      if (group.id === groupId) tags.push(tag);
+      return { id: group.id, tags };
+    })
+    .filter((group) => group.tags.length >= 2);
+
+  try {
+    await saveTagGroups(next);
+    const summary = groupSummary(groupId);
+    toast(`已把「${tag}」加入${summary ? `「${summary.representative}」` : '标签组'}`);
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'err');
+  }
+}
+
+async function removeTagFromGroup(tag) {
+  const group = groupOfTag(tag);
+  if (!group) return;
+  const key = normTag(tag);
+  const next = state.tagGroups
+    .map((item) =>
+      item.id === group.id ? { id: item.id, tags: item.tags.filter((t) => normTag(t) !== key) } : item,
+    )
+    .filter((item) => item.tags.length >= 2);
+
+  try {
+    await saveTagGroups(next);
+    toast(`已从组中移出「${tag}」`);
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'err');
+  }
+}
+
+async function dissolveGroup(groupId) {
+  try {
+    await saveTagGroups(state.tagGroups.filter((group) => group.id !== groupId));
+    toast('已解散标签组');
+  } catch (err) {
+    toast(`保存失败：${err.message}`, 'err');
+  }
+}
+
+/* ── 组编辑弹窗 ─────────────────────────────────────────── */
+
+function openGroupEditor(group) {
+  state.editingGroup = {
+    id: group?.id ?? null,
+    tags: Array.isArray(group?.tags) ? [...group.tags] : [],
+  };
+  els.tgTitle.textContent = group?.id ? '编辑标签组' : '新建标签组';
+  els.tgSub.textContent = state.current ? `来源：${state.current}` : '';
+  els.tgSearch.value = '';
+  els.tgHint.hidden = true;
+  els.tgDissolve.hidden = !group?.id;
+  els.tgModal.hidden = false;
+  document.body.classList.add('bm-open');
+  renderGroupEditor();
+  els.tgSearch.focus();
+}
+
+function closeGroupEditor() {
+  els.tgModal.hidden = true;
+  state.editingGroup = null;
+  document.body.classList.remove('bm-open');
+}
+
+function renderGroupEditor() {
+  const editing = state.editingGroup;
+  if (!editing) return;
+
+  const members = new Set(editing.tags.map(normTag));
+  els.tgCount.textContent = `${editing.tags.length} 个`;
+
+  els.tgMembers.innerHTML = editing.tags
+    .map(
+      (tag, index) =>
+        `<span class="bm-chip"><span>${escapeHtml(tag)}</span>` +
+        `<button type="button" data-remove="${index}" title="移出">✕</button></span>`,
+    )
+    .join('');
+
+  // 候选取当前来源的标签；组里已有但当前来源没有的，也补进来，免得看不见
+  const candidates = state.tags.slice();
+  for (const tag of editing.tags) {
+    if (!candidates.some((item) => normTag(item.tag) === normTag(tag))) {
+      candidates.push({ tag, count: 0 });
+    }
+  }
+
+  const filter = els.tgSearch.value.trim().toLowerCase();
+  const list = filter ? candidates.filter((item) => item.tag.toLowerCase().includes(filter)) : candidates;
+
+  els.tgCandidates.innerHTML = list
+    .slice(0, 300)
+    .map(
+      (item) =>
+        `<button type="button" class="bm-tag${members.has(normTag(item.tag)) ? ' on' : ''}" ` +
+        `data-pick="${escapeHtml(item.tag)}">${escapeHtml(item.tag)}` +
+        `<i class="bm-tag-count">${item.count}</i></button>`,
+    )
+    .join('');
+}
+
+async function saveGroupEditor() {
+  const editing = state.editingGroup;
+  if (!editing) return;
+
+  if (editing.tags.length < 2) {
+    els.tgHint.hidden = false;
+    els.tgHint.textContent = '至少两个标签才能成组';
+    return;
+  }
+
+  const keys = new Set(editing.tags.map(normTag));
+  const next = state.tagGroups.map((group) => ({
+    id: group.id,
+    tags: group.id === editing.id ? editing.tags : group.tags.filter((tag) => !keys.has(normTag(tag))),
+  }));
+
+  if (!editing.id) next.push({ tags: editing.tags });
+
+  // 被摘空的组顺手丢掉；正在编辑的这组已经检查过成员数
+  const cleaned = next.filter((group) => group.id === editing.id || group.tags.length >= 2);
+
+  els.tgSave.disabled = true;
+  try {
+    await saveTagGroups(cleaned);
+    closeGroupEditor();
+    toast('标签组已保存');
+  } catch (err) {
+    els.tgHint.hidden = false;
+    els.tgHint.textContent = err.message;
+  } finally {
+    els.tgSave.disabled = false;
+  }
+}
+
+/* ── 批量迁移 ────────────────────────────────────────────── */
+
+async function openConvertDialog(tag) {
+  const group = groupOfTag(tag);
+  if (!group) return;
+
+  let total = 0;
+  try {
+    const data = await api(
+      `/api/tag-convert/plan?source=${encodeURIComponent(state.current)}&target=${encodeURIComponent(tag)}`,
+    );
+    total = data.total ?? 0;
+  } catch (err) {
+    toast(`统计失败：${err.message}`, 'err');
+    return;
+  }
+
+  state.pendingConvert = { tag, total };
+  els.tcTitle.textContent = `迁移到「${tag}」`;
+  els.tcLead.innerHTML = total
+    ? `当前来源下有 <b>${total}</b> 个作品的收藏标签包含组内同义标签，会把它们统一迁移成「${escapeHtml(tag)}」；` +
+      `只替换组内成员，作品原有的其它收藏标签保留。`
+    : '当前来源下没有需要迁移的作品。';
+  els.tcStart.disabled = total === 0;
+  els.tcModal.hidden = false;
+  document.body.classList.add('bm-open');
+}
+
+function closeConvertDialog() {
+  els.tcModal.hidden = true;
+  state.pendingConvert = null;
+  document.body.classList.remove('bm-open');
+}
+
+function renderConvertBanner(job) {
+  const prev = state.lastConvert;
+  state.lastConvert = job ?? null;
+
+  if (!job || !job.running) {
+    els.convertBanner.hidden = true;
+    els.convertFill.style.width = '0%';
+    if (prev?.running) finishConvert(prev);
+    return;
+  }
+
+  const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
+  const label = state.sources.find((item) => item.key === job.source)?.label ?? job.source;
+
+  els.convertBanner.hidden = false;
+  els.convertText.innerHTML =
+    `<b>正在迁移收藏标签</b> · ${job.done}/${job.total} · 成功 ${job.ok}` +
+    `${job.failedCount ? ` · 失败 ${job.failedCount}` : ''}` +
+    `<br><span class="muted">目标「${escapeHtml(job.target)}」· ${escapeHtml(label)}` +
+    `${job.stopRequested ? ' · 正在停止' : ''}</span>`;
+  els.convertFill.style.width = `${pct}%`;
+  els.convertStop.disabled = Boolean(job.stopRequested);
+  els.convertStop.textContent = job.stopRequested ? '正在停止…' : '停止';
+}
+
+function finishConvert(job) {
+  if (state.finishedConverts.has(job.id)) return;
+  state.finishedConverts.add(job.id);
+
+  const parts = [`迁移结束：成功 ${job.ok} / ${job.total}`];
+  if (job.failedCount) parts.push(`失败 ${job.failedCount}`);
+  if (job.aborted === 'stopped') parts.push('已手动停止');
+  if (job.aborted === 'auth') parts.push('连续鉴权 / 限流错误，已自动中止');
+  if (job.aborted === 'error') parts.push('任务异常结束');
+
+  toast(parts.join('，'), job.aborted ? 'err' : '');
+  loadSidePanel();
+  reloadAll();
+}
+
+els.tgMembers.addEventListener('click', (event) => {
+  const btn = event.target.closest('[data-remove]');
+  if (!btn || !state.editingGroup) return;
+  state.editingGroup.tags.splice(Number(btn.dataset.remove), 1);
+  renderGroupEditor();
+});
+
+els.tgCandidates.addEventListener('click', (event) => {
+  const btn = event.target.closest('[data-pick]');
+  if (!btn || !state.editingGroup) return;
+  const tag = btn.dataset.pick;
+  const key = normTag(tag);
+  const index = state.editingGroup.tags.findIndex((item) => normTag(item) === key);
+  if (index >= 0) state.editingGroup.tags.splice(index, 1);
+  else state.editingGroup.tags.push(tag);
+  renderGroupEditor();
+});
+
+els.tgSearch.addEventListener('input', renderGroupEditor);
+els.tgSave.addEventListener('click', saveGroupEditor);
+els.tgCancel.addEventListener('click', closeGroupEditor);
+els.tgClose.addEventListener('click', closeGroupEditor);
+els.tgDissolve.addEventListener('click', () => {
+  const id = state.editingGroup?.id;
+  closeGroupEditor();
+  if (id) dissolveGroup(id);
+});
+
+els.tcCancel.addEventListener('click', closeConvertDialog);
+els.tcClose.addEventListener('click', closeConvertDialog);
+els.tcStart.addEventListener('click', async () => {
+  const pending = state.pendingConvert;
+  if (!pending) return;
+
+  els.tcStart.disabled = true;
+  try {
+    const data = await api('/api/tag-convert/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: state.current, target: pending.tag }),
+    });
+    closeConvertDialog();
+
+    if (!data.started) {
+      toast(data.reason ?? '没有需要迁移的作品');
+      return;
+    }
+
+    toast(`开始迁移：共 ${data.total} 个作品`);
+    startPolling();
+    await pollQueue();
+  } catch (err) {
+    toast(`启动失败：${err.message}`, 'err');
+    els.tcStart.disabled = false;
+  }
+});
+
+els.convertStop.addEventListener('click', async () => {
+  els.convertStop.disabled = true;
+  try {
+    await api('/api/tag-convert/stop', { method: 'POST' });
+    toast('已请求停止，当前这条完成后收手');
+    await pollQueue();
+  } catch (err) {
+    toast(`停止失败：${err.message}`, 'err');
+    els.convertStop.disabled = false;
+  }
+});
+
+document.addEventListener('mousedown', (event) => {
+  if (els.sideMenu.hidden) return;
+  if (els.sideMenu.contains(event.target)) return;
+  if (event.target.closest('[data-more], [data-more-group]')) return;
+  closeSideMenu();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  if (!els.tgModal.hidden) closeGroupEditor();
+  else if (!els.tcModal.hidden) closeConvertDialog();
+  else closeSideMenu();
+});
+
+els.sideList.addEventListener('scroll', closeSideMenu, { passive: true });
+window.addEventListener('resize', closeSideMenu);
 
 let sideTimer = null;
 els.sideQuery.addEventListener('input', () => {
@@ -282,6 +998,10 @@ function buildQuery(offset) {
     sort: settings.sort,
   });
   if (state.query) params.set('q', state.query);
+  // 默认过滤器和搜索分开传，服务端用 AND 组合 —— 拼成一个字符串的话
+  // 用户写的 `a OR b` 会被外层 AND 抢走优先级。
+  const defaultFilter = String(settings.defaultFilter ?? '').trim();
+  if (defaultFilter) params.set('f', defaultFilter);
   if (state.tag) params.set('tag', state.tag);
   if (state.authorId) params.set('author_id', state.authorId);
   if (settings.sort === 'random') params.set('seed', String(state.seed));
@@ -297,6 +1017,7 @@ async function loadPage(reset) {
       state.offset = 0;
       state.records = [];
       state.cardMap.clear();
+      hoveredRecord = null; // 旧卡片已经没了，别让 L / C 指到不存在的作品
       els.grid.innerHTML = '';
       document.querySelector('.grid-wrap').scrollTop = 0;
     }
@@ -356,6 +1077,12 @@ function createCard(record) {
   card.dataset.pid = record.pid;
   renderCardInner(card, record);
   card.addEventListener('click', () => openLightbox(record, card));
+  card.addEventListener('mouseenter', () => {
+    hoveredRecord = record;
+  });
+  card.addEventListener('mouseleave', () => {
+    if (hoveredRecord === record) hoveredRecord = null;
+  });
   state.cardMap.set(String(record.pid), card);
 
   if (!state.observer) {
@@ -399,6 +1126,345 @@ const PAGES_ICON =
   '<rect x="5.5" y="4.5" width="8" height="10" rx="1.2" fill="#000" fill-opacity=".6" stroke="currentColor" stroke-width="1.3"/>' +
   '</svg>';
 
+// ---------- 评分 ----------
+
+/**
+ * 评分就是收藏标签里的 `n/10`（n = 1~10），不是独立字段。
+ * 服务端的同一套规则在 src/rating.mjs；这里只做显示和快捷修改，格式必须一致。
+ */
+const RATING_TAG_RE = /^(\d{1,2})\s*\/\s*10$/;
+
+function ratingValueOfTag(tag) {
+  const matched = RATING_TAG_RE.exec(String(tag ?? '').trim());
+  if (!matched) return 0;
+  const value = Number(matched[1]);
+  return Number.isInteger(value) && value >= 1 && value <= 10 ? value : 0;
+}
+
+function isRatingTag(tag) {
+  return ratingValueOfTag(tag) > 0;
+}
+
+/** 从记录里取评分；没有就是 0。 */
+function ratingValueOf(record) {
+  for (const tag of record?.bookmark_tags ?? []) {
+    const value = ratingValueOfTag(tag);
+    if (value) return value;
+  }
+  return 0;
+}
+
+/**
+ * 十个档位各自一个色相：1 红 → 4 橙 → 5~7 黄（相邻档差别小，本来就都在「黄区」），
+ * 8 绿、9 青、10 亮青 —— 高分段是最常用的，色相间隔拉大了好一眼区分。
+ *
+ * 10 除了颜色，还有额外的高光（`.stars.max` 的辉光和呼吸动画）。
+ */
+const RATING_COLORS = {
+  1: '#ff4d5a',
+  2: '#ff6b45',
+  3: '#ff8a3d',
+  4: '#ffab3d',
+  5: '#ffd23f',
+  6: '#f0e63a',
+  7: '#dbe63d',
+  8: '#57d97c',
+  9: '#2fd6cf',
+  10: '#9ff6ff',
+};
+
+function ratingHex(value) {
+  const key = Math.round(Number(value) || 0);
+  return RATING_COLORS[key] ?? RATING_COLORS[5];
+}
+
+/** #rrggbb → rgba(...)，用来给标签做半透明底色。 */
+function withAlpha(hex, alpha) {
+  const text = String(hex).replace('#', '');
+  const full =
+    text.length === 3
+      ? text
+          .split('')
+          .map((ch) => ch + ch)
+          .join('')
+      : text;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function ratingColor(value, kind = 'text') {
+  const hex = ratingHex(value);
+  return kind === 'bg' ? withAlpha(hex, 0.16) : hex;
+}
+
+/** 评分标签的内联样式：卡片、详情面板、阅读器、编辑弹窗统一用它。 */
+function ratingTagInline(value) {
+  if (!value) return '';
+  // 10 分额外加一点光，和 9 分拉开距离
+  const glow = Number(value) === 10 ? `;text-shadow:0 0 7px ${withAlpha(ratingHex(10), 0.55)}` : '';
+  return `color:${ratingColor(value, 'text')};background:${ratingColor(value, 'bg')}${glow}`;
+}
+
+/**
+ * 5 颗星 = 10 分，每颗星 2 分。奇数分靠半颗星表示：
+ * 7 分 = 三颗满星 + 第四颗半星。
+ *
+ * 用同一个字符叠两层（底色 + 裁剪后的彩色层）而不是 SVG，是为了两层像素级对齐。
+ */
+function starsHtml(rating, { pid = '', small = false, clear = true } = {}) {
+  const value = Number(rating) || 0;
+  const stars = [1, 2, 3, 4, 5]
+    .map((index) => {
+      const fill = Math.max(0, Math.min(2, value - (index - 1) * 2)) * 50;
+      return (
+        `<button type="button" class="star" data-star="${index}" style="--fill:${fill}%"` +
+        ` aria-label="${index * 2 - 1} 或 ${index * 2} 分"` +
+        ` title="左半 ${index * 2 - 1} 分 · 右半 ${index * 2} 分">` +
+        '<i class="star-base">★</i><i class="star-fill">★</i></button>'
+      );
+    })
+    .join('');
+
+  const clearButton = clear
+    ? `<button type="button" class="star-clear" title="清除评分" aria-label="清除评分"${
+        value ? '' : ' hidden'
+      }>×</button>`
+    : '';
+
+  return (
+    `<div class="stars${small ? ' small' : ''}${value ? ' rated' : ''}${
+      value === 10 ? ' max' : ''
+    }" data-rating="${value}"` +
+    ` data-pid="${escapeHtml(pid)}" style="--rc:${value ? ratingColor(value) : 'transparent'}"` +
+    ` role="group" aria-label="${value ? `评分 ${value} 分，满分 10 分` : '未评分'}">` +
+    `${stars}${clearButton}</div>`
+  );
+}
+
+/**
+ * 让一排星星可点击。点左半边给奇数分、右半边给偶数分，悬停实时预览。
+ *
+ * 只负责画，不改数据 —— 真正写 pixiv 的是 setRating，成功返回后才重画。
+ */
+function bindStars(container, getValue, onPick) {
+  if (!container) return;
+
+  const paint = (value) => {
+    container.dataset.rating = String(value);
+    container.classList.toggle('rated', value > 0);
+    // 10 分多一层辉光，预览到 10 分时也要能提前看到
+    container.classList.toggle('max', Number(value) === 10);
+    container.style.setProperty('--rc', value ? ratingColor(value) : 'transparent');
+    for (const star of container.querySelectorAll('.star')) {
+      const index = Number(star.dataset.star);
+      const fill = Math.max(0, Math.min(2, value - (index - 1) * 2)) * 50;
+      star.style.setProperty('--fill', `${fill}%`);
+    }
+    const clear = container.querySelector('.star-clear');
+    if (clear) clear.hidden = !value;
+  };
+
+  const valueAt = (event, star) => {
+    const rect = star.getBoundingClientRect();
+    // 点左半边 = 奇数分，右半边 = 偶数分
+    const half = event.clientX - rect.left < rect.width / 2 ? 1 : 2;
+    return (Number(star.dataset.star) - 1) * 2 + half;
+  };
+
+  container.addEventListener('mousemove', (event) => {
+    const star = event.target.closest('.star');
+    if (!star) {
+      paint(getValue());
+      return;
+    }
+    paint(valueAt(event, star));
+  });
+
+  // 失败时要把悬停预览抹掉，恢复成记录里真实的分数
+  container._paint = paint;
+
+  container.addEventListener('mouseleave', () => paint(getValue()));
+
+  container.addEventListener('click', (event) => {
+    event.stopPropagation(); // 卡片上的星星不能顺带打开大图
+
+    if (event.target.closest('.star-clear')) {
+      onPick(0);
+      return;
+    }
+    const star = event.target.closest('.star');
+    if (!star) return;
+    onPick(valueAt(event, star));
+  });
+}
+
+/** 一次只改一个作品，避免连点星星把请求叠起来。 */
+const ratingBusy = new Set();
+
+function ratingRows(pid) {
+  return document.querySelectorAll(`.stars[data-pid="${CSS.escape(String(pid))}"]`);
+}
+
+function markRatingBusy(pid, busy) {
+  for (const row of ratingRows(pid)) {
+    row.classList.toggle('busy', busy);
+    row.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+}
+
+/** 把同一作品的所有星星重画成真实分数（清掉悬停预览 / 乐观假象）。 */
+function repaintRatingRows(pid, value) {
+  for (const row of ratingRows(pid)) row._paint?.(value);
+}
+
+/** 把接口返回的结果写进内存记录（只有服务端确认成功后才调用）。 */
+function applyBookmarkResult(record, data) {
+  if (Array.isArray(data.tags)) record.bookmark_tags = data.tags;
+  if (data.source) record.source = data.source;
+  if (data.id !== undefined) record.id = data.id;
+  record.private_bookmark = /Private$/.test(record.source ?? '') ? 'yes' : 'no';
+}
+
+async function setRating(record, value) {
+  const pid = String(record.pid);
+  if (ratingBusy.has(pid)) return;
+
+  const current = ratingValueOf(record);
+  if (value === current) return; // 点当前分数不算改动，别白发请求
+
+  ratingBusy.add(pid);
+  markRatingBusy(pid, true);
+  try {
+    const data = await api('/api/bookmark/rating', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pid: record.pid, source: record.source, rating: value }),
+    });
+
+    applyBookmarkResult(record, data);
+    if (!data.moved) toast(value ? `评分已设为 ${value}/10` : '已清除评分');
+    await afterBookmarkSaved(record, data.moved);
+  } catch (err) {
+    // 没成功就别让画面停在「已打分」的预览上
+    repaintRatingRows(pid, ratingValueOf(record));
+
+    if (err.data?.code === 'TAGS_FULL') {
+      // 10 个标签已满，且原来没有评分 —— 让用户挑一个删掉
+      openRatingTagPicker(record, value, err.data.tags ?? []);
+    } else {
+      toast(`评分没改成：${err.message}`, 'warn');
+    }
+  } finally {
+    ratingBusy.delete(pid);
+    markRatingBusy(pid, false);
+  }
+}
+
+/* ── 标签已满：挑一个删，同时写入评分 ──────────────────── */
+
+let pickState = null;
+let pickBusy = false;
+
+function setPickStatus(text, tone = 'ok') {
+  els.bmPickStatus.textContent = text;
+  els.bmPickStatus.className = `bm-status ${tone}`;
+  els.bmPickStatus.hidden = !text;
+}
+
+function renderPickList(tags) {
+  els.bmPickList.innerHTML = tags
+    .map((tag) => {
+      const style = ratingTagInline(ratingValueOfTag(tag));
+      return (
+        `<button type="button" class="bm-pick-tag" data-tag="${escapeHtml(tag)}"${
+          style ? ` style="${style}"` : ''
+        }>${escapeHtml(tag)}<span class="bm-pick-del">删除</span></button>`
+      );
+    })
+    .join('');
+}
+
+function openRatingTagPicker(record, rating, tags) {
+  pickState = { record, rating, tags: [...tags] };
+  pickBusy = false;
+  els.bmPickLead.textContent = `收藏标签已经有 10 个了。要给这个作品打 ${rating}/10，先点一个标签删掉：`;
+  setPickStatus('');
+  renderPickList(tags);
+  els.bmPick.hidden = false;
+  document.body.classList.add('bm-open');
+}
+
+function closeRatingTagPicker() {
+  if (pickBusy) return;
+  els.bmPick.hidden = true;
+  document.body.classList.remove('bm-open');
+  pickState = null;
+}
+
+async function pickDropTag(tag) {
+  const state = pickState;
+  if (!state || pickBusy) return;
+
+  pickBusy = true;
+  for (const button of els.bmPickList.querySelectorAll('button')) button.disabled = true;
+  setPickStatus(`正在写入 pixiv：删掉「${tag}」并打 ${state.rating}/10…`, 'busy');
+
+  try {
+    const data = await api('/api/bookmark/rating', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pid: state.record.pid,
+        source: state.record.source,
+        rating: state.rating,
+        drop: tag,
+      }),
+    });
+
+    els.bmPick.hidden = true;
+    document.body.classList.remove('bm-open');
+    pickState = null;
+
+    applyBookmarkResult(state.record, data);
+    toast(`已评分 ${data.rating}/10，删掉了「${tag}」`);
+    await afterBookmarkSaved(state.record, data.moved);
+  } catch (err) {
+    if (err.data?.code === 'TAGS_FULL') {
+      // 期间网站在别处又加了标签，刷新列表再来一次
+      state.tags = err.data.tags ?? state.tags;
+      renderPickList(state.tags);
+      setPickStatus('标签还是满的，再挑一个', 'err');
+    } else {
+      setPickStatus(`失败：${err.message}`, 'err');
+    }
+  } finally {
+    pickBusy = false;
+    if (!els.bmPick.hidden) {
+      for (const button of els.bmPickList.querySelectorAll('button')) button.disabled = false;
+    }
+  }
+}
+
+/**
+ * 收藏标签的全局使用次数（服务端算好，键是转小写后的标签）。
+ *
+ * 卡片上只有 4 个标签位，顺序按「这个标签在我的收藏里出现过多少次」排，
+ * 让最常用的分类优先露出来；同次数时保持记录里的原始顺序（sort 是稳定的）。
+ */
+const tagUsage = new Map();
+
+async function loadTagUsage() {
+  try {
+    const data = await api('/api/tag-usage');
+    tagUsage.clear();
+    for (const [tag, count] of Object.entries(data.usage ?? {})) tagUsage.set(tag, count);
+  } catch {
+    /* 拿不到就按原顺序排，不影响浏览 */
+  }
+}
+
 function renderCardInner(card, record) {
   const firstPage = record.localPages?.[0] ?? 0;
   const isNovel = record.type === 'novel';
@@ -416,9 +1482,7 @@ function renderCardInner(card, record) {
   const pageBadge =
     !isNovel && record.type !== 'ugoira' && totalPages > 1
       ? `<span class="badge pages" title="共 ${totalPages} 页">${PAGES_ICON}<b>${totalPages}</b></span>`
-      : '';
-
-  let frame;
+      : '';  let frame;
   if (record.hasImage && downloadable) {
     frame = `<img data-src="${thumbUrl(record, firstPage)}" alt="">`;
   } else if (isNovel && record.hasCover) {
@@ -440,7 +1504,12 @@ function renderCardInner(card, record) {
 
   const spinner = record.downloading ? '<div class="spinner">下载中</div>' : '';
 
-  const ownAll = settings.showOwnTags ? record.bookmark_tags ?? [] : [];
+  const rating = ratingValueOf(record);
+  // 开了评分指示器就把评分标签让出标签位：星星已经表达了同一件事，
+  // 没必要再占卡片上有限的 4 个格子
+  const ownAll = settings.showOwnTags
+    ? (record.bookmark_tags ?? []).filter((tag) => !(settings.showRating && isRatingTag(tag)))
+    : [];
   const worksAll = settings.showTags ? record.tags ?? [] : [];
 
   // 同一个标签可能既是收藏标签又是作品标签。两处都显示时只保留收藏标签那一份，
@@ -449,25 +1518,56 @@ function renderCardInner(card, record) {
   const ownKeys = new Set(ownAll.map(key));
   const worksUnique = worksAll.filter((tag) => !ownKeys.has(key(tag)));
 
-  const own = ownAll.slice(0, 4);
+  // 标签位优先给用得最多的收藏标签
+  const own = [...ownAll]
+    .sort((a, b) => (tagUsage.get(key(b)) ?? 0) - (tagUsage.get(key(a)) ?? 0))
+    .slice(0, 4);
   const works = worksUnique.slice(0, 3);
   const tagHtml =
     own.length || works.length
       ? `<div class="card-tags">${own
-          .map((t) => `<span class="card-tag own">${escapeHtml(t)}</span>`)
+          .map((t) => {
+            const style = ratingTagInline(ratingValueOfTag(t));
+            return `<span class="card-tag own"${style ? ` style="${style}"` : ''}>${escapeHtml(t)}</span>`;
+          })
           .join('')}${works
           .map((t) => `<span class="card-tag">${escapeHtml(t)}</span>`)
           .join('')}</div>`
       : '';
 
+  // 星星和标题 / 作者同一个容器：没开「信息叠在图上」时它就落在封面外面，
+  // 开了之后跟着整块信息区一起压到图底，不会再和文字打架
+  const ratingBadge = settings.showRating
+    ? `<div class="card-rating${rating ? ' rated' : ''}">${starsHtml(rating, {
+        pid: record.pid,
+        small: true,
+        clear: false, // 卡片上不给 ×，清除去详情面板
+      })}</div>`
+    : '';
+
   card.innerHTML = `
-    <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${pageBadge}${spinner}</div>
+    <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${pageBadge}${spinner}<button class="card-copy" type="button" title="复制作品链接 (L)" aria-label="复制作品链接">${COPY_ICON}</button></div>
     <div class="info">
       <div class="title">${escapeHtml(record.title || '(无题)')}</div>
-      <div class="sub"><span class="author-name">${escapeHtml(record.author || '未知')}</span></div>
+      <div class="sub"><span class="author-name">${escapeHtml(record.author || '未知')}</span>${ratingBadge}</div>
       ${tagHtml}
     </div>
   `;
+
+  // 星星要单独绑：每次重渲染都会重建 DOM
+  bindStars(
+    card.querySelector('.card-rating .stars'),
+    () => ratingValueOf(record),
+    (value) => setRating(record, value),
+  );
+
+  const copyBtn = card.querySelector('.card-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', (event) => {
+      event.stopPropagation(); // 别顺带打开大图
+      copyLink(record);
+    });
+  }
 
   const authorEl = card.querySelector('.author-name');
   if (authorEl && record.author_id) {
@@ -545,7 +1645,13 @@ async function pollQueue() {
     applyQueueState(snapshot.queue);
     renderDownloadPanel(snapshot);
 
-    if (!snapshot.queue.running && snapshot.queue.pending === 0 && !snapshot.queue.active) {
+    // 休息中也要继续轮询，否则横幅上的倒计时会停在原地不动
+    const paused = Boolean(snapshot.queue.pacer?.paused);
+    // 批量转换在跑时同样不能停轮询，否则顶部进度条会僵住
+    const converting = Boolean(snapshot.convert?.running);
+    if (converting) startPolling();
+
+    if (!snapshot.queue.running && inFlightCount(snapshot.queue) === 0 && !paused && !converting) {
       idleTicks += 1;
       if (idleTicks >= 3) stopPolling();
     } else {
@@ -554,6 +1660,14 @@ async function pollQueue() {
   } catch {
     stopPolling();
   }
+}
+
+/**
+ * 在飞任务数：作品任务和单页任务都在同一条队列里，服务端直接给一个数。
+ * 顶栏和右栏都用它，口径一致。
+ */
+function inFlightCount(q) {
+  return q.pending + (q.activeCount ?? (q.active ? 1 : 0));
 }
 
 function applyQueueState(snapshot) {
@@ -594,6 +1708,8 @@ function applyQueueState(snapshot) {
 
 function renderDownloadPanel(data) {
   renderGuardBanner(data.guard);
+  renderPacerBanner(data.queue?.pacer);
+  renderConvertBanner(data.convert);
 
   const sum = data.sources.reduce(
     (acc, s) => {
@@ -617,14 +1733,19 @@ function renderDownloadPanel(data) {
   `;
 
   const q = data.queue;
-  const inFlight = (q.active ? 1 : 0) + q.pending;
+  // 队列里作品任务和单页任务混在一起，计数只有一个 —— 不再区分「补页」
+  const inFlight = inFlightCount(q);
+
+  // 进度条按已完成 /（已完成 + 在飞）算
   const base = q.processed + inFlight;
   els.dlBar.style.width = `${base > 0 ? Math.round((q.processed / base) * 100) : 0}%`;
 
   const bits = [];
+  // 休息中先说这件事，否则「没有进度」看着像卡住了
+  if (q.pacer?.paused) bits.push(`<span class="now">☾ 休息 ${formatCountdown(q.pacer.remainingMs)}</span>`);
   if (q.active) bits.push(`<span class="now">● ${q.active}</span>`);
   if (q.pending > 0) bits.push(`队列 ${q.pending}`);
-  if (q.processed > 0) bits.push(`本次完成 ${q.processed} 个作品`);
+  if (q.processed > 0) bits.push(`本次完成 ${q.processed} 项`);
   if (q.failedCount > 0) bits.push(`失败 ${q.failedCount}`);
   els.dlMeta.innerHTML = bits.length ? bits.join(' · ') : '队列空闲';
 
@@ -632,6 +1753,11 @@ function renderDownloadPanel(data) {
   els.queueState.textContent = inFlight ? `队列 ${inFlight}` : '';
 
   els.dlAll.disabled = inFlight > 0;
+  const anyFirstMissing = data.sources.some((s) => (s.firstMissing ?? 0) > 0);
+  els.dlFirst.disabled = inFlight > 0 || !anyFirstMissing;
+  els.dlFirst.title = anyFirstMissing
+    ? '每个作品只下载第一页，已有任意一页的作品跳过'
+    : '所有作品都已有首张，暂时不用补';
   els.dlClear.disabled = q.pending === 0 && !q.active;
 
   els.dlSources.innerHTML = data.sources
@@ -639,11 +1765,17 @@ function renderDownloadPanel(data) {
       // 按来源也按页显示，鼠标悬停给出作品数
       const missingPages = s.pages?.missing ?? s.missing;
       const title = `${s.label}：${s.pages?.done ?? 0}/${s.pages?.total ?? 0} 页 · ${s.done}/${s.total} 个作品`;
+      const empty = missingPages === 0;
+      // 首张缺口：一个作品都没有首图时，右边那个「首页」按钮就没必要点亮
+      const noFirst = s.firstMissing ?? 0;
       return `
-      <button data-source="${s.key}" ${missingPages === 0 ? 'disabled' : ''} title="${escapeHtml(title)}">
-        <span>${escapeHtml(s.label)}</span>
-        <span class="n">${missingPages === 0 ? '✓' : missingPages}</span>
-      </button>`;
+      <div class="dl-source-row">
+        <button data-source="${s.key}" ${empty ? 'disabled' : ''} title="${escapeHtml(title)}">
+          <span>${escapeHtml(s.label)}</span>
+          <span class="n">${empty ? '✓' : missingPages}</span>
+        </button>
+        <button class="dl-source-first" data-source-first="${s.key}" ${noFirst === 0 ? 'disabled' : ''} title="只下载「${escapeHtml(s.label)}」里每个作品的第一页（${noFirst} 个作品还缺首张）">首页</button>
+      </div>`;
     })
     .join('');
 
@@ -667,6 +1799,31 @@ els.dlAll.addEventListener('click', async () => {
   }
 });
 
+/**
+ * 批量「只下首页」：source 为空表示所有来源。
+ *
+ * 服务端按 mode=first 只给「一张图都还没有」的作品排队，已经下过首张的直接跳过，
+ * 所以重复点也不会白跑。
+ */
+async function enqueueFirstPages(source, btn) {
+  btn?.setAttribute('disabled', '');
+  try {
+    const qs = new URLSearchParams({ mode: 'first' });
+    if (source) qs.set('source', source);
+    const data = await api(`/api/enqueue-all?${qs.toString()}`, { method: 'POST' });
+    // 被守卫拦下时队列不会动，直接刷新一次状态把横幅显示出来
+    if (data.blocked) {
+      await pollQueue();
+      return;
+    }
+    startPolling();
+  } catch {
+    btn?.removeAttribute('disabled');
+  }
+}
+
+els.dlFirst.addEventListener('click', () => enqueueFirstPages(null, els.dlFirst));
+
 els.dlClear.addEventListener('click', async () => {
   try {
     const data = await api('/api/queue/clear', { method: 'POST' });
@@ -686,6 +1843,13 @@ els.dlVerify.addEventListener('click', async () => {
 });
 
 els.dlSources.addEventListener('click', async (event) => {
+  // 每行右边那个「首页」小按钮：只补这个来源的首张
+  const firstBtn = event.target.closest('button[data-source-first]');
+  if (firstBtn) {
+    await enqueueFirstPages(firstBtn.dataset.sourceFirst, firstBtn);
+    return;
+  }
+
   const btn = event.target.closest('button[data-source]');
   if (!btn) return;
   btn.disabled = true;
@@ -719,6 +1883,9 @@ const lb = {
 };
 
 let stripPid = null;
+
+// 网格里鼠标停在哪张卡片上 —— L / C 在非大图状态下操作这张
+let hoveredRecord = null;
 
 async function openLightbox(record, card) {
   if (record.type === 'novel') {
@@ -771,12 +1938,16 @@ function prefetchPages(record) {
   }
   if (missing.length === 0) return;
 
+  // 这些页会进服务端那条统一的下载队列（单页任务插队），开着轮询面板上的
+  // 「队列」和「已下载页」才会实时变
+  startPolling();
 
   (async () => {
     for (const page of missing) {
       try {
-        await fetch(`/api/full/${record.pid}/${page}`);
-        record.localPages = [...(record.localPages ?? []), page];
+        const res = await fetch(`/api/full/${record.pid}/${page}`);
+        // 只有真的拿到图才算本地有这一页；队列被清空或额度用尽时会返回 5xx
+        if (res.ok) record.localPages = [...(record.localPages ?? []), page];
       } catch {
         /* 单页失败不影响其他页 */
       }
@@ -785,6 +1956,8 @@ function prefetchPages(record) {
       stripPid = null;
       renderPageStrip(record, total, lb.index);
     }
+    // 收尾再取一次统计，让「已下载 / 待下载」跟上（轮询可能已经因为空闲停了）
+    void pollQueue();
   })();
 }
 
@@ -839,6 +2012,8 @@ function renderInfoPanel(record) {
   if (record.type === 'ugoira') chips.push('<span class="chip-tag type">动图</span>');
   if (record.removed === 'yes') chips.push('<span class="chip-tag">已取消收藏</span>');
   else if (record.status === 'unavailable') chips.push('<span class="chip-tag">作品已失效</span>');
+  // 公开 / 私密是收藏本身的属性，放在这里比藏在来源标签页里直观
+  if (/Private$/.test(record.source ?? '')) chips.push('<span class="chip-tag private">私密收藏</span>');
 
   const dims = record.width && record.height ? `${record.width} × ${record.height}` : '';
   const pagesText = Number(record.pages) > 1 ? `${record.pages} 页` : '';
@@ -865,11 +2040,39 @@ function renderInfoPanel(record) {
   if (chips.length) html += `<div class="chips">${chips.join('')}</div>`;
   if (metaLine) html += `<div style="color:var(--muted);margin-bottom:10px">${escapeHtml(metaLine)}</div>`;
 
-  if (owned.length) {
-    html += `<div class="section">我的收藏标签</div><div class="taglist">${owned
-      .map((t) => `<span class="tag owned">${escapeHtml(t)}</span>`)
-      .join('')}</div>`;
-  }
+  // 收藏标签是唯一能改的东西，所以标题右边直接挂入口；不能编辑的记录就不给按钮
+  const editable = record.removed !== 'yes' && record.status !== 'unavailable';
+
+  // 评分：星星可以直接点着改。左右半边分别对应奇数 / 偶数分
+  const rating = ratingValueOf(record);
+  const scoreStyle = rating
+    ? `color:${ratingColor(rating)}${
+        rating === 10 ? `;text-shadow:0 0 8px ${withAlpha(ratingHex(10), 0.6)}` : ''
+      }`
+    : '';
+  html += `<div class="section section-row"><span>评分</span><span class="rating-score"${
+    scoreStyle ? ` style="${scoreStyle}"` : ''
+  }>${rating ? `${rating}/10` : '未评分'}</span></div>`;
+  html += `<div class="panel-rating${editable ? '' : ' readonly'}">${starsHtml(rating, {
+    pid: record.pid,
+  })}</div>`;
+
+  html += `<div class="section section-row"><span>我的收藏标签</span>${
+    editable
+      ? `<button type="button" class="section-btn" data-edit-bookmark="${escapeHtml(
+          record.pid,
+        )}" title="编辑收藏标签与公开状态 (E)">编辑</button>`
+      : ''
+  }</div>`;
+
+  html += owned.length
+    ? `<div class="taglist">${owned
+        .map((t) => {
+          const style = ratingTagInline(ratingValueOfTag(t));
+          return `<span class="tag owned"${style ? ` style="${style}"` : ''}>${escapeHtml(t)}</span>`;
+        })
+        .join('')}</div>`
+    : '<div class="empty-note">还没有打收藏标签</div>';
 
   if (tags.length) {
     html += `<div class="section">作品标签 ${tags.length}</div><div class="taglist">${tags
@@ -889,17 +2092,41 @@ function renderInfoPanel(record) {
   }
 
   els.lbPanel.innerHTML = html;
+
+  // 星星在面板里是常驻的；记录不可编辑时才退化成只读展示
+  if (editable) {
+    bindStars(
+      els.lbPanel.querySelector('.panel-rating .stars'),
+      () => ratingValueOf(record),
+      (value) => setRating(record, value),
+    );
+  }
 }
 
 els.lbPanel.addEventListener('click', (event) => {
-  const title = event.target.closest('h3[data-open]');
-  if (title && title.dataset.open) {
-    window.open(title.dataset.open, '_blank', 'noopener');
+  // 「编辑」按钮：改收藏标签 / 公开状态
+  if (event.target.closest('[data-edit-bookmark]')) {
+    openBookmarkEditor(lb.record);
     return;
   }
+
+  const title = event.target.closest('h3[data-open]');
+  if (title && title.dataset.open) {
+    openExternal(title.dataset.open);
+    return;
+  }
+
+  // pid 链接是 <a target="_blank">，默认会在 Edge 里开，这里拦下来交给系统浏览器
+  const pidLink = event.target.closest('a.pid-link');
+  if (pidLink) {
+    event.preventDefault();
+    openExternal(pidLink.getAttribute('href'));
+    return;
+  }
+
   const author = event.target.closest('[data-author-page]');
   if (author && author.dataset.authorPage) {
-    window.open(author.dataset.authorPage, '_blank', 'noopener');
+    openExternal(author.dataset.authorPage);
   }
 });
 
@@ -1118,20 +2345,32 @@ window.addEventListener('resize', () => {
 });
 
 els.lbClose.addEventListener('click', closeLightbox);
+els.lbCopy.addEventListener('click', () => copyLink(lb.record));
 els.lbPrev.addEventListener('click', () => stepRecord(-1));
 els.lbNext.addEventListener('click', () => stepRecord(1));
 
 // ---------- 小说阅读器 ----------
 
+let readerRecord = null;
+
+/** 阅读器左侧的收藏标签。编辑完成后要单独重画，所以抽出来。 */
+function renderReaderTags(record) {
+  els.rdTags.innerHTML = (record.bookmark_tags ?? [])
+    .map((t) => {
+      const style = ratingTagInline(ratingValueOfTag(t));
+      return `<span${style ? ` style="${style}"` : ''}>${escapeHtml(t)}</span>`;
+    })
+    .join('');
+}
+
 async function openReader(record, card) {
+  readerRecord = record;
   els.reader.hidden = false;
   document.body.style.overflow = 'hidden';
 
   els.rdTitle.textContent = record.title || '(无题)';
   els.rdAuthor.textContent = record.author || '未知作者';
-  els.rdTags.innerHTML = (record.bookmark_tags ?? [])
-    .map((t) => `<span>${escapeHtml(t)}</span>`)
-    .join('');
+  renderReaderTags(record);
   els.rdLink.href = record.url || '#';
   els.rdCoverBox.innerHTML = '<span>加载中…</span>';
   els.rdBody.innerHTML = '<div class="rd-loading">正在读取正文…</div>';
@@ -1157,6 +2396,496 @@ function closeReader() {
 }
 
 els.rdClose.addEventListener('click', closeReader);
+
+// ---------- 编辑收藏 ----------
+
+/**
+ * 编辑收藏对话框。
+ *
+ * 只负责收集输入，真正的顺序保证在服务端：写 pixiv 成功（200）→ 才改本地。
+ * 所以这里失败时**不能**先改 record 再等响应 —— 只有 200 才动内存里的对象。
+ *
+ * 打开时用本地数据填（秒开），想核对网站上此刻的状态就点「从 pixiv 读取」。
+ */
+const bm = {
+  record: null,
+  kind: 'illust',
+  tags: [],
+  isPrivate: false,
+  workTags: [],
+  myTags: [],
+  limit: 10,
+  saving: false,
+  filter: '',
+};
+
+/** 和 pixiv 输入框一致：空格 / 逗号 / 顿号 / 分号都当分隔符。 */
+function splitTagText(raw) {
+  return String(raw)
+    .split(/[,，、;；\s]+/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+}
+
+function isVisibleBookmark(record) {
+  return record && record.removed !== 'yes' && record.status !== 'unavailable';
+}
+
+function setBmStatus(text, tone = 'ok') {
+  const el = els.bmStatus;
+  if (!el) return;
+  el.textContent = text;
+  el.className = `bm-status ${tone}`;
+  el.hidden = !text;
+  clearTimeout(setBmStatus.timer);
+  if (text && tone === 'ok') {
+    setBmStatus.timer = setTimeout(() => {
+      el.hidden = true;
+    }, 4000);
+  }
+}
+
+function showBmHint(text, isError = false) {
+  const el = els.bmHint;
+  el.textContent = text;
+  el.classList.toggle('err', isError);
+  el.hidden = !text;
+  clearTimeout(showBmHint.timer);
+  if (text) {
+    showBmHint.timer = setTimeout(() => {
+      el.hidden = true;
+    }, 2600);
+  }
+}
+
+function updateBmSaveState() {
+  if (!els.bmSave) return;
+  els.bmSave.disabled = bm.saving;
+  els.bmSave.textContent = bm.saving ? '保存中…' : '保存';
+  els.bmFetch.disabled = bm.saving;
+}
+
+function renderBmChips() {
+  for (const old of els.bmTagInput.querySelectorAll('.bm-chip')) old.remove();
+
+  const frag = document.createDocumentFragment();
+  for (const tag of bm.tags) {
+    const chip = document.createElement('span');
+    const rating = ratingValueOfTag(tag);
+    chip.className = `bm-chip${rating ? ' rating' : ''}`;
+    if (rating) chip.setAttribute('style', ratingTagInline(rating));
+    chip.innerHTML = `<span>${escapeHtml(tag)}</span><button type="button" aria-label="移除 ${escapeHtml(
+      tag,
+    )}">×</button>`;
+    chip.querySelector('button').addEventListener('click', () => {
+      bm.tags = bm.tags.filter((item) => item !== tag);
+      renderBmChips();
+      syncBmClouds();
+    });
+    frag.appendChild(chip);
+  }
+  els.bmTagInput.insertBefore(frag, els.bmTagEntry);
+
+  els.bmCount.textContent = `${bm.tags.length} / ${bm.limit}`;
+  els.bmTagEntry.placeholder =
+    bm.tags.length >= bm.limit ? '已达上限' : '输入标签后回车';
+  syncBmClouds();
+  updateBmSaveState();
+}
+
+/** 只切换云里标签的选中样式，不重建 DOM（否则点到一半会闪）。 */
+function syncBmClouds() {
+  const set = new Set(bm.tags);
+  for (const cloud of [els.bmWorkTags, els.bmMineTags]) {
+    if (!cloud) continue;
+    for (const btn of cloud.querySelectorAll('.bm-tag')) {
+      btn.classList.toggle('on', set.has(btn.dataset.tag));
+    }
+  }
+}
+
+function renderBmWorkTags() {
+  const tags = bm.workTags ?? [];
+  els.bmWorkTags.innerHTML = tags
+    .map((tag) => {
+      const style = ratingTagInline(ratingValueOfTag(tag));
+      return `<button type="button" class="bm-tag${style ? ' rating' : ''}" data-tag="${escapeHtml(
+        tag,
+      )}"${style ? ` style="${style}"` : ''}>${escapeHtml(tag)}</button>`;
+    })
+    .join('');
+  syncBmClouds();
+}
+
+function renderBmMine() {
+  const keyword = bm.filter.trim().toLowerCase();
+  const list = keyword
+    ? bm.myTags.filter((item) => item.tag.toLowerCase().includes(keyword))
+    : bm.myTags;
+
+  // 标签可能有几百个，先只铺前 300 个；搜索框能把范围缩小
+  const shown = list.slice(0, 300);
+  els.bmMineTags.innerHTML = shown
+    .map((item) => {
+      const style = ratingTagInline(ratingValueOfTag(item.tag));
+      return `<button type="button" class="bm-tag${style ? ' rating' : ''}" data-tag="${escapeHtml(
+        item.tag,
+      )}" title="${escapeHtml(item.tag)} · ${item.count} 个作品"${
+        style ? ` style="${style}"` : ''
+      }>${escapeHtml(item.tag)}<i class="bm-tag-count">${item.count}</i></button>`;
+    })
+    .join('');
+
+  els.bmMineCount.textContent = keyword
+    ? `${list.length} / ${bm.myTags.length}`
+    : `共 ${bm.myTags.length} 个${list.length > shown.length ? ` · 显示前 ${shown.length}` : ''}`;
+  syncBmClouds();
+}
+
+/**
+ * 加标签。评分是唯一的：加新的评分会顶掉旧的，而不是并存两个 `n/10`。
+ * 标签已满时（且没有评分可顶替）直接拒绝，避免提交 11 个上去。
+ */
+function addBmTag(tag) {
+  const value = String(tag ?? '').trim();
+  if (!value || bm.tags.includes(value)) return;
+
+  if (isRatingTag(value)) {
+    const rest = bm.tags.filter((item) => !isRatingTag(item));
+    if (rest.length >= bm.limit) {
+      showBmHint(`收藏标签最多 ${bm.limit} 个`, true);
+      return;
+    }
+    bm.tags = rest;
+  } else if (bm.tags.length >= bm.limit) {
+    showBmHint(`收藏标签最多 ${bm.limit} 个`, true);
+    return;
+  }
+
+  bm.tags.push(value);
+  renderBmChips();
+}
+
+function addBmTags(list) {
+  for (const tag of list) addBmTag(tag);
+}
+
+function toggleBmTag(tag) {
+  if (!tag) return;
+
+  const index = bm.tags.indexOf(tag);
+  if (index >= 0) {
+    bm.tags.splice(index, 1);
+  } else if (isRatingTag(tag)) {
+    const rest = bm.tags.filter((item) => !isRatingTag(item));
+    if (rest.length >= bm.limit) {
+      showBmHint(`收藏标签最多 ${bm.limit} 个`, true);
+      return;
+    }
+    bm.tags = [...rest, tag];
+  } else if (bm.tags.length >= bm.limit) {
+    showBmHint(`收藏标签最多 ${bm.limit} 个`, true);
+    return;
+  } else {
+    bm.tags.push(tag);
+  }
+
+  renderBmChips();
+  syncBmClouds();
+}
+
+function commitBmEntry() {
+  const raw = els.bmTagEntry.value;
+  if (!raw.trim()) return false;
+  els.bmTagEntry.value = '';
+  addBmTags(splitTagText(raw));
+  return true;
+}
+
+function syncBmRestrict() {
+  for (const input of els.bmRestrict.querySelectorAll('input[name="bm-restrict"]')) {
+    input.checked = input.value === (bm.isPrivate ? '1' : '0');
+  }
+}
+
+function thumbForBm(record) {
+  if (record.type === 'novel') return record.hasCover ? `/api/cover/${record.pid}` : '';
+  if (record.hasImage) return `/api/thumb/${record.pid}/0?w=96`;
+  return record.hasCover ? `/api/cover/${record.pid}` : '';
+}
+
+async function openBookmarkEditor(record) {
+  if (!record) return;
+  if (!isVisibleBookmark(record)) {
+    toast('这条收藏已取消或作品已失效，不能编辑', 'warn');
+    return;
+  }
+
+  bm.record = record;
+  bm.kind = record.type === 'novel' ? 'novel' : 'illust';
+  bm.tags = [...(record.bookmark_tags ?? [])];
+  bm.isPrivate = /Private$/.test(record.source ?? '');
+  bm.workTags = record.tags ?? [];
+  bm.myTags = [];
+  bm.limit = 10;
+  bm.saving = false;
+  bm.filter = '';
+
+  els.bmSub.textContent = `pid ${record.pid}`;
+  els.bmWorkTitle.textContent = record.title || '(无题)';
+  els.bmWorkAuthor.textContent = record.author ? `by ${record.author}` : '';
+
+  const thumb = thumbForBm(record);
+  els.bmThumb.innerHTML = thumb ? `<img src="${thumb}" alt="">` : '<span>无封面</span>';
+
+  els.bmTagEntry.value = '';
+  els.bmTagSearch.value = '';
+  els.bmHint.hidden = true;
+  setBmStatus('');
+  els.bmMineCount.textContent = '读取中…';
+
+  renderBmChips();
+  renderBmWorkTags();
+  els.bmMineTags.innerHTML = '';
+  syncBmRestrict();
+
+  els.bmModal.hidden = false;
+  document.body.classList.add('bm-open');
+  requestAnimationFrame(() => els.bmTagEntry.focus());
+
+  // 「我的标签」来自本地备份，不发请求；公开 + 私密合并计数
+  try {
+    const data = await api(
+      `/api/bookmark/meta?pid=${encodeURIComponent(record.pid)}&source=${encodeURIComponent(record.source ?? '')}`,
+    );
+    if (bm.record !== record) return; // 期间又打开了别的作品
+    bm.myTags = data.myTags ?? [];
+    bm.limit = data.limit ?? 10;
+    bm.workTags = data.workTags ?? bm.workTags;
+    renderBmWorkTags();
+    renderBmMine();
+    renderBmChips();
+  } catch (err) {
+    if (bm.record !== record) return;
+    els.bmMineCount.textContent = '';
+    els.bmMineTags.innerHTML = `<div class="bm-empty">读取本地标签失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function closeBookmarkEditor() {
+  if (bm.saving) {
+    toast('正在保存，请稍候…', 'warn');
+    return;
+  }
+  els.bmModal.hidden = true;
+  document.body.classList.remove('bm-open');
+  bm.record = null;
+  bm.tags = [];
+  bm.myTags = [];
+}
+
+/** 保存成功后的界面收尾：计数、卡片、详情面板、侧栏。 */
+async function afterBookmarkSaved(record, moved) {
+  // 标签增删会改变使用次数，卡片标签位的排序要跟着变
+  await loadTagUsage();
+
+  // 来源数量变了（跨文件搬迁时尤其明显），顺手把标签页上的数字更新掉
+  try {
+    const data = await api('/api/state');
+    state.sources = data.sources;
+    renderTabs();
+  } catch {
+    /* 计数没刷上不影响主流程 */
+  }
+
+  if (moved) {
+    // 记录已经不在当前来源里了，留在原网格上没有意义
+    closeLightbox();
+    closeReader();
+    await loadSidePanel();
+    reloadAll();
+    return;
+  }
+
+  const card = state.cardMap.get(String(record.pid));
+  if (card) refreshCard(card, record);
+  if (lb.record === record) renderInfoPanel(record);
+  if (!els.reader.hidden && readerRecord === record) renderReaderTags(record);
+  await loadSidePanel();
+}
+
+async function saveBookmarkEdit() {
+  if (bm.saving || !bm.record) return;
+  commitBmEntry();
+
+  if (bm.tags.length > bm.limit) {
+    showBmHint(`收藏标签最多 ${bm.limit} 个`, true);
+    return;
+  }
+
+  const record = bm.record;
+  bm.saving = true;
+  updateBmSaveState();
+  setBmStatus('正在写入 pixiv…', 'busy');
+
+  try {
+    const data = await api('/api/bookmark', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pid: record.pid,
+        source: record.source,
+        tags: bm.tags,
+        private: bm.isPrivate,
+      }),
+    });
+
+    // 服务端写入成功、本地文件已写好，这时才动内存里的记录
+    applyBookmarkResult(record, data);
+
+    els.bmModal.hidden = true;
+    document.body.classList.remove('bm-open');
+    bm.record = null;
+    bm.saving = false;
+
+    toast(`已保存 · ${data.private ? '私密' : '公开'} · ${record.bookmark_tags.length} 个标签`);
+    await afterBookmarkSaved(record, data.moved);
+  } catch (err) {
+    bm.saving = false;
+    updateBmSaveState();
+    setBmStatus(`保存失败：${err.message}`, 'err');
+  }
+}
+
+async function fetchBmFromPixiv() {
+  if (!bm.record || bm.saving) return;
+
+  els.bmFetch.disabled = true;
+  setBmStatus('正在读取 pixiv 上的当前状态…', 'busy');
+
+  try {
+    const data = await api(
+      `/api/bookmark/state?pid=${encodeURIComponent(bm.record.pid)}&source=${encodeURIComponent(
+        bm.record.source ?? '',
+      )}`,
+    );
+    bm.tags = [...(data.tags ?? [])];
+    bm.isPrivate = Boolean(data.private);
+    syncBmRestrict();
+    renderBmChips();
+    setBmStatus(`已读取：${data.private ? '私密' : '公开'} · ${bm.tags.length} 个标签`, 'ok');
+  } catch (err) {
+    setBmStatus(`读取失败：${err.message}`, 'err');
+  } finally {
+    els.bmFetch.disabled = bm.saving;
+  }
+}
+
+els.bmTagEntry.addEventListener('keydown', (event) => {
+  // 输入法选词时的回车 / 空格不能当分隔符
+  if (event.isComposing || event.keyCode === 229) return;
+
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    commitBmEntry();
+    return;
+  }
+  if (event.key === ' ' || event.key === '，' || event.key === ',') {
+    if (els.bmTagEntry.value.trim()) {
+      event.preventDefault();
+      commitBmEntry();
+    }
+    return;
+  }
+  if (event.key === 'Backspace' && !els.bmTagEntry.value && bm.tags.length) {
+    event.preventDefault();
+    bm.tags.pop();
+    renderBmChips();
+  }
+});
+
+els.bmTagEntry.addEventListener('input', () => {
+  // 输入法直接敲出逗号时立即结算
+  if (/[,，、;；]$/.test(els.bmTagEntry.value)) {
+    els.bmTagEntry.value = els.bmTagEntry.value.replace(/[,，、;；]+$/, '');
+    commitBmEntry();
+  }
+});
+
+els.bmTagEntry.addEventListener('blur', () => commitBmEntry());
+
+els.bmTagInput.addEventListener('mousedown', (event) => {
+  if (event.target === els.bmTagInput) {
+    event.preventDefault();
+    els.bmTagEntry.focus();
+  }
+});
+
+for (const cloud of [els.bmWorkTags, els.bmMineTags]) {
+  cloud.addEventListener('click', (event) => {
+    const btn = event.target.closest('.bm-tag');
+    if (btn) toggleBmTag(btn.dataset.tag);
+  });
+}
+
+els.bmTagSearch.addEventListener('input', () => {
+  bm.filter = els.bmTagSearch.value;
+  renderBmMine();
+});
+
+els.bmRestrict.addEventListener('change', (event) => {
+  const input = event.target.closest('input[name="bm-restrict"]');
+  if (input) bm.isPrivate = input.value === '1';
+});
+
+els.bmSave.addEventListener('click', saveBookmarkEdit);
+els.bmFetch.addEventListener('click', fetchBmFromPixiv);
+els.bmCancel.addEventListener('click', closeBookmarkEditor);
+els.bmClose.addEventListener('click', closeBookmarkEditor);
+
+// 点遮罩关闭。大图 / 阅读器都开着的时候，Esc 只该关对话框，所以这里 stopPropagation
+els.bmModal.addEventListener('mousedown', (event) => {
+  if (event.target === els.bmModal) closeBookmarkEditor();
+});
+
+els.bmModal.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  event.stopPropagation();
+  event.preventDefault();
+  closeBookmarkEditor();
+});
+
+// 阅读器里的入口
+els.rdEdit.addEventListener('click', () => {
+  if (readerRecord) openBookmarkEditor(readerRecord);
+});
+
+// 「在 pixiv 打开」同样交给系统浏览器
+els.rdLink.addEventListener('click', (event) => {
+  event.preventDefault();
+  const href = els.rdLink.getAttribute('href') ?? '';
+  if (/^https?:/i.test(href)) openExternal(href);
+});
+
+/* ── 「标签已满，挑一个删」弹窗 ───────────────────────── */
+
+els.bmPickList.addEventListener('click', (event) => {
+  const button = event.target.closest('.bm-pick-tag');
+  if (button) pickDropTag(button.dataset.tag);
+});
+
+els.bmPickClose.addEventListener('click', closeRatingTagPicker);
+
+els.bmPick.addEventListener('mousedown', (event) => {
+  if (event.target === els.bmPick) closeRatingTagPicker();
+});
+
+els.bmPick.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  event.stopPropagation();
+  event.preventDefault();
+  closeRatingTagPicker();
+});
 
 // ---------- 单张下载 ----------
 
@@ -1232,14 +2961,98 @@ els.guardResume?.addEventListener('click', async () => {
   }
 });
 
+// ---------- 随机休息横幅 ----------
+
+/** 毫秒 → 12:34 / 1 小时 05 分。倒计时别显示成 0.4 小时这种。 */
+function formatCountdown(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours} 小时 ${String(minutes).padStart(2, '0')} 分`;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function renderPacerBanner(pacer) {
+  if (!els.pacerBanner) return;
+
+  // 只有真在休息时才占据顶部一条；平时的计数不值得打断视线
+  if (!pacer || !pacer.enabled || !pacer.paused) {
+    els.pacerBanner.hidden = true;
+    els.pacerFill.style.width = '0%';
+    return;
+  }
+
+  const limits = pacer.limits ?? {};
+  const chance = Number(((limits.pauseChance ?? 0) * 100).toFixed(2));
+  const perSec = Math.round((limits.perRequestMs ?? 0) / 1000);
+  const minPause = Math.round((limits.minPauseMs ?? 0) / 60000);
+  const maxPause = Math.round((limits.maxPauseMs ?? 0) / 60000);
+
+  els.pacerBanner.hidden = false;
+  els.pacerText.innerHTML =
+    `<b>随机休息中</b> · 还剩 <span class="left">${formatCountdown(pacer.remainingMs)}</span>` +
+    `<br><span class="muted">触发前已连续请求 ${pacer.pauseRequests} 次，本次休息 ${formatCountdown(pacer.pauseMs)}；` +
+    `每个请求 ${chance}% 概率触发，每多一个请求期望 +${perSec} 秒（${minPause}–${maxPause} 分钟封顶），模拟真人的使用节奏。</span>`;
+
+  // 倒计时进度条：剩余比例越小，底部填充越短
+  const ratio = pacer.pauseMs > 0 ? (pacer.remainingMs / pacer.pauseMs) * 100 : 0;
+  els.pacerFill.style.width = `${Math.max(0, Math.min(100, ratio))}%`;
+  els.pacerSkip.disabled = false;
+}
+
+els.pacerSkip?.addEventListener('click', async () => {
+  els.pacerSkip.disabled = true;
+  try {
+    const data = await api('/api/pacer/skip', { method: 'POST' });
+    renderPacerBanner(data.pacer);
+    if (!data.skipped) els.pacerBanner.hidden = true;
+    toast('已跳过本次休息');
+    await pollQueue();
+  } catch (err) {
+    toast(`跳过失败：${err.message}`, 'err');
+    els.pacerSkip.disabled = false;
+  }
+});
+
 // ---------- 顶栏交互 ----------
+
+// 搜索框和默认过滤器共用一套建议 / 插入逻辑，靠 activeEditor 记住当前是哪个框
+const SEARCH_EDITOR = { input: els.search, panel: els.searchSuggest };
+const FILTER_EDITOR = { input: els.defaultFilter, panel: els.filterSuggest };
+const EDITORS = [SEARCH_EDITOR, FILTER_EDITOR];
+
+let activeEditor = null;
 
 let searchTimer = null;
 els.search.addEventListener('input', () => {
   state.query = els.search.value.trim();
-  showSuggest();
+  showSuggest(SEARCH_EDITOR);
   clearTimeout(searchTimer);
   searchTimer = setTimeout(reloadAll, 280);
+});
+
+let filterTimer = null;
+els.defaultFilter.addEventListener('input', () => {
+  settings.defaultFilter = els.defaultFilter.value.trim();
+  saveSettings();
+  // 这里不调 syncFilterUI：它会把输入框内容回写成 trim 后的值，正在敲的尾随空格会被吃掉
+  els.btnFilter.classList.toggle('on', settings.defaultFilter !== '');
+  showSuggest(FILTER_EDITOR);
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(reloadAll, 280);
+});
+
+els.btnFilter.addEventListener('click', () => {
+  settings.filterOpen = !settings.filterOpen;
+  saveSettings();
+  syncFilterUI();
+  if (settings.filterOpen) {
+    els.defaultFilter.focus();
+    els.defaultFilter.select();
+  } else {
+    hideSuggest();
+  }
 });
 
 // ---------- 搜索建议：聚焦时列出可用的属性筛选 ----------
@@ -1299,13 +3112,14 @@ const FIELD_GROUPS = [
 ];
 
 /** 光标前正在输入的那一段（用于过滤建议、并在点击时替换掉它） */
-function searchTail() {
-  const match = /(\S*)$/.exec(els.search.value);
+function editorTail(input) {
+  const match = /(\S*)$/.exec(input.value);
   return match ? match[1] : '';
 }
 
-function showSuggest() {
-  const tail = searchTail();
+function showSuggest(editor) {
+  activeEditor = editor;
+  const tail = editorTail(editor.input);
   // 支持 `-ra` 这种写法：前缀减号只影响插入结果，过滤建议时忽略它
   const keyword = (tail.startsWith('-') ? tail.slice(1) : tail).toLowerCase();
   const parts = [];
@@ -1329,48 +3143,64 @@ function showSuggest() {
     }
   }
 
-  els.searchSuggest.innerHTML = count
+  editor.panel.innerHTML = count
     ? parts.join('')
     : '<div class="sg-empty">没有匹配的属性，可直接写全文关键词</div>';
-  els.searchSuggest.hidden = false;
+  editor.panel.hidden = false;
 }
 
 function hideSuggest() {
-  els.searchSuggest.hidden = true;
+  for (const editor of EDITORS) editor.panel.hidden = true;
+  activeEditor = null;
 }
 
-/** 把条件插到搜索框里，替换掉光标前那段半截输入。 */
+/** 把条件插到当前输入框里，替换掉光标前那段半截输入。 */
 function insertSearchTerm(term) {
-  const tail = searchTail();
+  const editor = activeEditor;
+  if (!editor) return;
+
+  const tail = editorTail(editor.input);
   const negated = tail.startsWith('-');
-  const value = els.search.value;
+  const value = editor.input.value;
   const head = value.slice(0, value.length - tail.length);
   // 用户先打了减号：插入时保留，变成排除条件
   const next = `${head}${negated ? '-' : ''}${term}`;
 
-  els.search.value = next;
-  state.query = next.trim();
+  editor.input.value = next;
+  if (editor === FILTER_EDITOR) {
+    settings.defaultFilter = next.trim();
+    saveSettings();
+    els.btnFilter.classList.toggle('on', settings.defaultFilter !== '');
+  } else {
+    state.query = next.trim();
+  }
   hideSuggest();
   reloadAll();
-  els.search.focus();
+  editor.input.focus();
 }
 
-els.search.addEventListener('focus', showSuggest);
+for (const editor of EDITORS) {
+  editor.input.addEventListener('focus', () => {
+    // 两个框各有一块建议面板，切过去时先把另一块收掉，否则会同时挂两个
+    hideSuggest();
+    showSuggest(editor);
+  });
 
-els.search.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') hideSuggest();
-});
+  editor.input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideSuggest();
+  });
 
-// 用 mousedown 而不是 click：click 之前会先触发 blur，建议面板可能已被隐藏
-els.searchSuggest.addEventListener('mousedown', (event) => {
-  event.preventDefault();
-  const item = event.target.closest('.sg-item');
-  if (item) insertSearchTerm(item.dataset.term);
-});
+  // 用 mousedown 而不是 click：click 之前会先触发 blur，建议面板可能已被隐藏
+  editor.panel.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    const item = event.target.closest('.sg-item');
+    if (item) insertSearchTerm(item.dataset.term);
+  });
+}
 
 document.addEventListener('click', (event) => {
-  if (els.searchSuggest.hidden) return;
-  if (event.target === els.search || els.searchSuggest.contains(event.target)) return;
+  if (!activeEditor) return;
+  if (EDITORS.some((editor) => editor.input === event.target || editor.panel.contains(event.target))) return;
   hideSuggest();
 });
 
@@ -1426,13 +3256,27 @@ els.optShowTags.addEventListener('change', () => {
   applySettings();
 });
 
+els.optShowRating.addEventListener('change', () => {
+  settings.showRating = els.optShowRating.checked;
+  saveSettings();
+  // 星星和「标签位里藏不藏评分标签」一起变，只能重建卡片
+  applySettings();
+});
+
 els.optAutoDownload.addEventListener('change', () => {
   settings.autoDownload = els.optAutoDownload.checked;
   saveSettings();
 });
 
 els.optReset.addEventListener('click', () => {
-  settings = { ...DEFAULT_SETTINGS, leftOpen: settings.leftOpen, rightOpen: settings.rightOpen };
+  settings = {
+    ...DEFAULT_SETTINGS,
+    leftOpen: settings.leftOpen,
+    rightOpen: settings.rightOpen,
+    // 视图设置里的「恢复默认」只管外观，不动过滤条件
+    defaultFilter: settings.defaultFilter,
+    filterOpen: settings.filterOpen,
+  };
   saveSettings();
   applySettings();
 });
@@ -1463,7 +3307,48 @@ window.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') closeReader();
     return;
   }
-  if (els.lightbox.hidden) return;
+
+  // 编辑对话框 / 挑标签弹窗开着时，按键归它们自己管（Esc 在各自的监听里处理）
+  if (!els.bmModal.hidden || !els.bmPick.hidden) return;
+
+  // 输入框里打字、或者按着 Ctrl/Alt 的组合键（Ctrl+C 等）都不要抢
+  const tag = event.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || event.target?.isContentEditable) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+  const inLightbox = !els.lightbox.hidden;
+  // 大图里操作当前作品，网格里操作鼠标停着的那张卡片
+  const target = inLightbox ? lb.record : hoveredRecord;
+
+  // L 复制作品链接；C 复制当前图片（失败退回复制链接）
+  switch (event.key.toLowerCase()) {
+    case 'l':
+      if (target) {
+        event.preventDefault();
+        copyLink(target);
+        return;
+      }
+      break;
+    case 'c':
+      if (target) {
+        event.preventDefault();
+        copyImage(target, inLightbox ? lb.index : 0);
+        return;
+      }
+      break;
+    case 'e':
+      // 只在大图里给快捷键：网格卡片上编辑收藏容易误触
+      if (inLightbox && lb.record) {
+        event.preventDefault();
+        openBookmarkEditor(lb.record);
+        return;
+      }
+      break;
+    default:
+      break;
+  }
+
+  if (!inLightbox) return;
 
   // ← → 换作品；↑ ↓ / PageUp / PageDown 在作品内翻页
   switch (event.key) {
@@ -1545,6 +3430,8 @@ async function loadState() {
   applySettings();
   try {
     await loadState();
+    // 卡片标签位要按使用次数排序，先把这个表拿到再渲染第一屏
+    await loadTagUsage();
     if (settings.leftOpen) await loadSidePanel();
     await loadPage(true);
     await pollQueue();

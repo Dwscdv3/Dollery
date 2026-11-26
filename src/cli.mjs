@@ -18,6 +18,7 @@ import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
 import { downloadRecords, formatBytes } from './download.mjs';
 import { updateBookmarkTagMap, applyBookmarkTags, refreshBookmarkTags } from './bookmark-tags.mjs';
 import { createGuard, GuardTripped, DailyLimitReached } from './guard.mjs';
+import { RequestPacer, DEFAULT_PACER } from './pacer.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
@@ -74,6 +75,9 @@ const DEFAULT_CONFIG = {
     dailyFileLimit: 2000,
     dailyByteLimit: 0,
   },
+
+  // 请求节奏：攒够若干次请求就整队随机休息一段，模拟真人的使用习惯
+  pacer: { ...DEFAULT_PACER },
 };
 
 function parseArgs(argv) {
@@ -123,6 +127,7 @@ async function loadConfig() {
     download: { ...DEFAULT_CONFIG.download, ...(raw.download ?? {}) },
     bookmarkTags: { ...DEFAULT_CONFIG.bookmarkTags, ...(raw.bookmarkTags ?? {}) },
     guard: { ...DEFAULT_CONFIG.guard, ...(raw.guard ?? {}) },
+    pacer: { ...DEFAULT_CONFIG.pacer, ...(raw.pacer ?? {}) },
     // 兼容旧版配置：以前只有 illust / novel 两个输出路径，全部对应到公开收藏。
     output: {
       ...DEFAULT_CONFIG.output,
@@ -189,6 +194,7 @@ function printHelp() {
     '  --image-interval MS  图片下载间隔，默认 1000',
     '  --out DIR            输出目录，默认 images',
     '  --dry-run            只列出要下什么，不实际下载',
+    '  --no-pacer           关闭随机休息（按概率触发的长暂停），赶时间时用',
     '',
     '认证:',
     '  把浏览器登录 pixiv 后的 cookie 写入 .secrets/cookies.txt，',
@@ -215,7 +221,7 @@ class ConfigError extends Error {
   }
 }
 
-async function buildClient(config, flags) {
+async function buildClient(config, flags, { pacer = null } = {}) {
   const intervalMs = Number(flags.interval ?? config.intervalMs ?? 2000);
   if (!Number.isFinite(intervalMs) || intervalMs < 500) {
     throw new ConfigError(`请求间隔 ${intervalMs}ms 过小。Pixiv 对高频访问敏感，不要低于 2000ms。`);
@@ -235,7 +241,7 @@ async function buildClient(config, flags) {
     );
   }
 
-  const limiter = new RateLimiter(intervalMs);
+  const limiter = new RateLimiter(intervalMs, 250, pacer);
   const client = new PixivClient({
     cookie,
     proxy: config.proxy,
@@ -564,7 +570,14 @@ const DOWNLOAD_TARGETS = {
 
 async function commandDownload(flags) {
   const config = await loadConfig();
-  const { client } = await buildClient(config, flags);
+
+  // 节奏控制和限速是同一件事的两层：接口限速器（client 里那个）和图片限速器
+  // 共用同一个 pacer，休息时两条线一起停，计数也是同一本账。
+  const pacer = new RequestPacer(flags['no-pacer'] ? { ...config.pacer, enabled: false } : config.pacer, {
+    log: (text) => console.log(`    [节奏] ${text}`),
+  });
+
+  const { client } = await buildClient(config, flags, { pacer });
   const guard = makeGuard(config, client);
   await guard.assertAllowed();
 
@@ -636,11 +649,26 @@ async function commandDownload(flags) {
       `AVIF 质量 ${quality}   图片间隔 ${imageInterval}ms   ${keepOriginal ? '保留原图' : '转换后删除原图'}${dryRun ? '   [演练模式]' : ''}`,
     );
   }
+
+  const pacerStatus = pacer.status();
+  if (pacerStatus.enabled) {
+    const limits = pacerStatus.limits;
+    const chance = Number((limits.pauseChance * 100).toFixed(2));
+    const perSec = Math.round(limits.perRequestMs / 1000);
+    const minPause = Math.round(limits.minPauseMs / 60000);
+    const maxPause = Math.round(limits.maxPauseMs / 60000);
+    console.log(
+      `休息节奏: 每个请求 ${chance}% 概率休息；期望时长 = 距上次休息的请求数 × ${perSec} 秒` +
+        `（${minPause}~${maxPause} 分钟，Gamma k=${limits.shape}）`,
+    );
+  } else {
+    console.log('休息节奏: 已关闭（--no-pacer）');
+  }
   console.log('');
 
   if (usable.length === 0) return 0;
 
-  const imageLimiter = new RateLimiter(imageInterval);
+  const imageLimiter = new RateLimiter(imageInterval, 250, pacer);
   const startedAt = Date.now();
 
   const summary = await downloadRecords(client, {

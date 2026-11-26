@@ -13,6 +13,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
+import zlib from 'node:zlib';
 import { URL } from 'node:url';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,20 +25,48 @@ export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * 吞掉异常，保证一个任务失败不会把后续任务一起带走。
  */
 export class RateLimiter {
-  constructor(minIntervalMs = 2000, jitterMs = 250) {
+  /**
+   * @param {number} minIntervalMs 相邻两次请求的最小间隔
+   * @param {number} jitterMs 在最小间隔之上再随机加一点
+   * @param {import('./pacer.mjs').RequestPacer|null} pacer 粗粒度节奏控制（长暂停），可为空
+   * @param {number} fastIntervalMs 快速通道的间隔（用户手动触发的写操作）。0 = 不排队
+   */
+  constructor(minIntervalMs = 2000, jitterMs = 250, pacer = null, fastIntervalMs = 0) {
     this.minIntervalMs = minIntervalMs;
     this.jitterMs = jitterMs;
+    this.pacer = pacer;
+    // 快速通道不能比普通通道还慢，否则这个开关就没意义了
+    this.fastIntervalMs = Math.max(0, Math.min(fastIntervalMs, minIntervalMs));
     this.nextAllowedAt = 0;
+    this.fastAllowedAt = 0;
     this.tail = Promise.resolve();
     this.executed = 0;
   }
 
-  run(task) {
+  /**
+   * @param {() => Promise<any>} task
+   * @param {{ bypassPacer?: boolean, fast?: boolean }} [options]
+   *   bypassPacer: 用户手动触发的那一次，不等随机长休息
+   *   fast: 走快速通道 —— 用户点了保存就盯着界面等，按 2 秒排队会以为卡死了。
+   *         默认间隔 0（不额外等待），但仍然是串行执行的；发完之后普通请求
+   *         照样按完整间隔排队，所以后台的下载节奏不会被带快。
+   */
+  run(task, { bypassPacer = false, fast = false } = {}) {
     const result = this.tail.then(async () => {
-      const wait = this.nextAllowedAt - Date.now();
+      // 普通请求要看两条闸门（普通队列和快速通道都可能刚用过），
+      // 快速请求只等自己那条更短的。
+      const gate = fast
+        ? this.fastAllowedAt
+        : Math.max(this.nextAllowedAt, this.fastAllowedAt);
+      const wait = gate - Date.now();
       if (wait > 0) await sleep(wait);
+      // 粗粒度休息在这里等着：整条串行链都卡住，所以队列会真的停下来，
+      // 而不是一边「休息」一边继续发请求。
+      if (this.pacer) await this.pacer.gate({ bypass: bypassPacer });
       // 抖动是为了避免固定频率的请求特征，兼防止多个进程恰好同频。
-      this.nextAllowedAt = Date.now() + this.minIntervalMs + Math.random() * this.jitterMs;
+      const stamp = Date.now();
+      this.nextAllowedAt = stamp + this.minIntervalMs + Math.random() * this.jitterMs;
+      this.fastAllowedAt = stamp + this.fastIntervalMs;
       this.executed += 1;
       return task();
     });
@@ -108,28 +137,95 @@ async function openTlsOverTunnel(proxyUrl, host, port, timeoutMs) {
 }
 
 /**
- * 发起一次 GET 请求。
+ * 连接池：每个「代理 + 目标主机」复用一个 keep-alive agent。
+ *
+ * 以前是「一个请求一条隧道，用完即弃」。走代理到 pixiv 时，建隧道 + TLS 握手
+ * 本身要 0.6~0.7 秒，编辑收藏一次要发三个请求，光握手就白扔掉 1.3 秒。
+ * 改成复用之后，只有第一个请求付这笔钱。
+ *
+ * socket 由 `createConnection` 懒创建：agent 手里有空闲连接就直接复用，
+ * 连接被代理掐断时 Node 会自己再调一次 createConnection，配合上层的重试正好。
+ */
+const agentPool = new Map();
+
+function agentFor(proxy, host, port, timeoutMs) {
+  const key = `${proxy}|${host}:${port}`;
+  const existing = agentPool.get(key);
+  if (existing) return existing;
+
+  const agent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 15000,
+    maxSockets: 2,
+    maxFreeSockets: 1,
+    timeout: 45000,
+  });
+
+  // 异步建连：走 CONNECT 隧道，再在隧道上做 TLS
+  agent.createConnection = (options, callback) => {
+    openTlsOverTunnel(proxy, host, port, timeoutMs)
+      .then((socket) => {
+        socket.setKeepAlive(true, 15000);
+        callback(null, socket);
+      })
+      .catch((err) => callback(err));
+  };
+
+  agentPool.set(key, agent);
+  return agent;
+}
+
+/** 按 Content-Encoding 解开响应体。解不开就原样返回，交给上层报「不是 JSON」。 */
+function decodeBody(buffer, encoding) {
+  const kind = String(encoding ?? '').toLowerCase().trim();
+  if (!kind || kind === 'identity') return buffer;
+
+  try {
+    if (kind === 'gzip' || kind === 'x-gzip') return zlib.gunzipSync(buffer);
+    if (kind === 'deflate') return zlib.inflateSync(buffer);
+    if (kind === 'br') return zlib.brotliDecompressSync(buffer);
+  } catch {
+    // 响应体损坏时保持原样，让调用方走「解析失败」的分支
+  }
+  return buffer;
+}
+
+/**
+ * 发起一次 HTTPS 请求。
  *
  * 默认把响应按 UTF-8 解成 `body` 字符串（接口都是 JSON）。
  * 传 `binary: true` 则只给 `buffer` —— 图片、zip 走这条路，按字符串解会损坏文件。
+ *
+ * `method` / `body` 是为写操作准备的：编辑收藏要 POST JSON，且必须带
+ * `Content-Length`，否则 Pixiv 会把请求体当空。body 一律按 UTF-8 编码，
+ * 因为唯一的写接口（bookmarks/add）只收 JSON。
+ *
+ * 文本请求会自动带 `Accept-Encoding: gzip` 并解压：旧版编辑页有 120KB，
+ * 走代理时不压缩要一秒多，压完只剩十几 KB。
  */
-export async function httpsGet(
+export async function httpsRequest(
   url,
-  { headers = {}, proxy = null, timeoutMs = 60000, binary = false } = {},
+  { method = 'GET', headers = {}, body = null, proxy = null, timeoutMs = 60000, binary = false } = {},
 ) {
   const target = new URL(url);
   const port = target.port ? Number(target.port) : 443;
   const path = target.pathname + target.search;
 
-  let agent = false;
-  if (proxy) {
-    const socket = await openTlsOverTunnel(proxy, target.hostname, port, timeoutMs);
-    // 每个请求单独一个 agent：连接用完即弃，配合串行限速最省心。
-    agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
-    agent.createConnection = (opts, callback) => {
-      callback(null, socket);
-      return socket;
-    };
+  const agent = proxy ? agentFor(proxy, target.hostname, port, timeoutMs) : false;
+
+  const payload =
+    body === null || body === undefined
+      ? null
+      : Buffer.isBuffer(body)
+        ? body
+        : Buffer.from(String(body), 'utf8');
+
+  // Connection 交给 agent 决定（keep-alive 复用），这里不要再写死 close
+  const finalHeaders = { Host: target.host, ...headers };
+  if (payload) finalHeaders['Content-Length'] = payload.length;
+
+  if (!binary && !Object.keys(finalHeaders).some((key) => key.toLowerCase() === 'accept-encoding')) {
+    finalHeaders['Accept-Encoding'] = 'gzip, deflate, br';
   }
 
   return new Promise((resolve, reject) => {
@@ -137,8 +233,8 @@ export async function httpsGet(
       host: target.hostname,
       port,
       path,
-      method: 'GET',
-      headers: { Host: target.host, Connection: 'close', ...headers },
+      method: String(method || 'GET').toUpperCase(),
+      headers: finalHeaders,
       timeout: timeoutMs,
       agent,
     };
@@ -147,7 +243,8 @@ export async function httpsGet(
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
-        const collected = Buffer.concat(chunks);
+        const raw = Buffer.concat(chunks);
+        const collected = binary ? raw : decodeBody(raw, res.headers['content-encoding']);
         resolve({
           status: res.statusCode,
           headers: res.headers,
@@ -169,8 +266,13 @@ export async function httpsGet(
       req.destroy(new Error(`请求超时 (${timeoutMs}ms): ${url}`));
     });
 
-    req.end();
+    req.end(payload ?? undefined);
   });
+}
+
+/** GET 的便捷入口，保留原签名（大量调用点都按这个来）。 */
+export function httpsGet(url, opts = {}) {
+  return httpsRequest(url, { ...opts, method: 'GET', body: null });
 }
 
 /**
@@ -181,13 +283,13 @@ export async function httpsGet(
  *
  * 注意退避等待发生在限速队列之外，但重试本身仍排队，所以依然满足 2 秒间隔。
  */
-export async function httpsGetWithRetry(url, opts = {}, { retries = 3, onRetry } = {}) {
+export async function httpsRequestWithRetry(url, opts = {}, { retries = 3, onRetry } = {}) {
   const retryable = new Set([429, 500, 502, 503, 504]);
   let lastError = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      const res = await httpsGet(url, opts);
+      const res = await httpsRequest(url, opts);
       if (!retryable.has(res.status)) return res;
 
       lastError = new Error(`HTTP ${res.status}`);
@@ -204,4 +306,9 @@ export async function httpsGetWithRetry(url, opts = {}, { retries = 3, onRetry }
   }
 
   throw lastError ?? new Error('请求失败');
+}
+
+/** 带重试的 GET，保留原签名。 */
+export function httpsGetWithRetry(url, opts = {}, options = {}) {
+  return httpsRequestWithRetry(url, { ...opts, method: 'GET', body: null }, options);
 }

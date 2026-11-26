@@ -31,6 +31,16 @@
     "keepOriginal": false
   },
 
+  "_pacer说明": "概率触发的随机长休息：每个后台请求有 pauseChance 的概率休息一次；休息时长期望 = 距上次休息的请求数 × perRequestMs，夹在 minPauseMs~maxPauseMs 之间，再按 Gamma 分布抽样（shape=1 即指数分布，越大越集中）。enabled 设 false 可整体关闭。",
+  "pacer": {
+    "enabled": true,
+    "pauseChance": 0.01,
+    "perRequestMs": 5000,
+    "minPauseMs": 60000,
+    "maxPauseMs": 5400000,
+    "shape": 2
+  },
+
   "bookmarkTags": {
     "enabled": true,
     "cacheDir": ".cache"
