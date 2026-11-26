@@ -1311,7 +1311,13 @@ const gridView = {
   layout: null,
   lastRange: '',
   frame: 0,
-  skipAnchor: 0, // 刚换过列数时，前几轮跳过锚点补偿，保住 scrollTop
+  // 换布局时记下的滚动百分比；只在新布局的第一次重画里换算成位置
+  heldRatio: null,
+  ratioApplied: false,
+  ratioLastTotal: 0, // 上一次校正时的总高度，用来判断行高是否还在变
+  ratioStable: 0,
+  heldRatioUntil: 0, // 锁定的最晚时间，避免行高一直不稳定时把用户卡住
+  skipAnchor: 0, // 重排后的前几轮不做锚点补偿（由 heldRatio 接管）
 };
 
 function gridLayout() {
@@ -1422,12 +1428,20 @@ function paintGrid(force = false) {
     Math.abs(layout.width - gridView.layout.width) > 0.5 ||
     layout.cols !== gridView.layout.cols
   ) {
+    // 布局要变了，先记下「现在滚了百分之几」。清行之前量，高度还在，比值才有效。
+    // 虚拟列表没法靠浏览器自己保住位置：列数一变，偏移量对应的内容就全换了。
+    const range = wrap.scrollHeight - wrap.clientHeight;
+    gridView.heldRatio =
+      range > 0 ? Math.min(1, Math.max(0, wrap.scrollTop / range)) : null;
+    gridView.ratioApplied = false;
+    gridView.ratioLastTotal = 0;
+    gridView.ratioStable = 0;
+    gridView.heldRatioUntil = Date.now() + 800; // 兜底：行高一直没稳定也别锁太久
+
     clearGridRows();
     gridView.heights.clear();
     gridView.sample = 0;
     gridView.layout = layout;
-    // 这一轮是在换了列数的重排：所有行都是新建的，别再用「锚点行」去补偿行高差，
-    // 否则 scrollTop 会被自己推动大半屏。保持浏览器的偏移量不动就好。
     gridView.skipAnchor = 3; // 含视口上方两行的实测轮次，一起跳过
   }
 
@@ -1450,6 +1464,16 @@ function paintGrid(force = false) {
   // 最后再把末尾多算的那一个间距减掉
   for (let i = 0; i < rowCount; i += 1) {
     prefix[i + 1] = prefix[i] + (gridView.heights.get(i) ?? estimate) + gap;
+  }
+
+  // 按记下的百分比还原滚动位置：先把新总高度撑起来，否则 scrollTop 会被夹在旧范围里。
+  // 这一次用的是估算行高，只是先把位置放个大概，避免画到第一行去。
+  if (gridView.heldRatio !== null && !gridView.ratioApplied) {
+    const total = pad * 2 + prefix[rowCount] - gap;
+    els.grid.style.height = `${total}px`;
+    const range = total - wrap.clientHeight;
+    wrap.scrollTop = range > 0 ? gridView.heldRatio * range : 0;
+    gridView.ratioApplied = true;
   }
 
   const scrollTop = wrap.scrollTop;
@@ -1518,11 +1542,14 @@ function paintGrid(force = false) {
     els.grid.style.height = `${pad * 2 + next[rowCount] - gap}px`;
     wrap.dispatchEvent(new Event('scroll'));
 
-    // 视口上方的高度变了的话，把锚点行拉回原来的屏幕位置。
-    // 刚换过列数的第一轮例外：行是新建的，补偿只会把 scrollTop 推走。
-    const delta = next[first] - prefix[first];
-    if (gridView.skipAnchor > 0) gridView.skipAnchor -= 1;
-    else if (first > 0 && Math.abs(delta) > 0.5) wrap.scrollTop = scrollTop + delta;
+    if (gridView.skipAnchor > 0) {
+      // 刚换过布局：行都是新建的，别再按「行高差」去推 scrollTop
+      gridView.skipAnchor -= 1;
+    } else {
+      // 平时滚动时，视口上方行高变准了就把锚点行拉回原来的屏幕位置
+      const delta = next[first] - prefix[first];
+      if (first > 0 && Math.abs(delta) > 0.5) wrap.scrollTop = scrollTop + delta;
+    }
 
     gridView.lastRange = '';
     scheduleGridPaint();
@@ -1533,7 +1560,47 @@ function paintGrid(force = false) {
     if (!card || !card.isConnected) hoveredRecord = null;
   }
 
+  settleHeldRatio(wrap);
+
   if (state.offset < state.total && !state.loading && end >= loadedRows - 1) loadPage(false);
+}
+
+/**
+ * 换布局后，行高要过几轮才会从估算变成实测，总高度跟着变 —— 百分比的分母一直在动。
+ * 所以只要总高度还在变，就按同一个百分比把位置再落一次；连续两次算出来一样才算稳定，
+ * 之后交还给用户（wheel / 触摸会立刻解除锁定）。
+ */
+function settleHeldRatio(wrap) {
+  if (gridView.heldRatio === null) return;
+
+  if (Date.now() > gridView.heldRatioUntil) {
+    gridView.heldRatio = null;
+    gridView.ratioApplied = false;
+    return;
+  }
+
+  const totalH = wrap.scrollHeight;
+  if (Math.abs(totalH - gridView.ratioLastTotal) > 1) {
+    gridView.ratioLastTotal = totalH;
+    gridView.ratioStable = 0;
+
+    const range = totalH - wrap.clientHeight;
+    if (range <= 0) return;
+
+    const target = gridView.heldRatio * range;
+    if (Math.abs(target - wrap.scrollTop) > 0.5) {
+      wrap.scrollTop = target;
+      gridView.lastRange = '';
+      scheduleGridPaint();
+    }
+    return;
+  }
+
+  gridView.ratioStable += 1;
+  if (gridView.ratioStable >= 2) {
+    gridView.heldRatio = null;
+    gridView.ratioApplied = false;
+  }
 }
 
 // ---------- 卡片 ----------
@@ -3925,6 +3992,18 @@ window.addEventListener('keydown', (event) => {
 // 滚动 = 重画可见行；加载下一页的判断在 paintGrid 里（靠近已加载末尾时触发）
 const gridWrap = document.querySelector('.grid-wrap');
 gridWrap.addEventListener('scroll', () => scheduleGridPaint(), { passive: true });
+
+// 用户在重排后马上自己滚动的话，别再用记下的百分比把他拉回去
+for (const type of ['wheel', 'pointerdown', 'touchstart']) {
+  gridWrap.addEventListener(
+    type,
+    () => {
+      gridView.heldRatio = null;
+      gridView.ratioApplied = false;
+    },
+    { passive: true },
+  );
+}
 
 // 窗口 / 侧栏尺寸变化会改变列数和卡片宽度，行高缓存要重建
 new ResizeObserver(() => scheduleGridPaint(true)).observe(gridWrap);
