@@ -217,7 +217,7 @@
 
 ---
 
-## 10. README 加免责声明 + 封号风险告知
+## 10. README 重写：免责声明 + 封号风险 + Credit
 
 **背景**：仓库已公开。抓取类工具公开后可能招来站点 ToS 层面的投诉；而「封号」是这个项目最真实的风险，
 应该在显眼处讲清楚，而不是藏在配置说明里。等 README 定稿后再动笔。
@@ -233,9 +233,189 @@
 - **免责**：作者与贡献者对账号受限、数据丢失、法律后果不承担责任。
   （与 `LICENSE` 里的 GPL 无担保条款一致，README 只是写人话版。）
 
-**位置**：放在「这是什么」之后单独一节（`## 免责声明`），太靠后等于没写。
+**Credit 一节**（用户已指定内容，写 README 时带上）
+
+```
+- 静瑶 (Dwscdv3)
+- DeepSeek
+```
+
+**位置**：`## 免责声明` 放在「这是什么」之后，太靠后等于没写；`## Credit` 按惯例放文末，不用抢眼。
 
 **顺带**：README 里还有 3 处 `pixiv-export`，改名那轮按约定没动，重写时一并处理。
+
+---
+
+## 11. 启动方式改造：单入口 + 可选浏览器 + 设置搬到服务端
+
+**现状实测（2026-11-27）**
+- 五个 bat：`download` / `sync` / `sync-full` / `status` / `viewer`，都是 `cd /d "%~dp0"` 起手。
+- `viewer.bat` 第 2 行写着一条硬规矩：**bat 里不能出现中文**，cmd 用系统 ANSI 代码页解析，UTF-8 中文会变乱码；
+  所有中文输出都交给 Node。它自己还带 `chcp 65001`。
+- `server.mjs:2186 openBrowser()` 只认 Edge 的两个固定安装路径（`findEdge()`），用 `--app=` 开应用窗口；
+  找不到就只在控制台打印「请手动打开」。
+- 前端 15 个设置键全在 `localStorage` 的 `pixiv-viewer-settings.v2`（`app.js:9/11`），换浏览器就丢。
+- **没有退出逻辑**：全仓没有 `process.on`、没有 shutdown 接口、没有心跳检测。
+  所以 `viewer.bat` 里那句「Close that window to quit」是**假的** —— 关掉 Edge 窗口，node 进程照样活着、端口照样占着。
+  真正的退出方式是关掉那个黑窗口（Ctrl+C / 点 ×）。这一条本身是现存 bug。
+
+### 11.1 只留一个启动器
+
+- 目标：一个脚本同时起后端 + 前端，并改名。
+- **删之前先看依赖**：`sync.bat` 得等第 7 条（前端同步）能用才能删，否则同步没入口；
+  `download.bat` 已被右栏「全部下载」替代；`status.bat` 的信息要在界面里找到对应展示（`/api/stats` 已有大部分）。
+- 名字：建议 ASCII（`dollery.cmd` / `start.cmd`）。中文文件名在 NTFS 上没问题，但 `chcp 65001` 和中文路径
+  混用是现成的坑（见上面那条硬规矩），少一个变量少一次排查。
+- 文件内容必须保持纯 ASCII，中文提示一律由 Node 打印。
+- 若最终入口换成托盘 exe（见 11.4），用户双击的就是 `Dollery.exe`，**启动脚本可以一个都不留**；
+  仓库里只保留 `build-launcher.cmd` 用来编译（那是构建入口，不是启动入口）。
+
+### 11.2 启动方式可配置
+
+`config.json` 增加 `launch` 段：
+
+```json
+"launch": {
+  "browser": "edge-app",
+  "open": true,
+  "port": 7788
+}
+```
+
+- `browser`：`edge-app`（现状，无地址栏，像原生程序）/ `default`（系统默认浏览器普通标签页，
+  Windows 用 `start "" url`，macOS `open`，Linux `xdg-open`）/ `chrome-app` / `none`（只起服务，用户自己开）。
+- `open: false` 与 `browser: none` 的区别要说清：前者是不自动打开但仍按 browser 记偏好，后者是彻底不管。
+  （二选一即可，别两个都留，容易歧义。）
+- `port`：现在 `BASE_PORT = 7788` 写死，占用时 `listen(port, attempt)` 自动 +1，但用户无法指定。
+- 这块直接并进第 6 条的配置面板，加一个下拉就够，不要另立接口。
+
+### 11.3 界面设置从 localStorage 搬到服务端
+
+目的：换浏览器 / 换 profile / 换机器都能保留（现在换个浏览器就全丢）。
+
+- 存储文件：`data/viewer-settings.json`，走 `tag-groups.mjs` 那套（原子写 + mtime 缓存）。
+  放 `data/` 是因为它已经是 gitignore 的个人数据目录。
+- 接口：`GET /api/settings` 返回「默认值 + 文件值」合并结果；`POST /api/settings` 做**浅合并**，
+  不要整体替换 —— 否则两个标签页同时改会互相覆盖。
+- 前端改造，**首屏策略已定：先拿到设置再渲染**。`loadSettings()` 改成返回 Promise，启动时 `await` 一次 GET
+  再进 `init()`；等待期间给一个极简加载态，不要只留白屏。设置和首屏数据（`/api/state`、`/api/records`）
+  可以并发发出，但**渲染前两者都必须到齐** —— 否则会出现「先用默认列数画一遍网格，再跳成用户设置」的闪动。
+- `saveSettings()` 改成 debounce 200ms 的 POST（现在是每动一次就同步写 localStorage，拖一个滑块会连发十几次）。
+- 迁移：首次 GET 发现文件不存在时，前端把自己现有的 localStorage 值 POST 上去，打个 `migrated: true` 标记；
+  先别删 localStorage，留一阵再清。
+- 降级：服务没起来或请求失败时，前端回落到 localStorage，不能白屏。
+- **分界要定死**：界面偏好 → 服务端文件（跨浏览器）；敏感与后端配置（proxy / cookie / API Key）→ `config.json`。
+  两者都可以在第 6 条的面板里出现，但存储位置不能混。
+
+### 11.4 托盘 GUI（Windows 优先）
+
+**需求**：各平台封装一个简单 GUI；Windows 上以托盘形式常驻，点一下能「打开前端 / 查看标准输出 / 退出」。
+
+**为什么不是只包一层 VBS**：VBS 只藏得住窗口，藏不住「日志没地方看」和「没法退出」这两个真问题。
+托盘把三件事一次解决，而且图标本身就是个状态灯——服务在不在跑，一眼能看到。
+
+**技术选型**
+
+| 方案 | 依赖 | 体积 | 代价 |
+|---|---|---|---|
+| **C# 单文件 exe**（WinForms `NotifyIcon`） | 用系统自带 .NET Framework 4.x 的 `csc.exe` 编译 | ~20KB | 只能 Windows；但零安装、启动快、能直接管子进程和 stdout |
+| PowerShell + WinForms | 无 | 0 | 执行策略可能拦；启动约 1 秒；图标闪；异常难查 |
+| Electron / Tauri | 重 | 50–150MB | 与「不起框架、不打包」的取向直接冲突 |
+| Node 原生模块（`systray` 等） | npm + node-gyp | 小 | 为个图标引入 C++ 构建链，不值 |
+| 服务化（nssm / winsw） | 第三方 exe | 小 | 没有托盘，退出只能命令行 |
+
+**倾向 C# 单文件 + `/target:winexe`**：它是唯一能同时做到「无控制台、托管子进程、抓 stdout、三动作齐全」
+又不引入构建依赖的路子。`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 每台 Windows 都有。
+
+**launcher 与 node 的契约**（这条是关键，别让两边互相猜）
+
+- launcher 用 `--no-open` 起 node，接管 stdout / stderr。
+- node 起来后打印一行机器可读的握手：`[launch] url=http://127.0.0.1:7788`。
+  **端口可能因占用自动 +1，所以 URL 必须由 node 给出**，launcher 不许自己拼。
+- 抓到这行才算启动成功，然后按 `launch.browser` 决定怎么开（`default` = `Process.Start(url)`，
+  正好满足「用户想用浏览器」的诉求）；抓不到就当启动失败，图标标红 + 气泡里贴最后几行 stderr。
+- 退出：往子进程 stdin 写一行 `shutdown`（见 11.5），等它自己退；3 秒不退才 `Kill` 兜底。
+
+**三个动作怎么实现**
+- 打开前端：URL 来自握手行，见上。
+- 查看标准输出：stdout/stderr 同时进「最近 N 行」的环形缓冲 + `logs/viewer.log`；
+  菜单项弹一个小窗实时 tail（WinForms `TextBox` + `Timer` 追加），比开记事本体面，也不用加依赖。
+- 退出：见 11.5，走 stdin 指令，不提供 HTTP 接口。
+
+**跨平台**：先只做 Windows。把 launcher 的职责卡死在「起进程 / 读握手行 / 收输出 / 三个动作」，
+接口留清楚即可；macOS（`NSStatusItem`）和 Linux（libappindicator）以后按需补，
+不要一开始就抽象成跨平台壳——为一个用不上的平台付构建复杂度不划算。
+
+**要接受的代价**：多一个需要维护的 C# 文件；多一步编译（仓库里放 `build-launcher.cmd`，一行 `csc` 调用）；
+进程管理比双击 bat 复杂。换来的是一个能真正关掉的服务，和一个「不用一直开着黑窗口」的日常。
+
+**分工说明**：助手环境禁止调用 `csc.exe`（等同于 `Add-Type`），所以 `.cs` 源码和编译脚本我来写，
+**编译与实机验证必须由用户执行**（双击 `build-launcher.cmd`）。这也是为什么脚本要做得能一键跑完。
+
+### 11.5 优雅退出（不加 HTTP 接口）
+
+**已定**：不新增 `/api/shutdown`。收尾走 `process.on` + 标准输入通道，托盘点「退出」不许硬杀。
+
+**三个触发源**
+- `SIGINT`：控制台里 Ctrl+C。现在没有 handler，是硬杀 —— 正在做的原子写（tmp + rename）不会写坏，
+  但队列里的任务会丢，日志也可能断在半截。
+- **stdin 指令**：launcher 本来就要托管子进程的 stdout / stderr，顺手把 stdin 也留着；退出时写一行 `shutdown\n`。
+  node 读 `process.stdin`，收到就走优雅退出。零端口、零接口、跨平台。
+- **stdin EOF**：父进程被任务管理器杀掉、或托盘程序崩了，管道自动关闭，node 收到 `end` 跟着退。
+  这顺带治好了现在那个孤儿问题：关掉窗口后 node 还在跑、端口一直占着（见 11 开头的实测）。
+
+**为什么不能用「别的进程发 SIGINT」**：Windows 上 `process.kill(pid, 'SIGINT')` / `'SIGTERM'` 会被忽略，
+实际执行的是 `TerminateProcess` —— 目标进程直接消失，`process.on('SIGINT')` 一次都不会触发。
+原生路子是 `GenerateConsoleCtrlEvent`（CTRL_C_EVENT / CTRL_BREAK_EVENT），要 C# 侧 P/Invoke，
+还要求子进程有独立控制台或独立进程组（`CREATE_NEW_PROCESS_GROUP`），且信号会打到整个控制台组；
+对一个本来无控制台的 WinExe 父进程来说，要额外 `AllocConsole`，容易闪一下黑窗、也容易误伤。
+**结论：SIGINT 只能用于「自己在控制台按 Ctrl+C」，跨进程退出仍走 stdin。**
+
+**收尾顺序**（对着现有模块来）
+1. 停止领取新任务：`queue.running = false`；正在跑的迁移任务置 `stopRequested = true`。
+2. **解除 pacer 的等待**：`state.pacer.skip()`（等于界面上的「立即继续」），让还没发出去的请求不再干等。
+   这一条不能省 —— 否则正好卡在随机长休息里时，「优雅退出」要等几分钟到 90 分钟。
+   注意只解除「等待」，**不打断已经在跑的任务**：正在压制的 `magick` 要让它写完，否则会产出破图（见下节）。
+3. 等极短的临界区落地：`tag-groups` / 书签编辑的原子写（tmp + rename），等 Promise 兑现即可。
+4. `server.close()`，让 `/api/*` 的连接自然结束。
+5. 打印 `[launch] bye`，让 launcher 确知是「软退」而不是崩溃。
+6. `process.exit(0)`。
+
+**退出时队列里剩下的任务怎么办**
+
+现状：`queue.pending / queued / actives / done / failed` 全在内存里，没有任何持久化。
+进程一死就全丢，界面上的进度条、失败列表也一起清空。但**已下载的文件不受影响** ——
+`refreshIndex()` 扫 `images/` 重建索引，重新点一次「全部下载」会自动跳过已有的页。
+
+真正需要保护的只有一件事：**正在压制的那一页**。
+`downloadSinglePage` 是「先把原图写到 `images/.tmp/`，再用 `magick` 直接写目标 `.avif`」，
+不是 tmp + rename。压制途中被杀，目标位置会留下一个**截断的 `.avif`**（图能打开但是坏的）。
+所以「等在途任务跑完」不是客套，是防破图 —— 这也说明优雅退出必须等 `magick` 那一步收尾。
+
+另一个遗留：`images/.tmp/` 里可能残留原图（每张几百 KB 到几 MB），而**启动时不清理**
+（只有整作品下载结束时会 `rm` 整个 `.tmp`，单页路径不删）。要补一条启动清理。
+
+结论与做法：
+- 在途任务（最多 `QUEUE_CONCURRENCY` = 2 个）等它跑完，别打断 —— 打断会产出破图。
+- `pending` 里的任务**直接丢弃**，但要把数量打出来（`[launch] 丢弃 N 个待办`），托盘气泡也提示一句。
+- **暂不做队列持久化**。重建成本很低（再点一次「全部下载」，已下的会跳过），
+  而持久化要处理版本兼容、任务升级（`first` → `full`）、pid 已失效这些麻烦事，不划算。
+  如果以后「全部下载」经常是几千条的批量，再考虑做「快照式恢复」（只存 pid + mode，启动时问一句要不要续）。
+- 启动时清空 `images/.tmp/`（顺手把上次残留的原图清掉）。
+
+**不用固定秒数，改成等事件**
+
+「3 秒」是拍脑袋的常数，收尾要多久其实取决于当时在做什么（迁移写到一半、磁盘慢、正在落盘）。
+所以改成握手：
+
+- node 收到退出请求立刻打印 `[launch] shutting-down`，收尾完打印 `[launch] bye`。
+- launcher **等 `bye` 那一行**，而不是等秒表。
+- 兜底上限放宽到 30 秒：真到 30 秒还没 `bye`，说明卡死了（比如原子写挂了），这时才 `Kill`。
+
+这样正常退出通常是毫秒级（步骤 2 已经把最耗时的等待掐掉了），而「不够用」的可能性从常数问题变成真故障才出现的兜底。
+
+**launcher 侧**：写 stdin → 等 `[launch] bye` → 移除托盘图标；只有超过 30 秒没等到才 `Kill()`。
+**正常路径不允许出现 `Kill`**，这条要写进注释里。
 
 ---
 

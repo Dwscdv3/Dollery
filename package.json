@@ -7,6 +7,10 @@
     "type": "git",
     "url": "git+https://github.com/Dwscdv3/Dollery.git"
   },
+  "author": "静瑶 (Dwscdv3)",
+  "contributors": [
+    "DeepSeek"
+  ],
   "type": "module",
   "description": "增量备份 Pixiv 账号收藏元数据到本地纯文本，便于 Git 追踪",
   "bin": {
