@@ -199,7 +199,9 @@
 - **已落地（2026-11-27）**：`package.json` 的 `name` 改为 `dollery`；`index.html` 的 `<title>` 改为「色廊 · Dollery」。
 - **未动**：仓库目录名（仍是 `pixiv-export/`）、`package.json` 的 `bin` 键（仍是 `pixiv-export`，
   怕影响已 link 到全局的命令）、三个 `.bat`、查看器顶栏文案。
-- **使用范围**：个人本地使用，暂不对外开源。
+- **开源范围**：已开源 —— <https://github.com/Dwscdv3/Dollery>，许可证 `GPL-3.0-or-later`（全文见 `LICENSE`）。
+  名称冲突已知情接受：`Dollery` 与那家人偶店重名，真收到异议再改名（见第 8 条）。
+- **注意**：`package.json` 的 `private: true` 保留，它只用来挡住误 `npm publish`，不表示「不公开」。
 
 ---
 
