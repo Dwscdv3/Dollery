@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pixiv 收藏查看器</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=23">
+<link rel="stylesheet" href="style.css?v=30">
 </head>
 <body>
 
@@ -14,14 +14,16 @@
   <div class="tabs" id="tabs"></div>
 
   <div class="filters">
-    <button id="btnFilter" class="icon-btn filter-toggle" title="默认过滤器：与搜索用 AND 连接，点此展开/收起" aria-expanded="false" aria-controls="filterBox">
-      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-        <path d="M2.5 3.5h11l-4.2 4.8v4.2l-2.6 1.3V8.3L2.5 3.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-      </svg>
-    </button>
-    <div class="filter-box" id="filterBox" hidden>
-      <input id="defaultFilter" type="search" placeholder="默认过滤…" autocomplete="off" spellcheck="false" title="默认过滤器：与搜索 AND 连接，留空即不过滤。例如 -is:unavailable">
-      <div class="search-suggest" id="filterSuggest" hidden></div>
+    <div class="filter-pill" id="filterPill">
+      <button id="btnFilter" class="filter-toggle" title="默认过滤器：与搜索用 AND 连接，点此展开/收起" aria-expanded="false" aria-controls="filterBox">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path d="M2.5 3.5h11l-4.2 4.8v4.2l-2.6 1.3V8.3L2.5 3.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <label class="switch filter-switch" title="启用 / 停用默认过滤器">
+        <input type="checkbox" id="filterEnabled" aria-label="启用默认过滤器">
+        <span class="track"></span>
+      </label>
     </div>
     <div class="search-box">
       <input id="search" type="search" placeholder="搜索 / 布尔 / 属性（- 前缀排除）：foo AND is:ai -type:novel" autocomplete="off" spellcheck="false">
@@ -42,6 +44,13 @@
     <button id="btnRight" class="icon-btn edge-in-toolbar" title="下载管理">▤</button>
   </div>
 </header>
+
+<div class="filter-row" id="filterBox" hidden>
+  <div class="filter-row-inner">
+    <input id="defaultFilter" type="search" placeholder="默认过滤…（与搜索 AND，留空即不过滤，例如 -is:unavailable）" autocomplete="off" spellcheck="false">
+    <div class="search-suggest" id="filterSuggest" hidden></div>
+  </div>
+</div>
 
 <div class="guard-banner" id="guardBanner" hidden>
   <span class="guard-icon">⚠</span>
@@ -330,7 +339,7 @@
 
 <div id="toast" class="toast" hidden></div>
 
-<script src="app.js?v=27"></script>
+<script src="app.js?v=37"></script>
 <script src="edge-scroll.js?v=3"></script>
 </body>
 </html>

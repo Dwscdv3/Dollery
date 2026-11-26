@@ -21,6 +21,7 @@ const DEFAULT_SETTINGS = {
   tagIncludeWork: false, // 标签面板是否把作品本身的标签也算进来
   onlyGroups: false, // 标签面板是否只列标签组
   defaultFilter: '-is:unavailable', // 默认过滤器：与搜索 AND 连接，默认藏掉已失效的作品
+  filterEnabled: true, // 默认过滤器的总开关：关掉后条件保留但不参与查询
   filterOpen: false, // 默认过滤器输入框是否展开（纯 UI 状态，不影响过滤是否生效）
   leftOpen: false,
   rightOpen: false,
@@ -67,6 +68,7 @@ const state = {
   tags: [],
   tagGroups: [], // 完整组定义（编辑用）
   groupSummaries: [], // /api/tags 带回的组汇总（带计数）
+  expandedGroups: new Set(), // 展开了哪些组卡片（默认全部折叠）
   pendingConvert: null, // 待确认的批量转换
   lastConvert: null, // 上一次轮询到的转换任务快照
   finishedConverts: new Set(),
@@ -84,7 +86,7 @@ for (const id of [
   'tgModal', 'tgTitle', 'tgSub', 'tgClose', 'tgCount', 'tgMembers', 'tgHint',
   'tgSearch', 'tgCandidates', 'tgDissolve', 'tgCancel', 'tgSave',
   'tcModal', 'tcTitle', 'tcClose', 'tcLead', 'tcCancel', 'tcStart',
-  'btnFilter', 'filterBox', 'defaultFilter', 'filterSuggest',
+  'btnFilter', 'filterPill', 'filterEnabled', 'filterBox', 'defaultFilter', 'filterSuggest',
   'grid', 'sentinel', 'guardBanner', 'guardText', 'guardResume',
   'pacerBanner', 'pacerText', 'pacerSkip',
   'dlSummary', 'dlBar', 'dlMeta', 'dlAll', 'dlFirst', 'dlClear', 'dlVerify', 'dlSources', 'dlFails',
@@ -253,7 +255,23 @@ async function copyImage(record, page = 0) {
 
 // ---------- 设置应用 ----------
 
-/** 把默认过滤器的文本 / 展开状态同步到界面（按钮高亮表示「有条件在生效」）。 */
+/** 只同步「是否在过滤」的视觉状态，不碰输入框内容。 */
+function syncFilterActive() {
+  const text = String(settings.defaultFilter ?? '').trim();
+  const active = settings.filterEnabled && text !== '';
+
+  els.filterEnabled.checked = settings.filterEnabled;
+  els.filterPill.classList.toggle('on', active);
+  els.filterBox.classList.toggle('off', !settings.filterEnabled);
+  els.btnFilter.classList.toggle('on', active);
+  els.btnFilter.title = active
+    ? `默认过滤器：${text}（与搜索 AND，点此展开/收起）`
+    : settings.filterEnabled
+      ? '默认过滤器：未设置（点此展开）'
+      : '默认过滤器已停用（点开关启用）';
+}
+
+/** 把默认过滤器的文本 / 展开状态同步到界面。 */
 function syncFilterUI() {
   const text = String(settings.defaultFilter ?? '');
   // 正在这个框里打字时别回写，否则 trim 会把刚敲的尾随空格吃掉、光标也会跳
@@ -261,11 +279,8 @@ function syncFilterUI() {
     els.defaultFilter.value = text;
   }
   els.filterBox.hidden = !settings.filterOpen;
-  els.btnFilter.classList.toggle('on', text.trim() !== '');
   els.btnFilter.setAttribute('aria-expanded', String(Boolean(settings.filterOpen)));
-  els.btnFilter.title = text.trim()
-    ? `默认过滤器：${text}（与搜索 AND，点此展开/收起）`
-    : '默认过滤器：未设置（点此展开）';
+  syncFilterActive();
 }
 
 function applySettings({ rerender = true } = {}) {
@@ -292,12 +307,10 @@ function applySettings({ rerender = true } = {}) {
 
   syncFilterUI();
 
-  // 重渲染卡片后必须重新 observe，否则新生成的 img[data-src] 不会被触发加载
+  // 卡片外观变了，行高全部作废；只重画视口附近这些行
   if (rerender) {
-    for (const record of state.records) {
-      const card = state.cardMap.get(String(record.pid));
-      if (card) refreshCard(card, record);
-    }
+    resetGridRender();
+    scheduleGridPaint(true);
   }
 }
 
@@ -333,117 +346,334 @@ function renderSideTabs() {
   }
 }
 
+// 换类别 / 换面板时可能有多个请求同时在飞，只让最后一次的结果落地
+let sidePanelSeq = 0;
+
 async function loadSidePanel() {
+  const seq = ++sidePanelSeq;
+  const panel = state.sidePanel;
+  const source = state.current;
+
   renderSideTabs();
-  const isTags = state.sidePanel === 'tags';
+  const isTags = panel === 'tags';
   els.tagIncludeWrap.hidden = !isTags;
   els.onlyGroupsWrap.hidden = !isTags;
   els.tagIncludeWork.checked = settings.tagIncludeWork;
   els.onlyGroups.checked = settings.onlyGroups;
+
+  // 换面板 / 换来源时回到顶部，旧的高度缓存保留（按 key 命中，不会串行）
+  sidebarView.items = [];
+  sidebarView.lastRange = '';
+  els.sideList.scrollTop = 0;
   els.sideList.innerHTML = '<div class="side-empty">加载中…</div>';
 
   try {
-    if (state.sidePanel === 'authors') {
-      const data = await api(`/api/authors?source=${encodeURIComponent(state.current)}`);
+    if (panel === 'authors') {
+      const data = await api(`/api/authors?source=${encodeURIComponent(source)}`);
+      if (seq !== sidePanelSeq) return;
       state.authors = data.authors;
       renderAuthors();
     } else {
       const include = settings.tagIncludeWork ? '&include=1' : '';
-      const data = await api(`/api/tags?source=${encodeURIComponent(state.current)}${include}`);
+      const data = await api(`/api/tags?source=${encodeURIComponent(source)}${include}`);
+      if (seq !== sidePanelSeq) return;
       state.tags = data.tags;
       state.groupSummaries = data.groups ?? [];
       state.tagGroups = state.groupSummaries.map((group) => ({ id: group.id, tags: [...group.tags] }));
       renderTags();
     }
   } catch (err) {
+    if (seq !== sidePanelSeq) return;
+    sidebarView.items = [];
     els.sideList.innerHTML = `<div class="side-empty">加载失败：${escapeHtml(err.message)}</div>`;
   }
+}
+
+/* ── 侧栏虚拟列表 ──────────────────────────────────────────
+ * 作者和标签都可能上千条，一次性塞进 DOM 会卡住面板。这里只渲染视口附近的一小段，
+ * 用上下两个占位块把总高度撑住，滚动条长度从第一帧起就是对的。
+ *
+ * 每项高度在渲染后实测并缓存（组展开/折叠用不同的 key），所以折叠组、展开组、
+ * 头像行混在一起也能算准；滚动时高度变了会同步修正占位块，必要时把 scrollTop
+ * 拉回原来的锚点，避免列表内容跳一下。
+ */
+
+const sidebarView = {
+  items: [],
+  heights: new Map(),
+  empty: '',
+  version: 0,
+  lastRange: '',
+  frame: 0,
+};
+
+function sidebarItemHtml(item) {
+  if (item.kind === 'author') return authorRowHtml(item.data);
+  if (item.kind === 'group') return groupCardHtml(item.data.group, item.data.expanded, item.data.filtering);
+  return tagRowHtml(item.data, item.showBadge);
+}
+
+function authorRowHtml(a) {
+  return `
+    <div class="side-item${a.author_id === state.authorId ? ' active' : ''}"
+         data-author="${escapeHtml(a.author_id)}" title="${escapeHtml(a.name)}">
+      <img class="avatar" src="/api/avatar/${encodeURIComponent(a.author_id)}" loading="lazy" alt="">
+      <span class="name">${escapeHtml(a.name)}</span>
+      <span class="cnt">${a.count}</span>
+    </div>`;
+}
+
+/** 找到高度区间包含 value 的项下标（prefix 长度 = 项数 + 1）。 */
+function findSlot(prefix, value) {
+  if (value <= 0) return 0;
+  let lo = 0;
+  let hi = prefix.length - 2;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (prefix[mid] <= value) lo = mid;
+    else hi = mid - 1;
+  }
+  return Math.max(0, Math.min(lo, prefix.length - 2));
+}
+
+function updateSidebarSpacers(topHeight, bottomHeight) {
+  const pads = els.sideList.querySelectorAll('.vpad');
+  if (pads[0]) pads[0].style.height = `${Math.max(0, topHeight)}px`;
+  if (pads[1]) pads[1].style.height = `${Math.max(0, bottomHeight)}px`;
+}
+
+function paintSidebar(force = false) {
+  const box = els.sideList;
+  const items = sidebarView.items;
+
+  // 面板收起时量不到高度，等 ResizeObserver 触发再画
+  if (!box.clientHeight) return;
+
+  if (items.length === 0) {
+    box.innerHTML = `<div class="side-empty">${escapeHtml(sidebarView.empty || '没有内容')}</div>`;
+    sidebarView.lastRange = '';
+    return;
+  }
+
+  const heights = items.map((item) => sidebarView.heights.get(item.key) ?? item.estimate);
+  const prefix = new Array(items.length + 1);
+  prefix[0] = 0;
+  for (let i = 0; i < items.length; i += 1) prefix[i + 1] = prefix[i] + heights[i];
+
+  const top = box.scrollTop;
+  const bottom = top + box.clientHeight;
+  const first = findSlot(prefix, top);
+  const last = findSlot(prefix, bottom);
+  const start = Math.max(0, first - 4);
+  const end = Math.min(items.length, last + 5);
+
+  const sig = `${sidebarView.version}:${start}:${end}`;
+  if (!force && sig === sidebarView.lastRange) return;
+  sidebarView.lastRange = sig;
+
+  const chunks = [];
+  for (let i = start; i < end; i += 1) {
+    chunks.push(
+      `<div class="vitem" data-vkey="${escapeHtml(items[i].key)}">${sidebarItemHtml(items[i])}</div>`,
+    );
+  }
+
+  box.innerHTML =
+    `<div class="vpad" style="height:${prefix[start]}px"></div>` +
+    chunks.join('') +
+    `<div class="vpad" style="height:${prefix[items.length] - prefix[end]}px"></div>`;
+
+  let changed = false;
+  for (const node of box.querySelectorAll('.vitem')) {
+    const key = node.dataset.vkey;
+    const height = node.getBoundingClientRect().height;
+    if (!height) continue;
+    const prev = sidebarView.heights.get(key);
+    if (prev === undefined || Math.abs(prev - height) > 0.5) {
+      sidebarView.heights.set(key, height);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    const next = new Array(items.length + 1);
+    next[0] = 0;
+    for (let i = 0; i < items.length; i += 1) {
+      next[i + 1] = next[i] + (sidebarView.heights.get(items[i].key) ?? items[i].estimate);
+    }
+    const delta = next[start] - prefix[start];
+    updateSidebarSpacers(next[start], next[items.length] - next[end]);
+    if (Math.abs(delta) > 0.5) box.scrollTop = top + delta;
+    // 总高度变了，通知自绘滚动条重新算滑块长度
+    box.dispatchEvent(new Event('scroll'));
+    scheduleSidebarPaint();
+  }
+}
+
+function scheduleSidebarPaint() {
+  if (sidebarView.frame) return;
+  sidebarView.frame = requestAnimationFrame(() => {
+    sidebarView.frame = 0;
+    paintSidebar();
+  });
+}
+
+function setSidebarItems(items, emptyText) {
+  sidebarView.items = items;
+  sidebarView.empty = emptyText;
+  sidebarView.version += 1;
+  sidebarView.lastRange = '';
+  paintSidebar(true);
 }
 
 function renderAuthors() {
   const filter = state.sideQuery.trim().toLowerCase();
   const list = filter ? state.authors.filter((a) => a.name.toLowerCase().includes(filter)) : state.authors;
 
-  if (list.length === 0) {
-    els.sideList.innerHTML = '<div class="side-empty">没有匹配的作者</div>';
-    return;
-  }
-
-  els.sideList.innerHTML = list
-    .slice(0, 400)
-    .map(
-      (a) => `
-      <div class="side-item${a.author_id === state.authorId ? ' active' : ''}" data-author="${escapeHtml(
-        a.author_id,
-      )}" title="${escapeHtml(a.name)}">
-        <img class="avatar" src="/api/avatar/${encodeURIComponent(a.author_id)}" loading="lazy" alt="">
-        <span class="name">${escapeHtml(a.name)}</span>
-        <span class="cnt">${a.count}</span>
-      </div>`,
-    )
-    .join('');
+  setSidebarItems(
+    list.map((a) => ({ kind: 'author', key: `a:${a.author_id}`, estimate: 46, data: a })),
+    '没有匹配的作者',
+  );
 }
 
 function renderTags() {
   const filter = state.sideQuery.trim().toLowerCase();
-  if (settings.onlyGroups) return renderGroupList(filter);
+  const filtering = filter.length > 0;
 
-  const list = filter ? state.tags.filter((t) => t.tag.toLowerCase().includes(filter)) : state.tags;
-
-  if (list.length === 0) {
-    els.sideList.innerHTML = '<div class="side-empty">没有匹配的标签</div>';
+  // 筛选时退回扁平列表：点到哪个标签一目了然，也免得卡片在搜索过程中忽开忽合
+  if (filtering && !settings.onlyGroups) {
+    const list = state.tags.filter((t) => t.tag.toLowerCase().includes(filter));
+    setSidebarItems(
+      list.map((t) => ({
+        kind: 'tag',
+        key: `t:${t.tag}`,
+        estimate: 31,
+        data: t,
+        showBadge: Boolean(t.group),
+      })),
+      '没有匹配的标签',
+    );
     return;
   }
 
-  els.sideList.innerHTML = list
-    .map(
-      (t) => `
-      <div class="side-item" data-tag="${escapeHtml(t.tag)}" title="${escapeHtml(t.tag)}">
-        <span class="name">${escapeHtml(t.tag)}</span>
-        ${
-          t.group
-            ? `<span class="tag-link" title="组内 ${t.group.size} 个成员，组总计 ${t.group.total}">组</span>`
-            : ''
-        }
-        <span class="cnt">${t.count}</span>
-        <button class="tag-more" type="button" data-more="${escapeHtml(t.tag)}" title="标签组操作">⋯</button>
-      </div>`,
+  // 按显示出来的去重计数排序（和标签行的 count 是同一个口径），
+  // 成员计数之和只在并列时作次级参考
+  const groups = state.groupSummaries
+    .filter(
+      (group) =>
+        !filtering ||
+        group.representative.toLowerCase().includes(filter) ||
+        group.tags.some((tag) => tag.toLowerCase().includes(filter)),
     )
-    .join('');
-}
+    .sort(
+      (a, b) =>
+        b.union - a.union || b.total - a.total || a.representative.localeCompare(b.representative, 'zh'),
+    );
 
-/** 只看标签组：每组一行，名字取计数最多的成员。 */
-function renderGroupList(filter) {
-  const groups = state.groupSummaries.slice().sort(
-    (a, b) => b.total - a.total || a.representative.localeCompare(b.representative, 'zh'),
+  // 组里的标签不再单独出现在扁平列表里，全部收进组卡片
+  const tags = settings.onlyGroups ? [] : state.tags.filter((tag) => !tag.groupId);
+
+  const entries = [];
+
+  for (const group of groups) {
+    const expanded = filtering || state.expandedGroups.has(group.id);
+    entries.push({
+      kind: 'group',
+      sort: group.union,
+      key: `g:${group.id}:${expanded ? 1 : 0}`,
+      estimate: expanded ? 46 + group.tags.length * 28 : 40,
+      data: { group, expanded, filtering },
+    });
+  }
+
+  if (!settings.onlyGroups) {
+    for (const tag of tags) {
+      entries.push({ kind: 'tag', sort: tag.count, key: `t:${tag.tag}`, estimate: 31, data: tag });
+    }
+  }
+
+  entries.sort((a, b) => {
+    if (a.sort !== b.sort) return b.sort - a.sort;
+    if (a.kind !== b.kind) return a.kind === 'group' ? -1 : 1;
+    const left = a.kind === 'group' ? a.data.group.representative : a.data.tag;
+    const right = b.kind === 'group' ? b.data.group.representative : b.data.tag;
+    return left.localeCompare(right, 'zh');
+  });
+
+  setSidebarItems(
+    entries,
+    settings.onlyGroups ? '还没有标签组，在标签的 ⋯ 菜单里新建' : '没有标签',
   );
-
-  const list = filter
-    ? groups.filter(
-        (g) =>
-          g.representative.toLowerCase().includes(filter) ||
-          g.tags.some((tag) => tag.toLowerCase().includes(filter)),
-      )
-    : groups;
-
-  if (list.length === 0) {
-    els.sideList.innerHTML = '<div class="side-empty">还没有标签组，在标签的 ⋯ 菜单里新建</div>';
-    return;
-  }
-
-  els.sideList.innerHTML = list
-    .map(
-      (g) => `
-      <div class="side-item group-item${g.union > 0 ? '' : ' zero'}" data-group="${escapeHtml(g.id)}"
-           title="${escapeHtml(g.tags.join(' / '))}">
-        <span class="name">${escapeHtml(g.representative)}</span>
-        <span class="tag-link" title="组内 ${g.tags.length} 个成员">×${g.tags.length}</span>
-        <span class="cnt" title="去重后 ${g.union} 个作品；成员计数之和 ${g.total}（用于排序）">${g.union}</span>
-        <button class="tag-more" type="button" data-more-group="${escapeHtml(g.id)}" title="标签组操作">⋯</button>
-      </div>`,
-    )
-    .join('');
 }
+
+function tagRowHtml(t, showGroupBadge) {
+  const badge =
+    showGroupBadge && t.group
+      ? `<span class="tag-link" title="组内 ${t.group.size} 个成员">组</span>`
+      : '';
+
+  return `
+    <div class="side-item" data-tag="${escapeHtml(t.tag)}" title="${escapeHtml(t.tag)}">
+      <span class="name">${escapeHtml(t.tag)}</span>
+      ${badge}
+      <span class="cnt">${t.count}</span>
+      <button class="tag-more" type="button" data-more="${escapeHtml(t.tag)}" title="标签组操作">⋯</button>
+    </div>`;
+}
+
+/**
+ * 组卡片：标题是「当前计数最多的成员」，只是显示名，不是独立的主标签。
+ * 展开后 members 全部列出 —— 包括被拿来当标题的那一个。
+ *
+ * 标题和折叠按钮是两个独立控件：点标题 = 按整组筛选，点左侧三角 = 展开/折叠。
+ */
+function groupCardHtml(group, expanded, filtering) {
+  const members = group.members
+    .slice()
+    .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag, 'zh'));
+
+  const body = expanded
+    ? `<div class="tag-group-members">${members
+        .map(
+          (member) => `
+          <div class="side-item" data-tag="${escapeHtml(member.tag)}" title="${escapeHtml(member.tag)}">
+            <span class="name">${escapeHtml(member.tag)}</span>
+            <span class="cnt">${member.count}</span>
+            <button class="tag-more" type="button" data-more="${escapeHtml(member.tag)}" title="标签组操作">⋯</button>
+          </div>`,
+        )
+        .join('')}</div>`
+    : '';
+
+  return `
+    <div class="tag-group${expanded ? ' open' : ''}${group.union > 0 ? '' : ' zero'}"
+         data-group-card="${escapeHtml(group.id)}">
+      <div class="tag-group-head" title="${escapeHtml(group.tags.join(' / '))}">
+        <button class="tag-group-toggle" type="button" data-toggle-group="${escapeHtml(group.id)}"
+                aria-expanded="${expanded ? 'true' : 'false'}"${filtering ? ' disabled' : ''}
+                title="${filtering ? '筛选时自动展开' : '展开 / 折叠'}">
+          <span class="tag-group-chevron">▸</span>
+        </button>
+        <button class="tag-group-title" type="button"
+                data-group-search="${escapeHtml(group.representative)}"
+                title="按整组筛选（${escapeHtml(group.representative)}）">
+          ${escapeHtml(group.representative)}
+        </button>
+        <span class="tag-link" title="组内 ${group.tags.length} 个成员">${group.tags.length}</span>
+        <span class="cnt" title="组内共 ${group.union} 个作品（同一作品打了多个成员标签只算一次）；成员计数之和 ${group.total}">${group.union}</span>
+        <button class="tag-more" type="button" data-more-group="${escapeHtml(group.id)}" title="标签组操作">⋯</button>
+      </div>
+      ${body}
+    </div>`;
+}
+
+els.sideList.addEventListener('scroll', scheduleSidebarPaint, { passive: true });
+
+// 面板折叠/展开、窗口缩放都会改变可用高度，重新画一遍
+new ResizeObserver(() => {
+  sidebarView.lastRange = '';
+  scheduleSidebarPaint();
+}).observe(els.sideList);
 
 els.tagIncludeWork.addEventListener('change', () => {
   settings.tagIncludeWork = els.tagIncludeWork.checked;
@@ -491,11 +721,22 @@ els.sideList.addEventListener('click', (event) => {
     return;
   }
 
-  // 点组行 = 按整组筛选（代表标签会由服务端展开成全部同义标签）
-  const groupItem = event.target.closest('[data-group]');
-  if (groupItem) {
-    const group = groupSummary(groupItem.dataset.group);
-    if (group) addTagToSearch(group.representative);
+  // 组标题 = 展开 / 折叠（筛选时自动展开，按钮置灰）
+  const toggle = event.target.closest('[data-toggle-group]');
+  if (toggle) {
+    if (!toggle.disabled) {
+      const id = toggle.dataset.toggleGroup;
+      if (state.expandedGroups.has(id)) state.expandedGroups.delete(id);
+      else state.expandedGroups.add(id);
+      renderTags();
+    }
+    return;
+  }
+
+  // 组标题 = 按整组筛选（服务端会把代表标签展开成全部同义标签）
+  const groupSearch = event.target.closest('[data-group-search]');
+  if (groupSearch) {
+    addTagToSearch(groupSearch.dataset.groupSearch);
     return;
   }
 
@@ -506,11 +747,11 @@ els.sideList.addEventListener('click', (event) => {
 // 右键和 ⋯ 打开同一份菜单
 els.sideList.addEventListener('contextmenu', (event) => {
   const tagItem = event.target.closest('[data-tag]');
-  const groupItem = event.target.closest('[data-group]');
-  if (!tagItem && !groupItem) return;
+  const card = event.target.closest('[data-group-card]');
+  if (!tagItem && !card) return;
   event.preventDefault();
   if (tagItem) openTagMenu(tagItem.dataset.tag, null, event.clientX, event.clientY);
-  else openGroupMenu(groupItem.dataset.group, null, event.clientX, event.clientY);
+  else openGroupMenu(card.dataset.groupCard, null, event.clientX, event.clientY);
 });
 
 /** 点标签不是立即筛选，而是把它拼进顶部搜索框（用引号包住，标签里可能有空格）。 */
@@ -1000,7 +1241,7 @@ function buildQuery(offset) {
   if (state.query) params.set('q', state.query);
   // 默认过滤器和搜索分开传，服务端用 AND 组合 —— 拼成一个字符串的话
   // 用户写的 `a OR b` 会被外层 AND 抢走优先级。
-  const defaultFilter = String(settings.defaultFilter ?? '').trim();
+  const defaultFilter = settings.filterEnabled ? String(settings.defaultFilter ?? '').trim() : '';
   if (defaultFilter) params.set('f', defaultFilter);
   if (state.tag) params.set('tag', state.tag);
   if (state.authorId) params.set('author_id', state.authorId);
@@ -1008,39 +1249,39 @@ function buildQuery(offset) {
   return `/api/records?${params}`;
 }
 
+// 切类别时可能有旧请求还在飞：用序号作废旧结果，重置也不能被 loading 吞掉
+let gridLoadSeq = 0;
+
 async function loadPage(reset) {
-  if (state.loading) return;
+  if (state.loading && !reset) return;
+
+  if (reset) {
+    gridLoadSeq += 1; // 让在飞的那次作废
+    resetGridRender();
+    state.offset = 0;
+    state.total = 0;
+    state.records = [];
+    hoveredRecord = null; // 旧卡片已经没了，别让 L / C 指到不存在的作品
+    document.querySelector('.grid-wrap').scrollTop = 0;
+  }
+
+  const seq = ++gridLoadSeq;
   state.loading = true;
 
   try {
-    if (reset) {
-      state.offset = 0;
-      state.records = [];
-      state.cardMap.clear();
-      hoveredRecord = null; // 旧卡片已经没了，别让 L / C 指到不存在的作品
-      els.grid.innerHTML = '';
-      document.querySelector('.grid-wrap').scrollTop = 0;
-    }
-
     const data = await api(buildQuery(state.offset));
+    if (seq !== gridLoadSeq) return; // 期间又切了类别，这页已经过期
+
     state.total = data.total;
-
-    if (reset && data.items.length === 0) {
-      els.grid.innerHTML = '<div class="empty">这个筛选条件下没有作品。</div>';
-    }
-
     state.records.push(...data.items);
     state.offset += data.items.length;
 
-    const frag = document.createDocumentFragment();
-    for (const record of data.items) frag.appendChild(createCard(record));
-    els.grid.appendChild(frag);
-
     updateCounter();
+    scheduleGridPaint(true);
   } catch {
     // 加载失败保持现状：滚动到底会自动重试，不必打断已渲染的内容
   } finally {
-    state.loading = false;
+    if (seq === gridLoadSeq) state.loading = false;
   }
 }
 
@@ -1050,6 +1291,249 @@ function updateCounter() {
 
 function reloadAll() {
   loadPage(true);
+}
+
+/* ── 网格虚拟列表 ──────────────────────────────────────────
+ * 只渲染视口附近的行，用绝对定位把行摆到算好的位置上；滚动条高度按
+ * 「总行数 × 每行高度」一开始就撑满，不会随着滚动一截截变长。
+ *
+ * 行高先估后测：固定比例时估得基本准，原图比例时用已测行的均值，随着滚动
+ * 逐步修正 —— 原图模式下滚动条轻微跳动是预期行为。
+ *
+ * 卡片按行复用：滚出视口的行先从 DOM 摘下放进池子里，滚回来直接挂上，
+ * 避免反复重建 DOM 和重新解码缩略图。
+ */
+
+const gridView = {
+  rows: new Map(), // 行号 -> 行元素（含已摘下的池）
+  heights: new Map(), // 行号 -> 实测高度
+  sample: 0, // 已测行高的滑动均值，用来估未加载的行
+  layout: null,
+  lastRange: '',
+  frame: 0,
+  skipAnchor: 0, // 刚换过列数时，前几轮跳过锚点补偿，保住 scrollTop
+};
+
+function gridLayout() {
+  const wrap = document.querySelector('.grid-wrap');
+  const width = Math.max(0, wrap.clientWidth - 28); // 两侧各 14px
+  const gap = 12;
+  const cols = Math.max(1, Math.floor((width + gap) / (settings.cardWidth + gap)));
+  return { cols, gap, width, pad: 14 };
+}
+
+function gridRowEstimate() {
+  if (gridView.sample) return gridView.sample;
+
+  const { cols, gap, width } = gridView.layout;
+  const colW = (width - gap * (cols - 1)) / cols;
+  const ratio =
+    settings.ratio === 'auto'
+      ? 1.33
+      : (() => {
+          const [a, b] = settings.ratio.split(':').map(Number);
+          return b / a;
+        })();
+
+  // 信息区：上下 padding 16 + 标题行 16 + 作者/星星行 15，再留一点余量
+  const info = settings.showOwnTags || settings.showTags ? 69 : 49;
+  return colW * ratio + 2 + (settings.overlayInfo ? 0 : info);
+}
+
+function forgetCard(card) {
+  const pid = String(card.dataset.pid);
+  if (state.cardMap.get(pid) === card) state.cardMap.delete(pid);
+  state.observer?.unobserve(card);
+}
+
+/** 清掉所有行元素，但保留记录和布局。 */
+function clearGridRows() {
+  for (const el of gridView.rows.values()) el.remove();
+  gridView.rows.clear();
+  for (const card of state.cardMap.values()) state.observer?.unobserve(card);
+  state.cardMap.clear();
+  els.grid.innerHTML = '';
+  gridView.lastRange = '';
+}
+
+/**
+ * 布局或卡片外观变化：行高缓存也一起作废。
+ *
+ * 注意这里故意**不把 .grid 的高度清零**。高度一旦变成 0，浏览器的滚动范围跟着消失，
+ * 会把 scrollTop 夹到 0 —— 开关侧栏之后网格跳回顶部就是这么来的。
+ * 保留旧高度，浏览器就会自己把 scrollTop 原样留住，下一次 paintGrid 再把高度改成新值。
+ */
+function resetGridRender() {
+  clearGridRows();
+  gridView.heights.clear();
+  gridView.sample = 0;
+  gridView.layout = null;
+}
+
+function makeGridRow(index) {
+  const { cols } = gridView.layout;
+  const el = document.createElement('div');
+  el.className = 'grid-row';
+  el.dataset.row = String(index);
+  el.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+
+  const start = index * cols;
+  for (let k = 0; k < cols; k += 1) {
+    const record = state.records[start + k];
+    if (!record) break;
+    el.appendChild(createCard(record, { eager: true }));
+  }
+
+  return el;
+}
+
+/** 复用的行里，记录对象可能已经因为编辑被替换过，逐张对一下。 */
+function syncGridRow(el, index) {
+  const { cols } = gridView.layout;
+  const cards = [...el.children];
+
+  // 记录是分页追加的，最后一行的卡片数会变多，缺的要补上
+  for (let k = 0; k < cols; k += 1) {
+    const record = state.records[index * cols + k];
+    if (!record) break;
+    if (k < cards.length) {
+      if (cards[k]._sig !== cardSignature(record)) refreshCard(cards[k], record);
+    } else {
+      el.appendChild(createCard(record, { eager: true }));
+    }
+  }
+}
+
+function scheduleGridPaint(force = false) {
+  if (gridView.frame) return;
+  gridView.frame = requestAnimationFrame(() => {
+    gridView.frame = 0;
+    paintGrid(force);
+  });
+}
+
+function paintGrid(force = false) {
+  const wrap = document.querySelector('.grid-wrap');
+
+  // 先定布局。宽度或列数变了，行高也不再成立
+  const layout = gridLayout();
+  if (
+    !gridView.layout ||
+    Math.abs(layout.width - gridView.layout.width) > 0.5 ||
+    layout.cols !== gridView.layout.cols
+  ) {
+    clearGridRows();
+    gridView.heights.clear();
+    gridView.sample = 0;
+    gridView.layout = layout;
+    // 这一轮是在换了列数的重排：所有行都是新建的，别再用「锚点行」去补偿行高差，
+    // 否则 scrollTop 会被自己推动大半屏。保持浏览器的偏移量不动就好。
+    gridView.skipAnchor = 3; // 含视口上方两行的实测轮次，一起跳过
+  }
+
+  if (state.total === 0 && state.records.length === 0) {
+    els.grid.innerHTML = '<div class="empty">这个筛选条件下没有作品。</div>';
+    els.grid.style.height = 'auto';
+    return;
+  }
+
+  const { cols, gap, pad } = gridView.layout;
+  const rowCount = Math.max(1, Math.ceil(Math.max(state.total, state.records.length) / cols));
+
+  // 上一次可能是空结果，占位提示要清掉
+  els.grid.querySelector('.empty')?.remove();
+  const estimate = gridRowEstimate();
+
+  const prefix = new Array(rowCount + 1);
+  prefix[0] = 0;
+  // 行与行之间也要留 gap：前缀里把「行高 + 间距」一起累加，
+  // 最后再把末尾多算的那一个间距减掉
+  for (let i = 0; i < rowCount; i += 1) {
+    prefix[i + 1] = prefix[i] + (gridView.heights.get(i) ?? estimate) + gap;
+  }
+
+  const scrollTop = wrap.scrollTop;
+  const viewTop = Math.max(0, scrollTop - pad);
+  const viewBottom = scrollTop + wrap.clientHeight;
+  const first = findSlot(prefix, viewTop);
+  const last = findSlot(prefix, Math.min(viewBottom, prefix[rowCount]));
+  const start = Math.max(0, first - 2);
+  const end = Math.min(rowCount, last + 3);
+
+  const loadedRows = Math.ceil(state.records.length / cols);
+  const sig = `${start}:${end}:${loadedRows}:${rowCount}`;
+
+  if (!force && sig === gridView.lastRange) {
+    // 范围没变也要看看要不要继续加载
+    if (state.offset < state.total && !state.loading && end >= loadedRows - 1) loadPage(false);
+    return;
+  }
+  gridView.lastRange = sig;
+
+  for (let i = start; i < end && i < loadedRows; i += 1) {
+    let el = gridView.rows.get(i);
+    if (!el) {
+      el = makeGridRow(i);
+      gridView.rows.set(i, el);
+    } else {
+      syncGridRow(el, i);
+    }
+    el.style.top = `${pad + prefix[i]}px`;
+    if (el.parentNode !== els.grid) els.grid.appendChild(el);
+  }
+
+  // 视口外的行先摘下；离得太远的直接回收，避免整个列表都留在内存里
+  for (const [i, el] of gridView.rows) {
+    if (i >= start && i < end) continue;
+    el.remove();
+    if (i < start - 10 || i >= end + 10) {
+      for (const card of el.querySelectorAll('.card')) forgetCard(card);
+      gridView.rows.delete(i);
+    }
+  }
+
+  els.grid.style.height = `${pad * 2 + prefix[rowCount] - gap}px`;
+  wrap.dispatchEvent(new Event('scroll'));
+
+  // 新挂上来的行量一下真实高度
+  let measured = false;
+  for (let i = start; i < end && i < loadedRows; i += 1) {
+    if (gridView.heights.has(i)) continue;
+    const el = gridView.rows.get(i);
+    if (!el) continue;
+    const height = el.offsetHeight;
+    if (height > 0) {
+      gridView.heights.set(i, height);
+      gridView.sample = gridView.sample ? gridView.sample * 0.7 + height * 0.3 : height;
+      measured = true;
+    }
+  }
+
+  if (measured) {
+    const next = new Array(rowCount + 1);
+    next[0] = 0;
+    for (let i = 0; i < rowCount; i += 1) {
+      next[i + 1] = next[i] + (gridView.heights.get(i) ?? estimate) + gap;
+    }
+    els.grid.style.height = `${pad * 2 + next[rowCount] - gap}px`;
+    wrap.dispatchEvent(new Event('scroll'));
+
+    // 视口上方的高度变了的话，把锚点行拉回原来的屏幕位置。
+    // 刚换过列数的第一轮例外：行是新建的，补偿只会把 scrollTop 推走。
+    const delta = next[first] - prefix[first];
+    if (gridView.skipAnchor > 0) gridView.skipAnchor -= 1;
+    else if (first > 0 && Math.abs(delta) > 0.5) wrap.scrollTop = scrollTop + delta;
+
+    gridView.lastRange = '';
+    scheduleGridPaint();
+  }
+
+  if (hoveredRecord) {
+    const card = state.cardMap.get(String(hoveredRecord.pid));
+    if (!card || !card.isConnected) hoveredRecord = null;
+  }
+
+  if (state.offset < state.total && !state.loading && end >= loadedRows - 1) loadPage(false);
 }
 
 // ---------- 卡片 ----------
@@ -1071,17 +1555,61 @@ function thumbUrl(record, page) {
   return `/api/thumb/${record.pid}/${page}?w=${target}`;
 }
 
-function createCard(record) {
+/** 把卡片里的缩略图从 data-src 切到真实 src。虚拟列表里卡片都在视口附近，直接加载。 */
+function loadCardImage(card) {
+  const img = card.querySelector('img[data-src]');
+  if (!img) return;
+
+  img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
+  img.addEventListener(
+    'error',
+    () => {
+      img.classList.add('loaded');
+      img.style.opacity = '0.2';
+    },
+    { once: true },
+  );
+  img.src = img.dataset.src;
+  delete img.dataset.src;
+}
+
+/** 卡片上会变的那些字段，拼成一个签名；行被回收后靠它判断要不要重画。 */
+function cardSignature(record) {
+  return JSON.stringify([
+    record.title,
+    record.author,
+    record.hasImage,
+    record.hasCover,
+    record.localNovel,
+    record.localUgoira,
+    record.downloading,
+    record.error ?? '',
+    record.removed ?? '',
+    record.status ?? '',
+    record.pages,
+    record.bookmark_tags ?? [],
+    (record.tags ?? []).length,
+    ratingValueOf(record),
+  ]);
+}
+
+function createCard(record, { eager = false } = {}) {
   const card = document.createElement('article');
   card.className = 'card';
   card.dataset.pid = record.pid;
+  card._record = record;
+  card._sig = cardSignature(record);
   renderCardInner(card, record);
-  card.addEventListener('click', () => openLightbox(record, card));
+
+  // 用 _record 而不是闭包里的 record：卡片可能被回收复用，记录对象会换新的
+  card.addEventListener('click', () => {
+    if (card._record) openLightbox(card._record, card);
+  });
   card.addEventListener('mouseenter', () => {
-    hoveredRecord = record;
+    hoveredRecord = card._record;
   });
   card.addEventListener('mouseleave', () => {
-    if (hoveredRecord === record) hoveredRecord = null;
+    if (hoveredRecord === card._record) hoveredRecord = null;
   });
   state.cardMap.set(String(record.pid), card);
 
@@ -1092,22 +1620,9 @@ function createCard(record) {
           if (!entry.isIntersecting) continue;
           state.observer.unobserve(entry.target);
 
-          const img = entry.target.querySelector('img[data-src]');
-          if (img) {
-            img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
-            img.addEventListener(
-              'error',
-              () => {
-                img.classList.add('loaded');
-                img.style.opacity = '0.2';
-              },
-              { once: true },
-            );
-            img.src = img.dataset.src;
-            delete img.dataset.src;
-          }
+          loadCardImage(entry.target);
 
-          const target = state.records.find((r) => String(r.pid) === entry.target.dataset.pid);
+          const target = entry.target._record;
           if (target) queueForDownload(target);
         }
       },
@@ -1115,6 +1630,8 @@ function createCard(record) {
     );
   }
   state.observer.observe(card);
+
+  if (eager) loadCardImage(card);
 
   return card;
 }
@@ -1581,6 +2098,8 @@ function renderCardInner(card, record) {
 }
 
 function refreshCard(card, record) {
+  card._record = record;
+  card._sig = cardSignature(record);
   renderCardInner(card, record);
   state.observer?.observe(card);
 }
@@ -2986,6 +3505,7 @@ function renderPacerBanner(pacer) {
   const limits = pacer.limits ?? {};
   const chance = Number(((limits.pauseChance ?? 0) * 100).toFixed(2));
   const perSec = Math.round((limits.perRequestMs ?? 0) / 1000);
+  const decaySec = Math.round((limits.decayMs ?? 5000) / 1000);
   const minPause = Math.round((limits.minPauseMs ?? 0) / 60000);
   const maxPause = Math.round((limits.maxPauseMs ?? 0) / 60000);
 
@@ -2993,7 +3513,8 @@ function renderPacerBanner(pacer) {
   els.pacerText.innerHTML =
     `<b>随机休息中</b> · 还剩 <span class="left">${formatCountdown(pacer.remainingMs)}</span>` +
     `<br><span class="muted">触发前已连续请求 ${pacer.pauseRequests} 次，本次休息 ${formatCountdown(pacer.pauseMs)}；` +
-    `每个请求 ${chance}% 概率触发，每多一个请求期望 +${perSec} 秒（${minPause}–${maxPause} 分钟封顶），模拟真人的使用节奏。</span>`;
+    `每个请求 ${chance}% 概率触发，每多一个请求期望 +${perSec} 秒（${minPause}–${maxPause} 分钟封顶），` +
+    `空闲时每 ${decaySec} 秒回退 1 次，模拟真人的使用节奏。</span>`;
 
   // 倒计时进度条：剩余比例越小，底部填充越短
   const ratio = pacer.pauseMs > 0 ? (pacer.remainingMs / pacer.pauseMs) * 100 : 0;
@@ -3035,12 +3556,32 @@ els.search.addEventListener('input', () => {
 let filterTimer = null;
 els.defaultFilter.addEventListener('input', () => {
   settings.defaultFilter = els.defaultFilter.value.trim();
+  // 动手写条件了，就默认是想让它生效
+  if (settings.defaultFilter && !settings.filterEnabled) settings.filterEnabled = true;
   saveSettings();
   // 这里不调 syncFilterUI：它会把输入框内容回写成 trim 后的值，正在敲的尾随空格会被吃掉
-  els.btnFilter.classList.toggle('on', settings.defaultFilter !== '');
+  syncFilterActive();
   showSuggest(FILTER_EDITOR);
   clearTimeout(filterTimer);
   filterTimer = setTimeout(reloadAll, 280);
+});
+
+// 胶囊里的开关：关掉后条件保留，但不参与查询
+els.filterEnabled.addEventListener('change', () => {
+  settings.filterEnabled = els.filterEnabled.checked;
+  saveSettings();
+
+  // 打开时如果还没写条件，顺手把输入框展开
+  if (settings.filterEnabled && !String(settings.defaultFilter ?? '').trim()) {
+    settings.filterOpen = true;
+    saveSettings();
+    syncFilterUI();
+    els.defaultFilter.focus();
+    return;
+  }
+
+  syncFilterUI();
+  reloadAll();
 });
 
 els.btnFilter.addEventListener('click', () => {
@@ -3284,7 +3825,9 @@ els.optReset.addEventListener('click', () => {
 els.btnLeft.addEventListener('click', () => {
   settings.leftOpen = !settings.leftOpen;
   saveSettings();
-  applySettings();
+  // 侧栏只是改变了网格宽度，列数和行位置交给 ResizeObserver 里的 paintGrid 处理；
+  // 这里不要整块重置，否则会先清空行、滚动范围短暂消失，滚动位置就回顶部了。
+  applySettings({ rerender: false });
   // 栏刚打开且还没加载过，才去拉作者/标签（连带头像）
   if (settings.leftOpen && state.authors.length === 0 && state.tags.length === 0) loadSidePanel();
 });
@@ -3292,7 +3835,7 @@ els.btnLeft.addEventListener('click', () => {
 els.btnRight.addEventListener('click', () => {
   settings.rightOpen = !settings.rightOpen;
   saveSettings();
-  applySettings();
+  applySettings({ rerender: false });
 });
 
 els.reload.addEventListener('click', async () => {
@@ -3379,22 +3922,12 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
-// 滚动加载
+// 滚动 = 重画可见行；加载下一页的判断在 paintGrid 里（靠近已加载末尾时触发）
 const gridWrap = document.querySelector('.grid-wrap');
-gridWrap.addEventListener('scroll', () => {
-  if (gridWrap.scrollTop + gridWrap.clientHeight > gridWrap.scrollHeight - 700) {
-    if (state.offset < state.total && !state.loading) loadPage(false);
-  }
-});
+gridWrap.addEventListener('scroll', () => scheduleGridPaint(), { passive: true });
 
-new IntersectionObserver(
-  (entries) => {
-    if (entries.some((e) => e.isIntersecting) && state.offset < state.total && !state.loading) {
-      loadPage(false);
-    }
-  },
-  { rootMargin: '600px' },
-).observe(els.sentinel);
+// 窗口 / 侧栏尺寸变化会改变列数和卡片宽度，行高缓存要重建
+new ResizeObserver(() => scheduleGridPaint(true)).observe(gridWrap);
 
 // ---------- 启动 ----------
 

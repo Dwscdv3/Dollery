@@ -434,6 +434,51 @@ await test('期望时长随连续请求数线性增长，并被上下限夹住',
   assert.equal(pacer.expectedPauseMs(5000), 5400000, '超过上限时夹到上限');
 });
 
+await test('连续请求数随时间回落：每 5 秒减 1，最少到 0', async () => {
+  const pacer = new RequestPacer({ pauseChance: 0, decayMs: 5000 });
+  const t0 = Date.now();
+  pacer.count = 10;
+  pacer.decayAt = t0;
+
+  assert.equal(pacer.decay(t0 + 4999), 0, '不到 5 秒不该扣');
+  assert.equal(pacer.count, 10);
+  assert.equal(pacer.decay(t0 + 5000), 1, '满 5 秒扣 1');
+  assert.equal(pacer.count, 9);
+  assert.equal(pacer.decay(t0 + 26000), 4, '再隔 21 秒累计扣 4（共 5 个周期）');
+  assert.equal(pacer.count, 5);
+  assert.equal(pacer.decay(t0 + 600000), 5, '最多扣到 0');
+  assert.equal(pacer.count, 0);
+  assert.equal(pacer.decay(t0 + 900000), 0, '已经是 0 就不再扣');
+  assert.equal(pacer.count, 0);
+});
+
+await test('status() 报告的是回落之后的计数与期望时长', async () => {
+  const pacer = new RequestPacer({
+    pauseChance: 0,
+    perRequestMs: 5000,
+    decayMs: 5000,
+    minPauseMs: 60000,
+    maxPauseMs: 5400000,
+  });
+  const t0 = Date.now();
+  pacer.count = 100;
+  pacer.decayAt = t0;
+
+  const status = pacer.status(t0 + 60000); // 12 个回落周期
+  assert.equal(status.count, 88);
+  assert.equal(status.expectedPauseMs, 440000, '88 次 × 5 秒');
+  assert.equal(pacer.status().limits.decayMs, 5000);
+});
+
+await test('空闲很久之后重新开始，不会被补扣', async () => {
+  const pacer = new RequestPacer({ pauseChance: 0, decayMs: 5000 });
+  pacer.count = 0;
+  pacer.decayAt = Date.now() - 600000; // 假装已经空了 10 分钟
+
+  await pacer.gate();
+  assert.equal(pacer.status().count, 1, '新一轮从 1 开始，而不是负值或 0');
+});
+
 await test('抽样均值贴近期望，且不越界', async () => {
   const pacer = new RequestPacer({
     pauseChance: 0,

@@ -216,38 +216,91 @@ body {
   width: 100%;
 }
 
-/* 默认过滤器：和搜索框并排，虚线边框表示「一直生效的常驻条件」。
-   收起时按钮描边高亮，提醒还有过滤条件在起作用。 */
-.filter-box {
-  position: relative;
+/* 默认过滤器：从顶栏向下弹出一整行，和随机休息 / 迁移横幅同一套皮肤 */
+.filter-row {
+  flex: 0 0 auto;
   display: flex;
-  flex: 0 1 230px;
-  min-width: 140px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #dfe8f6;
+  background: linear-gradient(90deg, rgba(46, 62, 86, .96), rgba(36, 48, 68, .96));
+  border-bottom: 1px solid rgba(255, 255, 255, .1);
 }
 
-.filter-box[hidden] { display: none; }
+.filter-row[hidden] { display: none; }
 
-.filter-box input[type="search"] {
+.filter-row-inner {
+  position: relative;
+  display: flex;
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.filter-row input[type="search"] {
+  flex: 1 1 auto;
   width: 100%;
-  background: var(--panel-2);
-  border: 1px dashed var(--line);
-  color: var(--text);
-  padding: 7px 11px;
-  border-radius: 8px;
+  min-width: 0;
+  background: rgba(0, 0, 0, .2);
+  border: 1px solid rgba(255, 255, 255, .18);
+  color: #eef3fb;
+  padding: 6px 10px;
+  border-radius: 7px;
   font: inherit;
   font-size: 12px;
   outline: none;
+  transition: border-color .15s, background .15s;
 }
 
-.filter-box input[type="search"]:focus { border-color: var(--accent); border-style: solid; }
-.filter-box input::placeholder { color: var(--muted); opacity: .85; }
+.filter-row input[type="search"]:focus {
+  border-color: rgba(169, 198, 242, .8);
+  background: rgba(0, 0, 0, .3);
+}
 
+.filter-row input::placeholder { color: rgba(223, 232, 246, .5); }
+.filter-row.off input[type="search"] { opacity: .55; }
+
+.filter-row .search-suggest { z-index: 30; }
+
+/* 默认过滤器胶囊：漏斗按钮（展开/收起）+ 开关（是否生效） */
+.filter-pill {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 33px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  transition: border-color .15s, background .15s;
+}
+
+.filter-pill.on {
+  border-color: rgba(106, 169, 255, .55);
+  background: rgba(106, 169, 255, .12);
+}
+
+.filter-toggle {
+  width: 27px;
+  height: 27px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+
+.filter-toggle:hover { background: rgba(255, 255, 255, .08); color: var(--text); }
+.filter-pill.on .filter-toggle { color: var(--accent); }
 .filter-toggle svg { display: block; }
 
-/* 有过滤条件时按钮亮起来，即使输入框收着也能看出「正在过滤」 */
-.filter-toggle.on { border-color: var(--accent); color: var(--accent); background: rgba(106, 169, 255, .12); }
+.filter-switch { gap: 0; }
 
 .search-suggest {
   position: absolute;
@@ -284,7 +337,13 @@ body {
 }
 
 .sg-item:hover, .sg-item.active { background: var(--panel-2); }
-.sg-item code { color: var(--accent); }
+/* 条件词用等宽字体，比浏览器的默认 monospace（Courier 系）利落得多 */
+.sg-item code {
+  color: var(--accent);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, "Noto Sans SC Medium", monospace;
+  font-size: 11.5px;
+  letter-spacing: -.1px;
+}
 .sg-item .sg-desc { color: var(--muted); font-size: 11px; }
 .sg-empty { padding: 10px 8px; color: var(--muted); font-size: 12px; }
 
@@ -434,7 +493,11 @@ body {
   padding: 0 8px 12px 12px;
 }
 
+/* 虚拟列表的每一项：flow-root 让子元素的外边距算进高度，测量才准 */
+.vitem { display: flow-root; }
+
 .side-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -638,21 +701,29 @@ body {
   overflow-x: hidden;
   min-width: 0;
   position: relative;
+  /* 虚拟网格会整行移除 / 重建，浏览器的「滚动锚定」会跟着挑一个元素把 scrollTop
+     拉来拉去（开关侧栏后能偏出大半屏）。位置由脚本精确控制，这里关掉它。 */
+  overflow-anchor: none;
 }
 
+/* 虚拟网格：行绝对定位在算好的高度上，容器自身高度由脚本撑开 */
 .grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr));
-  grid-auto-rows: max-content;
-  /* 卡片高度由内容决定，不拉伸到行高。否则同一行里封面比例不同时，
-     矮的卡片会在底部（或图片与文字之间）留出一大片空白。 */
-  align-items: start;
-  gap: 12px;
-  padding: 14px;
-  align-content: start;
+  position: relative;
+  display: block;
+  padding: 0;
+  min-height: 1px;
 }
 
-.sentinel { height: 1px; }
+.grid-row {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  display: grid;
+  gap: 12px;
+  align-items: start;
+}
+
+.sentinel { display: none; }
 
 .card {
   position: relative;
@@ -2023,7 +2094,13 @@ body.bm-open { overflow: hidden; }
 /* ── 标签组：面板标记、行菜单、编辑器 ───────────────────── */
 
 /* 行尾的 ⋯，平时藏起来，hover / 键盘聚焦时才露 */
-.side-item .tag-more {
+/* ⋯ 绝对定位在计数上：平时完全隐藏、不占布局；hover / 键盘聚焦时用它替换计数，
+   行内不重新排版，名字也不会像以前那样被按钮挤窄 */
+.tag-more {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
   width: 20px;
   height: 20px;
   padding: 0;
@@ -2036,14 +2113,30 @@ body.bm-open { overflow: hidden; }
   line-height: 1;
   cursor: pointer;
   opacity: 0;
+  pointer-events: none;
   transition: opacity .12s, background .12s, color .12s;
 }
 
 .side-item:hover .tag-more,
-.side-item .tag-more:focus-visible { opacity: 1; }
-.side-item .tag-more:hover { background: rgba(255, 255, 255, .12); color: var(--text); }
+.side-item:focus-within .tag-more,
+.tag-group-head:hover .tag-more,
+.tag-group-head:focus-within .tag-more,
+.tag-more:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
 
-.side-item .tag-link {
+.tag-more:hover { background: rgba(255, 255, 255, .12); color: var(--text); }
+
+.side-item[data-tag] .cnt,
+.tag-group-head .cnt { transition: opacity .12s; }
+
+.side-item[data-tag]:hover .cnt,
+.side-item[data-tag]:focus-within .cnt,
+.tag-group-head:hover .cnt,
+.tag-group-head:focus-within .cnt { opacity: 0; }
+
+.tag-link {
   flex: 0 0 auto;
   padding: 0 4px;
   border-radius: 999px;
@@ -2053,10 +2146,92 @@ body.bm-open { overflow: hidden; }
   letter-spacing: .2px;
 }
 
-.side-item.group-item .name { flex: 1 1 auto; }
-.side-item.group-item .tag-link { color: var(--muted); background: rgba(128, 128, 128, .16); }
-.side-item.zero { opacity: .45; }
-.side-item.zero:hover { opacity: .75; }
+.tag-group {
+  margin: 4px 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .02);
+  overflow: hidden;
+}
+
+.tag-group.zero { opacity: .5; }
+.tag-group.zero:hover { opacity: .8; }
+
+/* 标题条：背景直接用边框色，和卡片边框连成一体 */
+.tag-group-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 7px;
+  background: var(--line);
+}
+
+/* 展开/折叠：24px 的方块按钮，箭头放大到 18px；行本身反而比之前矮一点 */
+.tag-group-toggle {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .07);
+  color: var(--text);
+  cursor: pointer;
+  transition: background .12s;
+}
+
+.tag-group-toggle:hover { background: rgba(255, 255, 255, .16); }
+.tag-group-toggle:disabled { cursor: default; opacity: .65; }
+
+.tag-group-chevron {
+  font-size: 18px;
+  line-height: 1;
+  transition: transform .15s ease;
+}
+
+.tag-group.open .tag-group-chevron { transform: rotate(90deg); }
+
+/* 标题本身是「按整组筛选」的按钮，和折叠按钮分开 */
+.tag-group-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-group-title:hover { color: var(--accent); }
+
+.tag-group-head .tag-link {
+  color: var(--muted);
+  background: rgba(255, 255, 255, .08);
+}
+
+.tag-group-head .cnt {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tag-group-members {
+  padding: 3px;
+  border-top: 1px solid var(--line);
+}
+
+.tag-group-members .side-item { padding: 5px 7px 5px 9px; }
 
 /* 行菜单 */
 .side-menu {

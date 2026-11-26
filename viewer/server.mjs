@@ -1439,9 +1439,11 @@ async function handleApi(req, res, url) {
   // 否则「收藏标签和作品标签重名」会被算成两个作品。
   //
   // 标签组：
-  //   · 组内成员按「成员计数之和」排序，并保证挨在一起；
   //   · 组的 union 是去重后的作品数（同一作品打了多个成员标签只算一次），
-  //     用来显示；排序仍用 total，两者口径不同，前端会在 title 里注明。
+  //     同时也是列表里显示的数字，排序就用它 —— 显示和排序必须是同一个口径，
+  //     否则会出现「显示 190 却排在 407 和 338 之间」这种看起来像 bug 的情况；
+  //   · total（成员计数之和）只作为并列时的次级参考，不再参与主排序；
+  //   · 组内成员按「成员计数之和」排序，并保证挨在一起；
   //   · 两个统计都跟随 include 开关，和单个标签的计数口径一致。
   if (url.startsWith('/api/tags')) {
     const source = params.get('source') ?? 'illustPublic';
@@ -1521,7 +1523,7 @@ async function handleApi(req, res, url) {
       })
       .sort(
         (a, b) =>
-          b.total - a.total || b.union - a.union || a.representative.localeCompare(b.representative, 'zh'),
+          b.union - a.union || b.total - a.total || a.representative.localeCompare(b.representative, 'zh'),
       );
 
     const summaryOf = new Map(groups.map((group) => [group.id, group]));
@@ -1544,8 +1546,9 @@ async function handleApi(req, res, url) {
                 union: summary.union,
               }
             : null,
-          // 同组成员共用一个排序键，组内再按自身计数排
-          sortKey: summary ? summary.total : item.count,
+          // 同组成员共用一个排序键（组的去重计数，和卡片上显示的数字一致），
+          // 组内再按自身计数排
+          sortKey: summary ? summary.union : item.count,
         };
       })
       .sort((a, b) => {

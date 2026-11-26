@@ -655,11 +655,13 @@ async function commandDownload(flags) {
     const limits = pacerStatus.limits;
     const chance = Number((limits.pauseChance * 100).toFixed(2));
     const perSec = Math.round(limits.perRequestMs / 1000);
+    const decaySec = Math.round(limits.decayMs / 1000);
     const minPause = Math.round(limits.minPauseMs / 60000);
     const maxPause = Math.round(limits.maxPauseMs / 60000);
     console.log(
       `休息节奏: 每个请求 ${chance}% 概率休息；期望时长 = 距上次休息的请求数 × ${perSec} 秒` +
-        `（${minPause}~${maxPause} 分钟，Gamma k=${limits.shape}）`,
+        `（${minPause}~${maxPause} 分钟，Gamma k=${limits.shape}）；` +
+        `空闲时每 ${decaySec} 秒回退 1 次计数`,
     );
   } else {
     console.log('休息节奏: 已关闭（--no-pacer）');

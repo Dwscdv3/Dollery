@@ -13,6 +13,11 @@
  * 休息多久：和「距上次休息已经请求了多少次」挂钩，每个请求给期望时长 +perRequestMs
  *   （默认 5 秒）。也就是请求越多越累，触发时该歇得越久。
  *
+ * 计数会随时间回落：每过 decayMs（默认 5 秒）连续请求数减 1，最少到 0。
+ *   否则一个跑了一夜、每秒才一个请求的慢任务，计数会一直涨到几千，
+ *   一触发就是 90 分钟封顶 —— 但它的实际频次一点也不高。
+ *   有了回落，计数更接近「最近的请求密度」而不是「开机以来的总数」。
+ *
  * 时长的分布：默认用 Erlang-2（Gamma 分布 shape=2），均值固定为
  *   clamp(请求数 × perRequestMs, 下限, 上限)。
  *   为什么不直接等这么久？固定时长本身又是机器特征。
@@ -62,6 +67,8 @@ export const DEFAULT_PACER = {
   pauseChance: 0.01,
   // 距上次休息每多一个请求，本次休息的期望时长 +5 秒
   perRequestMs: 5000,
+  // 连续请求数的回落速度：每过这么久减 1（最少到 0）
+  decayMs: 5000,
   // 期望时长的上下限：太短没有意义，太长会把一次任务拖到明天
   minPauseMs: 60 * 1000,
   maxPauseMs: 90 * 60 * 1000,
@@ -80,13 +87,15 @@ export class RequestPacer {
     this.enabled = settings.enabled !== false;
     this.pauseChance = clamp(num(settings.pauseChance, DEFAULT_PACER.pauseChance), 0, 1);
     this.perRequestMs = Math.max(0, num(settings.perRequestMs, DEFAULT_PACER.perRequestMs));
+    this.decayMs = Math.max(1000, num(settings.decayMs, DEFAULT_PACER.decayMs));
     this.minPauseMs = Math.max(1000, num(settings.minPauseMs, DEFAULT_PACER.minPauseMs));
     this.maxPauseMs = Math.max(this.minPauseMs, num(settings.maxPauseMs, DEFAULT_PACER.maxPauseMs));
     this.shape = clamp(Math.round(num(settings.shape, DEFAULT_PACER.shape)), 1, 8);
 
     this.log = log;
 
-    this.count = 0; // 距上次休息已经发了多少个请求
+    this.count = 0; // 距上次休息已经发了多少个请求（会随时间回落）
+    this.decayAt = Date.now(); // 上一次结算回落的时间点
     this.total = 0; // 进程启动以来累计请求数，仅用于展示
     this.pauses = 0;
     this.skips = 0;
@@ -100,6 +109,29 @@ export class RequestPacer {
   remainingMs(now = Date.now()) {
     if (this.pauseEndsAt === null) return 0;
     return Math.max(0, this.pauseEndsAt - now);
+  }
+
+  /**
+   * 结算「随时间回落」：每过 decayMs，连续请求数减 1，最少到 0。
+   *
+   * 用时间差补算而不是真起一个定时器：进程有没有被挂起、有没有睡过头都不影响结果，
+   * 也不用担心定时器在测试里到处留着。计数已经是 0 时把基准时间追到当下，
+   * 免得空闲很久之后一发请求就被「补扣」掉。
+   */
+  decay(now = Date.now()) {
+    if (this.count <= 0) {
+      this.count = 0;
+      this.decayAt = now;
+      return 0;
+    }
+
+    const steps = Math.floor((now - this.decayAt) / this.decayMs);
+    if (steps <= 0) return 0;
+
+    this.decayAt += steps * this.decayMs;
+    const before = this.count;
+    this.count = Math.max(0, this.count - steps);
+    return before - this.count;
   }
 
   /** 下一次触发时，休息时长的期望值（按当前连续请求数算，已夹在上下限内）。 */
@@ -129,6 +161,9 @@ export class RequestPacer {
     if (!this.enabled) return;
 
     this.total += 1;
+
+    // 先把「空闲期间该扣的」扣掉，再决定停不停、歇多久
+    this.decay();
 
     if (bypass) {
       // 手动请求照常计数（风险敞口是一样的），但不等，也不掷骰子：
@@ -172,6 +207,7 @@ export class RequestPacer {
     this.pauseRequests = this.count;
     // 休息完就是新的一轮：连续请求数清零，下一次的期望从下限重新长起来
     this.count = 0;
+    this.decayAt = now;
 
     this.pauseStartedAt = now;
     this.pauseEndsAt = now + pauseMs;
@@ -204,6 +240,9 @@ export class RequestPacer {
   }
 
   status(now = Date.now()) {
+    // 报告前先结算回落，否则面板上的「本轮进度」会比实际偏大
+    this.decay(now);
+
     const remainingMs = this.remainingMs(now);
 
     return {
@@ -223,6 +262,7 @@ export class RequestPacer {
       limits: {
         pauseChance: this.pauseChance,
         perRequestMs: this.perRequestMs,
+        decayMs: this.decayMs,
         minPauseMs: this.minPauseMs,
         maxPauseMs: this.maxPauseMs,
         shape: this.shape,
