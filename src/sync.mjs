@@ -38,6 +38,50 @@
  */
 import { normalizeIllust, normalizeNovel } from './pixiv.mjs';
 import { diffRecords, readRecords, writeRecords } from './store.mjs';
+import { isPlaceholderText } from './placeholder.mjs';
+
+/**
+ * 失效作品的元数据保全。
+ *
+ * 作品被删之后，收藏接口会把整条记录的文本字段换成一套占位值
+ * （`-----` / `1970-01-01` / 100×100 / 1 页）。本地以前存过的真实标题、简介、
+ * 收藏标签是仅剩的东西，不能被这轮同步抹掉 —— 所以拿旧记录把占位字段补回来。
+ *
+ * 只对 `status: 'unavailable'` 的记录生效；正常作品照旧以服务端为准。
+ */
+export function keepPreviousMeta(incoming, previous) {
+  if (!previous || incoming.status !== 'unavailable') return incoming;
+
+  const out = { ...incoming };
+
+  for (const key of ['title', 'description', 'author', 'tags']) {
+    if (isPlaceholderText(out[key]) && !isPlaceholderText(previous[key])) out[key] = previous[key];
+  }
+
+  if (String(out.author_id ?? '') === '0' && String(previous.author_id ?? '') !== '0') {
+    out.author_id = previous.author_id;
+  }
+
+  if (String(out.published ?? '').startsWith('1970-01-01') && !String(previous.published ?? '').startsWith('1970-01-01')) {
+    out.published = previous.published;
+  }
+
+  // 占位的尺寸固定是 100×100、页数固定是 1，别拿它覆盖本地记过的真实值
+  if (Number(out.width) === 100 && Number(out.height) === 100) {
+    if (Number(previous.width) > 100 || Number(previous.height) > 100) {
+      out.width = previous.width;
+      out.height = previous.height;
+    }
+  }
+  if (Number(out.pages) <= 1 && Number(previous.pages) > 1) out.pages = previous.pages;
+
+  // 失效之后接口常常不再返回收藏标签，本地那份是唯一的记录
+  if ((out.bookmark_tags ?? []).length === 0 && (previous.bookmark_tags ?? []).length > 0) {
+    out.bookmark_tags = previous.bookmark_tags;
+  }
+
+  return out;
+}
 
 function localDateString(date = new Date()) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -207,7 +251,7 @@ export async function syncKind(client, options) {
       if (fetchedIds.has(String(record.pid))) continue;
       kept.push(record.removed ? record : { ...record, removed: 'yes' });
     }
-    merged = [...fetched, ...kept];
+    merged = [...fetched.map((record) => keepPreviousMeta(record, existingById.get(String(record.pid)))), ...kept];
   } else {
     // 增量：只追加新记录，已有记录原样保留（增量只翻头部几页，没有完整更新视野，
     // 而且接口返回的 tags 顺序并不稳定，拿它覆盖旧值只会制造假 diff）。

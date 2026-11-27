@@ -339,11 +339,29 @@ function matchRatio(record, expr) {
  *   pages:>10 / pages:<5 / pages:2
  *   ratio:landscape|portrait|square|>1.5|<0.7
  *   date:2023 / date:2023-05 / date:>2023-01-01 / date:2020..2022
- *   is:ai|r18|ugoira|manga|novel|removed|unavailable|bookmarked
+ *   is:ai|r18|ugoira|manga|illust|novel|removed|unavailable|bookmarked
+ *   is:dead|dead-image|dead-meta|dead-bare|lost（失效作品的四个细分档）
  *
  * 返回 null 表示「不认识这个字段」，交给全文匹配兜底。
  */
-function matchField(key, value, record) {
+/**
+ * 有没有「能看」的元数据。
+ *
+ * 优先用调用方给的判定（服务端会用 src/placeholder.mjs，识别 `-----` 这类占位值）；
+ * 没给就退回朴素的非空检查 —— 注意那只是兜底，对失效作品会把横杠算成标题。
+ */
+function hasMeta(record, ctx) {
+  if (typeof ctx?.hasMeta === 'function') return ctx.hasMeta(record);
+
+  return Boolean(
+    String(record.title ?? '').trim() ||
+      String(record.description ?? '').trim() ||
+      (Array.isArray(record.tags) && record.tags.length > 0) ||
+      (Array.isArray(record.bookmark_tags) && record.bookmark_tags.length > 0),
+  );
+}
+
+function matchField(key, value, record, ctx) {
   switch (key) {
     case 'type':
       return String(record.type ?? '').toLowerCase() === value;
@@ -386,6 +404,21 @@ function matchField(key, value, record) {
           return record.removed === 'yes';
         case 'unavailable':
           return record.status === 'unavailable';
+        // 失效之后，「还剩多少东西可看」是另一层信息 —— 图在、只有数据、什么都没有，
+        // 三档对用户的意义完全不同（第一档还能看，后两档只能看个标题）
+        case 'dead': {
+          if (record.status !== 'unavailable') return false;
+          return true;
+        }
+        case 'dead-image':
+          return record.status === 'unavailable' && Boolean(ctx?.hasMedia?.(record));
+        case 'dead-meta':
+          return record.status === 'unavailable' && !ctx?.hasMedia?.(record) && hasMeta(record, ctx);
+        case 'dead-bare':
+          return record.status === 'unavailable' && !ctx?.hasMedia?.(record) && !hasMeta(record, ctx);
+        // 便捷写法：失效且没有图（后两档），默认过滤器用它
+        case 'lost':
+          return record.status === 'unavailable' && !ctx?.hasMedia?.(record);
         case 'bookmarked':
           return record.removed !== 'yes';
         default:
@@ -397,13 +430,13 @@ function matchField(key, value, record) {
   }
 }
 
-function matchWord(word, record) {
+function matchWord(word, record, ctx) {
   if (!word) return true;
 
   // 先尝试字段语法，再退回全文匹配
   const colon = word.indexOf(':');
   if (colon > 0) {
-    const handled = matchField(word.slice(0, colon), word.slice(colon + 1), record);
+    const handled = matchField(word.slice(0, colon), word.slice(colon + 1), record, ctx);
     if (handled !== null) return handled;
   }
 
@@ -421,16 +454,16 @@ function matchWord(word, record) {
   return false;
 }
 
-function evaluate(node, record) {
+function evaluate(node, record, ctx) {
   switch (node.op) {
     case 'and':
-      return evaluate(node.left, record) && evaluate(node.right, record);
+      return evaluate(node.left, record, ctx) && evaluate(node.right, record, ctx);
     case 'or':
-      return evaluate(node.left, record) || evaluate(node.right, record);
+      return evaluate(node.left, record, ctx) || evaluate(node.right, record, ctx);
     case 'not':
-      return !evaluate(node.expr, record);
+      return !evaluate(node.expr, record, ctx);
     case 'word':
-      return matchWord(node.value, record);
+      return matchWord(node.value, record, ctx);
     default:
       return true;
   }
@@ -449,10 +482,16 @@ export function compileQuery(text, options = {}) {
   return parse(tokenize(trimmed), buildExpander(options.groups));
 }
 
-/** 用编译结果过滤记录。 */
-export function matches(ast, record) {
+/**
+ * 用编译结果过滤记录。
+ *
+ * ctx.hasMedia(record) —— 「这个作品本地有没有可看的文件」。只有 is:dead-* 需要它：
+ * 失效作品还能分「有图」「无图有数据」「什么都没有」三档，查询层不该自己猜，
+ * 由调用方给（服务端看 imageIndex，测试里可以传一个假的）。
+ */
+export function matches(ast, record, ctx) {
   if (!ast) return true;
-  return evaluate(ast, record);
+  return evaluate(ast, record, ctx);
 }
 
 /** 查询串里是否用到了布尔语法（用于界面提示）。 */

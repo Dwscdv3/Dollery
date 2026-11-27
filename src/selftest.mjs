@@ -30,11 +30,12 @@ import path from 'node:path';
 import { diffRecords, parse, readRecords, serialize, sortRecords, writeRecords } from './store.mjs';
 import { normalizeTags, parseEditorPage, writeLocalBookmark } from './bookmark-edit.mjs';
 import { applyRating, findRating, parseRatingTag, stripRating } from './rating.mjs';
-import { syncKind, SyncAbort } from './sync.mjs';
+import { keepPreviousMeta, syncKind, SyncAbort } from './sync.mjs';
 import { RequestPacer } from './pacer.mjs';
 import { RateLimiter } from './http.mjs';
 import { planTagConversion } from './tag-convert.mjs';
 import { normalizeGroups } from '../viewer/tag-groups.mjs';
+import { hasUsableMeta, isPlaceholderText } from './placeholder.mjs';
 import { compileQuery, matches as matchQuery } from '../viewer/query.mjs';
 
 let passed = 0;
@@ -846,6 +847,100 @@ await test('评分筛选：前端拼出来的 (7/10 OR 9/10) 能编译并命中'
   const single = compileQuery('7/10');
   assert.equal(matchQuery(single, seven), true);
   assert.equal(matchQuery(single, nine), false);
+});
+
+await test('占位元数据：一排横杠不算内容', () => {
+  assert.equal(isPlaceholderText('-----'), true);
+  assert.equal(isPlaceholderText(''), true);
+  assert.equal(isPlaceholderText('   '), true);
+  assert.equal(isPlaceholderText('——'), true);
+  assert.equal(isPlaceholderText('标题'), false);
+
+  // 失效作品真实形态：三处文本都是横杠，只剩自己打的收藏标签有价值
+  assert.equal(hasUsableMeta({ title: '-----', description: '-----', author: '-----', bookmark_tags: [] }), false);
+  assert.equal(hasUsableMeta({ title: '-----', bookmark_tags: ['R-18'] }), true);
+  assert.equal(hasUsableMeta({ title: '-----', tags: ['オリジナル'] }), true);
+});
+
+await test('失效分档：占位标题归到「只剩记录」', () => {
+  const dash = { pid: '1', status: 'unavailable', title: '-----', description: '-----', author: '-----' };
+  const withTags = { pid: '2', status: 'unavailable', title: '-----', bookmark_tags: ['R-18'] };
+  const ctx = { hasMedia: () => false, hasMeta: hasUsableMeta };
+
+  assert.equal(matchQuery(compileQuery('is:dead-bare'), dash, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:dead-bare'), withTags, ctx), false);
+  assert.equal(matchQuery(compileQuery('is:dead-meta'), withTags, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:dead-meta'), dash, ctx), false);
+});
+
+await test('失效分档：is:dead-* 按「有没有图 / 有没有元数据」区分', () => {
+  const withImage = { pid: '1', title: '标题', status: 'unavailable', tags: [], bookmark_tags: [] };
+  const withMetaOnly = { pid: '2', title: '标题', status: 'unavailable', tags: [], bookmark_tags: [] };
+  const bare = { pid: '3', status: 'unavailable', tags: [], bookmark_tags: [] };
+  const ctx = { hasMedia: (record) => record.pid === '1' };
+
+  assert.equal(matchQuery(compileQuery('is:dead-image'), withImage, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:dead-image'), withMetaOnly, ctx), false, '没有图不算有图档');
+
+  assert.equal(matchQuery(compileQuery('is:dead-meta'), withMetaOnly, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:dead-meta'), bare, ctx), false, '没元数据不算这一档');
+
+  assert.equal(matchQuery(compileQuery('is:dead-bare'), bare, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:dead-bare'), withMetaOnly, ctx), false);
+
+  // 默认过滤器靠这两个：有数据的失效作品要留下，没图的才藏
+  assert.equal(matchQuery(compileQuery('is:lost'), withMetaOnly, ctx), true);
+  assert.equal(matchQuery(compileQuery('is:lost'), withImage, ctx), false);
+  assert.equal(matchQuery(compileQuery('-is:lost'), withImage, ctx), true);
+
+  // 没有 ctx 时不能崩，退化成「没有图」
+  assert.equal(matchQuery(compileQuery('is:lost'), { pid: '9', status: 'unavailable' }), true);
+});
+
+await test('同步：失效作品的占位值不覆盖本地真实元数据', () => {
+  const previous = {
+    pid: '1',
+    title: '真实标题',
+    description: '真实简介',
+    author: '某作者',
+    author_id: '12345',
+    published: '2020-05-01T00:00:00+09:00',
+    width: 1200,
+    height: 1600,
+    pages: 3,
+    tags: ['オリジナル'],
+    bookmark_tags: ['R-18', '好き'],
+    status: '',
+  };
+  const incoming = {
+    pid: '1',
+    title: '-----',
+    description: '-----',
+    author: '-----',
+    author_id: '0',
+    published: '1970-01-01T00:00:00+09:00',
+    width: 100,
+    height: 100,
+    pages: 1,
+    tags: [],
+    bookmark_tags: [],
+    status: 'unavailable',
+  };
+
+  const merged = keepPreviousMeta(incoming, previous);
+  assert.equal(merged.title, '真实标题');
+  assert.equal(merged.description, '真实简介');
+  assert.equal(merged.author, '某作者');
+  assert.equal(merged.author_id, '12345');
+  assert.equal(merged.published, '2020-05-01T00:00:00+09:00');
+  assert.equal(merged.width, 1200);
+  assert.equal(merged.pages, 3);
+  assert.deepEqual(merged.bookmark_tags, ['R-18', '好き']);
+  assert.equal(merged.status, 'unavailable', '失效状态本身要保留');
+
+  // 正常作品不受影响：仍然以服务端为准
+  const alive = { ...incoming, status: '', title: '新标题' };
+  assert.equal(keepPreviousMeta(alive, previous).title, '新标题');
 });
 
 await test('迁移计划：只换组内成员，保留其它标签', () => {

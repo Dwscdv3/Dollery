@@ -111,6 +111,7 @@ export class RequestPacer {
 
     this.log = log;
 
+
     this.count = 0; // 距上次休息已经发了多少个请求（会随时间回落）
     this.decayAt = Date.now(); // 上一次结算回落的时间点
     this.total = 0; // 进程启动以来累计请求数，仅用于展示
@@ -254,6 +255,40 @@ export class RequestPacer {
     this.clearPause();
     this.log(`已跳过本次休息（提前 ${formatDuration(remaining)} 继续）`);
     return { skipped: true, savedMs: remaining };
+  }
+
+  /**
+   * 热改参数：查看器的设置面板保存后立即生效，不用重启。
+   *
+   * 只处理传进来的那几项，没传的保持原样（不能拿默认值覆盖，否则用户只改一项，
+   * 其余全被打回默认）。已经在进行中的那一次休息不受影响。
+   *
+   * @param {object} partial 形如 { pauseChance: 0.02, shape: 2 }
+   */
+  applySettings(partial = {}) {
+    if ('enabled' in partial) this.enabled = partial.enabled !== false;
+    if ('pauseChance' in partial) {
+      this.pauseChance = clamp(num(partial.pauseChance, this.pauseChance), 0, 1);
+    }
+    if ('perRequestMs' in partial) {
+      this.perRequestMs = Math.max(0, num(partial.perRequestMs, this.perRequestMs));
+    }
+    if ('decayMs' in partial) {
+      this.decayMs = Math.max(1000, num(partial.decayMs, this.decayMs));
+    }
+    if ('minPauseMs' in partial) {
+      this.minPauseMs = Math.max(1000, num(partial.minPauseMs, this.minPauseMs));
+    }
+    if ('maxPauseMs' in partial) {
+      this.maxPauseMs = Math.max(this.minPauseMs, num(partial.maxPauseMs, this.maxPauseMs));
+    }
+    if ('shape' in partial) {
+      this.shape = clamp(Math.round(num(partial.shape, this.shape)), 1, 8);
+    }
+
+    // 两个上下限互相依赖：先改下限的话，上限可能已经比它小了
+    this.maxPauseMs = Math.max(this.maxPauseMs, this.minPauseMs);
+    return this.status();
   }
 
   status(now = Date.now()) {

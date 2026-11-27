@@ -45,6 +45,55 @@ export class DownloadError extends Error {
   }
 }
 
+/**
+ * 作品已经不存在（被作者删除、转为不可见、或被站点移除）。
+ *
+ * 单列一个类型是因为它和「这次下载失败」不是一回事：前者是**永久事实**，
+ * 记下来就别再试了；后者重试一次可能就好了。上层据此决定「标失效」还是「记失败」。
+ */
+export class WorkUnavailableError extends DownloadError {
+  constructor(message, { pid = '' } = {}) {
+    super(message);
+    this.name = 'WorkUnavailableError';
+    this.unavailable = true;
+    this.pid = String(pid);
+  }
+}
+
+/** 接口报错里能确认「作品没了」的措辞。宁可漏判，也不要把抖动当成死亡。 */
+const GONE_PATTERN = /(削除|删除|見つかりません|存在しません|已失效|非公開|not found|no longer available)/i;
+
+/**
+ * 探测作品是否还在。
+ *
+ * 判断顺序（命中任一条就算没了）：
+ *   1. 详情接口 404；
+ *   2. 详情接口正常返回，但 illust.userId 是 "0"（pixiv 对失效作品的标记）；
+ *   3. 详情接口报错，且错误信息里明确说「删除 / 不公开 / 找不到」。
+ *
+ * 其它情况（超时、代理挂了、403、"未知错误"）一律当作「不确定」，交给上层当普通失败处理 ——
+ * 一次网络抖动就把作品永久拉黑，比多试几次糟得多。
+ */
+export async function detectGone(client, record) {
+  const pid = record.pid;
+  const pathname = record.type === 'novel' ? `/ajax/novel/${pid}` : `/ajax/illust/${pid}`;
+
+  try {
+    const res = await client.ajaxRaw(pathname, { lang: 'zh' });
+
+    if (res.status === 404) return true;
+    if (res.ok) {
+      const owner = res.body?.illust?.userId ?? res.body?.userId;
+      if (owner !== undefined && String(owner) === '0') return true;
+      return false;
+    }
+    return GONE_PATTERN.test(res.message);
+  } catch {
+    return false;
+  }
+}
+
+
 function runProcess(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true });
@@ -98,7 +147,31 @@ function extensionOf(url) {
 /**
  * 下载单个作品。返回 { files, skipped, originalBytes, finalBytes, kind }。
  */
+/**
+ * 下载一个作品。先跑一遍 inner，失败时再做一次「还在不在」的确认：
+ * 作品真被删了，就抛 WorkUnavailableError（上层标失效、不再重试）；
+ * 只是网络抖动或限流，就照原样抛原来的错，让人可以重试。
+ */
 async function downloadOne(client, record, ctx) {
+  try {
+    return await downloadOneInner(client, record, ctx);
+  } catch (err) {
+    // 注意不能只接 DownloadError：pages 接口报错抛的是 PixivError，
+    // 而「作品已删除」恰好就是那个路径（HTTP 404、message 为空 → "未知错误"）。
+    const skipProbe =
+      ctx.dryRun ||
+      err?.unavailable ||
+      err?.name === 'GuardTripped' ||
+      err?.name === 'DailyLimitReached';
+
+    if (!skipProbe && (await detectGone(client, record))) {
+      throw new WorkUnavailableError(`${record.pid} 已失效：${err.message}`, { pid: record.pid });
+    }
+    throw err;
+  }
+}
+
+async function downloadOneInner(client, record, ctx) {
   const { outDir, tmpDir, imageLimiter, proxy, quality, keepOriginal, dryRun, firstPageOnly } = ctx;
   const result = { files: [], skipped: 0, originalBytes: 0, finalBytes: 0, kind: record.type };
 

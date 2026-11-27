@@ -119,6 +119,45 @@ export class PixivClient {
   }
 
   /**
+   * 同 ajax()，但接口报错时不抛异常，把 { ok, status, body, message } 原样交回。
+   *
+   * 专给「这个作品还在不在」这类探测用：对已删除的作品，Pixiv 常常回
+   * `{ error: true, message: "" }` 或者干脆 404 —— 这两种都是答案，
+   * 抛异常反而逼调用方去猜字符串。只发一次，不重试：探测要快。
+   */
+  async ajaxRaw(pathname, params = {}) {
+    const url = `${ORIGIN}${pathname}?${buildQuery(params)}`;
+    const headers = {
+      Cookie: this.cookie,
+      Referer: `${ORIGIN}/`,
+      Origin: ORIGIN,
+      Accept: 'application/json',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'User-Agent': this.userAgent,
+    };
+    if (this.userId) headers['x-user-id'] = this.userId;
+
+    const res = await this.limiter.run(
+      () => httpsGetWithRetry(url, { headers, proxy: this.proxy, timeoutMs: 20000 }, { retries: 0 }),
+      { fast: true },
+    );
+
+    let payload = null;
+    try {
+      payload = JSON.parse(res.body);
+    } catch {
+      payload = null;
+    }
+
+    return {
+      ok: Boolean(payload) && !payload.error,
+      status: res.status,
+      body: payload?.body ?? null,
+      message: String(payload?.message ?? ''),
+    };
+  }
+
+  /**
    * 取一个网页而不是 JSON。
    *
    * 只为一件事存在：收藏标签。Pixiv 没有任何接口能按作品查「我给它打了什么

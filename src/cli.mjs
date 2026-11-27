@@ -34,7 +34,7 @@ import { PixivClient, PixivError } from './pixiv.mjs';
 import { readRecords } from './store.mjs';
 import { syncKind, SyncAbort, formatDurationMs } from './sync.mjs';
 import { downloadRecords, formatBytes } from './download.mjs';
-import { updateBookmarkTagMap, applyBookmarkTags, refreshBookmarkTags } from './bookmark-tags.mjs';
+import { buildChannels, syncTagsForChannel } from './channels.mjs';
 import { createGuard, GuardTripped, DailyLimitReached } from './guard.mjs';
 import { RequestPacer, DEFAULT_PACER } from './pacer.mjs';
 
@@ -277,55 +277,6 @@ async function buildClient(config, flags, { pacer = null } = {}) {
  * 公开和私密是服务端两个独立的收藏列表（rest=show / rest=hide），各有自己的
  * 总数和分页，只能分别翻页、分别落盘。所以「插画」实际上对应两条通道。
  */
-function buildChannels(config, flags) {
-  const wantIllust = !flags['novel-only'];
-  const wantNovel = config.includeNovels && !flags['illust-only'];
-  const wantPublic = !flags['private-only'];
-  const wantPrivate = !flags['public-only'];
-
-  const channels = [];
-
-  if (wantIllust) {
-    if (wantPublic) {
-      channels.push({
-        kind: 'illust',
-        visibility: 'public',
-        label: '插画/漫画·公开',
-        file: config.output.illustPublic,
-      });
-    }
-    if (wantPrivate) {
-      channels.push({
-        kind: 'illust',
-        visibility: 'private',
-        label: '插画/漫画·私密',
-        file: config.output.illustPrivate,
-      });
-    }
-  }
-
-  if (wantNovel) {
-    if (wantPublic) {
-      channels.push({
-        kind: 'novel',
-        visibility: 'public',
-        label: '小说·公开',
-        file: config.output.novelPublic,
-      });
-    }
-    if (wantPrivate) {
-      channels.push({
-        kind: 'novel',
-        visibility: 'private',
-        label: '小说·私密',
-        file: config.output.novelPrivate,
-      });
-    }
-  }
-
-  return channels.filter((channel) => Boolean(channel.file));
-}
-
 function printProgress(event) {
   const eta =
     event.serverTotal > 0
@@ -392,86 +343,6 @@ function printSummary(result) {
  * 标签和元数据分两步走：元数据靠翻收藏列表，标签只能靠「逐标签反查」，
  * 两者成本差一个数量级，所以有缓存、有单独的开关。
  */
-async function syncTagsForChannel(client, { entry, config, filePath, flags, sourceTotal, result, guard }) {
-  const meta = {
-    kindLabel: entry.label,
-    lastSync: new Date().toISOString().replace('T', ' ').slice(0, 19),
-    sourceTotal: sourceTotal || undefined,
-  };
-
-  // ---- 差分：只查本次新增的作品，一个作品一次请求 ----
-  // 全量才用「逐标签反推」，因为反推一次要把所有标签翻一遍（约 868 个标签）。
-  if (!flags.full && !flags['rebuild-tags']) {
-    const pids = (result?.added ?? []).map((record) => record.pid).filter(Boolean);
-
-    if (pids.length === 0) {
-      console.log('    收藏标签：本次没有新增作品，无需检查');
-      return { changed: 0, stats: { total: 0, checked: 0, changed: 0, failed: 0 } };
-    }
-
-    const stats = await refreshBookmarkTags(client, {
-      filePath,
-      kind: entry.kind,
-      pids,
-      meta,
-      onProgress: async (event) => {
-        if (event.index % 10 === 0 || event.index === event.total) {
-          console.log(`    逐个检查标签 ${event.index}/${event.total}（已改 ${event.changed}）`);
-        }
-        // 一个作品一次请求
-        await guard.bump({ requests: 1 });
-      },
-    });
-
-    const failedNote = stats.failed > 0 ? `，${stats.failed} 个读取失败（保留原值）` : '';
-    console.log(
-      `    收藏标签：检查 ${stats.checked}/${stats.total} 个新增作品，${stats.changed} 条更新${failedNote}`,
-    );
-
-    return { changed: stats.changed, stats };
-  }
-
-  // ---- 全量：逐标签反推 ----
-  const cacheDir = path.resolve(PROJECT_ROOT, config.bookmarkTags.cacheDir);
-
-  const { map, stats } = await updateBookmarkTagMap(client, {
-    kind: entry.kind,
-    visibility: entry.visibility,
-    cacheDir,
-    limit: Number(config.pageSize[entry.kind] ?? 100),
-    force: Boolean(flags['rebuild-tags']),
-    onProgress: async (event) => {
-      // 868 个标签逐个打印太吵，每 20 个报一次进度
-      if (event.index % 20 === 0 || event.index === event.total) {
-        console.log(
-          `    标签扫描 ${event.index}/${event.total}（当前「${event.tag}」）已映射 ${event.mapped} 个作品`,
-        );
-      }
-      await guard.bump({ requests: 1 });
-    },
-  });
-
-  if (stats.truncated) {
-    console.log('    注意：Pixiv 标记了 tooManyBookmarkTags，可能有标签没返回。');
-  }
-
-  if (stats.reused) {
-    console.log(`    收藏标签：缓存有效（${stats.tags} 个标签），未产生额外请求`);
-  } else {
-    console.log(
-      `    收藏标签：扫描 ${stats.scannedTags} 个标签 / ${stats.requests} 次请求，映射 ${stats.mapped} 个作品`,
-    );
-  }
-
-  const changed = await applyBookmarkTags(filePath, map, meta);
-
-  if (changed > 0) {
-    console.log(`    收藏标签：${changed} 条记录已更新`);
-  }
-
-  return { changed, stats };
-}
-
 async function commandSync(flags) {
   const config = await loadConfig();
   const { client, intervalMs } = await buildClient(config, flags);
@@ -488,7 +359,12 @@ async function commandSync(flags) {
   const userId = await client.resolveUserId();
   console.log(`账号 userId: ${userId}\n`);
 
-  const channels = buildChannels(config, flags);
+  const channels = buildChannels(config, {
+    novelOnly: Boolean(flags['novel-only']),
+    illustOnly: Boolean(flags['illust-only']),
+    publicOnly: Boolean(flags['public-only']),
+    privateOnly: Boolean(flags['private-only']),
+  });
 
   if (channels.length === 0) {
     console.log('没有需要同步的收藏类型。');
@@ -525,10 +401,12 @@ async function commandSync(flags) {
         entry,
         config,
         filePath,
-        flags,
+        full,
+        rebuildTags: Boolean(flags['rebuild-tags']),
         sourceTotal: result.total,
         result,
         guard,
+        log: (text) => console.log(text),
       });
     }
   }
