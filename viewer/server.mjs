@@ -34,8 +34,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { readDocument } from '../src/store.mjs';
-import { downloadRecords, downloadSinglePage } from '../src/download.mjs';
+import { readDocument, writeRecords } from '../src/store.mjs';
+import { downloadRecords, downloadSinglePage, detectGone } from '../src/download.mjs';
 import { PixivClient } from '../src/pixiv.mjs';
 import {
   BOOKMARK_TAG_LIMIT,
@@ -52,6 +52,9 @@ import { createTagGroupStore } from './tag-groups.mjs';
 import { planTagConversion } from '../src/tag-convert.mjs';
 import { createGuard, DEFAULT_GUARD } from '../src/guard.mjs';
 import { RequestPacer, DEFAULT_PACER } from '../src/pacer.mjs';
+import { buildChannels, syncTagsForChannel } from '../src/channels.mjs';
+import { syncKind } from '../src/sync.mjs';
+import { hasUsableMeta } from '../src/placeholder.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IMAGES_DIR = path.join(ROOT, 'images');
@@ -100,6 +103,8 @@ const state = {
   pacer: null, // 请求节奏（随机长休息），见 src/pacer.mjs
   tagGroups: null, // 标签组，见 viewer/tag-groups.mjs
   convert: null, // 正在跑的「组内标签批量转换」任务
+  // 本次运行里新标成失效的 pid：前端靠它把卡片就地改成「已失效」，不用整页重载
+  unavailable: new Set(),
 };
 
 /**
@@ -135,6 +140,157 @@ async function loadConfig() {
   } catch {
     return {};
   }
+}
+
+/* ── 后端配置：字段表 / 校验 / 原子写 ────────────────────────
+ * 面板由这张表驱动，前端不硬编码表单 —— 以后接 AI 翻译，只需要往表里加几行。
+ *
+ * effect 决定改完怎么生效：
+ *   live    立即生效（pacer 参数、AVIF 质量这类运行时现读的）
+ *   restart 需要重启查看器（限速间隔、代理、userId、cookie 都已烘进 client / limiter）
+ *   cli     查看器还没读，目前只有命令行在用 —— 这是**临时状态**：
+ *           第 7 条（收藏同步搬进前端）落地后，这些字段要重新标成 live / restart。
+ *   none    代码里还没有任何实现（AI 那组），面板里锁住
+ */
+const CONFIG_FIELDS = [
+  // 常规
+  { path: 'proxy', group: '常规', label: '代理', type: 'url', effect: 'restart', def: 'http://127.0.0.1:7897', help: '所有出站请求都走它；写错不如留空' },
+  { path: 'intervalMs', group: '常规', label: '接口请求间隔（毫秒）', type: 'int', min: 0, max: 600000, step: 100, effect: 'restart', def: 2000 },
+  { path: 'userId', group: '常规', label: '账号 userId', type: 'string', effect: 'restart', help: '留空则启动时向 pixiv 询问' },
+  { path: 'cookie', group: '常规', label: 'Cookie', type: 'text', effect: 'restart', help: '留空则从 cookieFile 读' },
+  { path: 'cookieFile', group: '常规', label: 'Cookie 文件', type: 'path', effect: 'restart', def: '.secrets/cookies.txt' },
+  { path: 'includeNovels', group: '常规', label: '同步时包含小说', type: 'bool', effect: 'cli', def: true },
+
+  // 同步（命令行）
+  { path: 'pageSize.illust', group: '同步', label: '每页条数·插画', type: 'int', min: 1, max: 500, effect: 'cli', def: 100 },
+  { path: 'pageSize.novel', group: '同步', label: '每页条数·小说', type: 'int', min: 1, max: 500, effect: 'cli', def: 100 },
+  { path: 'maxPagesPerRun', group: '同步', label: '每次最多翻几页（0 = 不限）', type: 'int', min: 0, max: 100000, effect: 'cli', def: 0 },
+  { path: 'output.illustPublic', group: '同步', label: '输出·插画公开', type: 'path', effect: 'cli', def: 'data/bookmarks-illust.json' },
+  { path: 'output.illustPrivate', group: '同步', label: '输出·插画私密', type: 'path', effect: 'cli', def: 'data/bookmarks-illust-private.json' },
+  { path: 'output.novelPublic', group: '同步', label: '输出·小说公开', type: 'path', effect: 'cli', def: 'data/bookmarks-novel.json' },
+  { path: 'output.novelPrivate', group: '同步', label: '输出·小说私密', type: 'path', effect: 'cli', def: 'data/bookmarks-novel-private.json' },
+
+  // 下载
+  { path: 'download.dir', group: '下载', label: '图片保存目录', type: 'path', effect: 'cli', def: 'images', help: '查看器固定读写 images/；这里只影响命令行的 download 命令' },
+  { path: 'download.avifQuality', group: '下载', label: 'AVIF 质量', type: 'int', min: 1, max: 100, effect: 'live', def: 50 },
+  { path: 'download.imageIntervalMs', group: '下载', label: '图片请求间隔（毫秒）', type: 'int', min: 0, max: 600000, step: 100, effect: 'restart', def: 1000 },
+  { path: 'download.keepOriginal', group: '下载', label: '保留原图', type: 'bool', effect: 'cli', def: false, help: '查看器里的下载一律转换成 AVIF 后删除原图；这里只影响命令行' },
+
+  // 节奏
+  { path: 'pacer.enabled', group: '节奏', label: '启用随机长休息', type: 'bool', effect: 'live', def: true },
+  { path: 'pacer.pauseChance', group: '节奏', label: '每个请求触发休息的概率', type: 'float', min: 0, max: 1, step: 0.005, effect: 'live', def: 0.01 },
+  { path: 'pacer.perRequestMs', group: '节奏', label: '每个请求换多少毫秒休息', type: 'int', min: 0, max: 3600000, step: 500, effect: 'live', def: 5000 },
+  { path: 'pacer.decayMs', group: '节奏', label: '连续请求数回落间隔（毫秒）', type: 'int', min: 1000, max: 3600000, step: 1000, effect: 'live', def: 5000 },
+  { path: 'pacer.minPauseMs', group: '节奏', label: '最短休息（毫秒）', type: 'int', min: 1000, max: 3600000, step: 1000, effect: 'live', def: 60000 },
+  { path: 'pacer.maxPauseMs', group: '节奏', label: '最长休息（毫秒）', type: 'int', min: 1000, max: 86400000, step: 60000, effect: 'live', def: 5400000 },
+  { path: 'pacer.shape', group: '节奏', label: 'Gamma 形状参数', type: 'int', min: 1, max: 8, effect: 'live', def: 2, help: '1 = 指数分布，越大越集中在期望值附近' },
+
+  // 守卫
+  { path: 'guard.enabled', group: '守卫', label: '启用防封号守卫', type: 'bool', effect: 'live', def: true },
+  { path: 'guard.checkEveryFiles', group: '守卫', label: '每下载多少个文件巡检一次', type: 'int', min: 1, max: 100000, effect: 'live', def: 100 },
+  { path: 'guard.checkEveryRequests', group: '守卫', label: '每多少个请求巡检一次', type: 'int', min: 1, max: 100000, effect: 'live', def: 300 },
+  { path: 'guard.minCheckIntervalMs', group: '守卫', label: '两次巡检最小间隔（毫秒）', type: 'int', min: 1000, max: 86400000, step: 1000, effect: 'live', def: 200000 },
+  { path: 'guard.dailyFileLimit', group: '守卫', label: '每日文件上限（0 = 不限）', type: 'int', min: 0, max: 1000000, effect: 'live', def: 2000 },
+  { path: 'guard.dailyByteLimit', group: '守卫', label: '每日字节上限（0 = 不限）', type: 'int', min: 0, max: 1e12, step: 1048576, effect: 'live', def: 0 },
+
+  // 标签
+  { path: 'bookmarkTags.enabled', group: '标签', label: '同步时抓收藏标签', type: 'bool', effect: 'cli', def: true },
+  { path: 'bookmarkTags.cacheDir', group: '标签', label: '标签缓存目录', type: 'path', effect: 'cli', def: '.cache' },
+
+  // AI（占位：目前没有任何代码读这几项，纯给以后留位置）
+  { path: 'ai.provider', group: 'AI', label: '服务商', type: 'select', options: ['openai', 'deepseek', 'anthropic', 'custom'], effect: 'none', def: 'openai', unavailable: true },
+  { path: 'ai.baseUrl', group: 'AI', label: '接口地址', type: 'url', effect: 'none', unavailable: true, help: '留空用服务商默认地址' },
+  { path: 'ai.apiKey', group: 'AI', label: 'API Key', type: 'text', effect: 'none', unavailable: true },
+  { path: 'ai.model', group: 'AI', label: '模型名称', type: 'string', effect: 'none', unavailable: true },
+  { path: 'ai.targetLang', group: 'AI', label: '翻译目标语言', type: 'string', effect: 'none', def: '简体中文', unavailable: true },
+];
+
+function configGet(obj, dotted) {
+  return dotted.split('.').reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), obj);
+}
+
+function configSet(obj, dotted, value) {
+  const keys = dotted.split('.');
+  let cursor = obj;
+  for (const key of keys.slice(0, -1)) {
+    if (!cursor[key] || typeof cursor[key] !== 'object') cursor[key] = {};
+    cursor = cursor[key];
+  }
+  cursor[keys[keys.length - 1]] = value;
+}
+
+/** 按字段表把面板传来的值收敛成合法类型；不合法就抛，由路由回 400。 */
+function coerceConfigValue(field, raw) {
+  const fail = (why) => {
+    throw new Error(`${field.label}：${why}`);
+  };
+
+  switch (field.type) {
+    case 'bool':
+      return Boolean(raw);
+
+    case 'int':
+    case 'float': {
+      const value = Number(raw);
+      if (!Number.isFinite(value)) fail('必须是数字');
+      if (field.type === 'int' && !Number.isInteger(value)) fail('必须是整数');
+      if (field.min !== undefined && value < field.min) fail(`不能小于 ${field.min}`);
+      if (field.max !== undefined && value > field.max) fail(`不能大于 ${field.max}`);
+      return value;
+    }
+
+    case 'select': {
+      const value = String(raw ?? '');
+      if (!field.options.includes(value)) fail(`只能是 ${field.options.join(' / ')}`);
+      return value;
+    }
+
+    case 'path': {
+      const value = String(raw ?? '').trim();
+      if (value.includes('..')) fail('不能用 .. 跳出项目目录');
+      if (path.isAbsolute(value)) fail('请写项目内的相对路径');
+      return value;
+    }
+
+    case 'url': {
+      const value = String(raw ?? '').trim();
+      if (!value) return '';
+      try {
+        const parsed = new URL(value);
+        if (!/^https?:$/.test(parsed.protocol)) fail('只支持 http / https');
+      } catch {
+        fail('不是合法的地址');
+      }
+      return value;
+    }
+
+    default:
+      return String(raw ?? '');
+  }
+}
+
+/**
+ * 序列化：顶层每个键之间留一个空行。
+ *
+ * 纯粹为了可读 —— config.json 是给人改的，原文件就是按「认证 / 同步 / 下载 / 节奏」
+ * 分段空开的。JSON.stringify 会把所有空行吃掉，面板保存一次就变回一大坨。
+ */
+function serializeConfig(config) {
+  const keys = Object.keys(config);
+  const body = keys
+    .map((key) => {
+      const value = JSON.stringify(config[key], null, 2).replace(/\n/g, '\n  ');
+      return `  ${JSON.stringify(key)}: ${value}`;
+    })
+    .join(',\n\n');
+  return `{\n${body}\n}\n`;
+}
+
+/** 原子写：先写 .tmp 再 rename，别让半截 JSON 落在盘上。 */
+async function writeConfigFile(config) {
+  const tmp = `${CONFIG_PATH}.tmp`;
+  await fsp.writeFile(tmp, serializeConfig(config), 'utf8');
+  await fsp.rename(tmp, CONFIG_PATH);
 }
 
 /** 文件存在且不算明显损坏。只做大小判断，不碰内容（内容校验见 verify 流程）。 */
@@ -578,10 +734,19 @@ async function fetchPageNow(pid, page) {
     await bumpQuota({ files: 1, bytes });
     return filePath;
   })()
-    .catch((err) => {
+    .catch(async (err) => {
       // 守卫拦截意味着整条队列都该停，不能只当这一页失败
       if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
         stopQueueByGuard(err);
+        throw err;
+      }
+
+      // 缺页也可能是「作品已经没了」——确认一次，是就标失效，免得反复点
+      if (!err?.unavailable) {
+        const record = state.records.find((item) => String(item.pid) === String(pid));
+        if (record && (await detectGone(state.client, record))) {
+          await markRecordUnavailable(record);
+        }
       }
       throw err;
     })
@@ -653,6 +818,166 @@ function queueSnapshot() {
     // 随机休息的倒计时：前端据此显示「还剩 12 分钟」和「立即继续」按钮
     pacer: state.pacer ? state.pacer.status() : null,
   };
+}
+
+/* ── 已失效的作品 ──────────────────────────────────────────
+ * 下载时 pixiv 只回一句「未知错误」，实际是作品被删了。确认之后标进数据文件，
+ * 之后任何入队逻辑看到 status: unavailable 就会跳过，不再白试。
+ */
+async function markRecordUnavailable(record) {
+  if (record.status === 'unavailable') return;
+
+  record.status = 'unavailable';
+  state.unavailable.add(String(record.pid));
+  queue.done.delete(String(record.pid));
+  queue.failed.delete(String(record.pid));
+
+  const file = DATA_FILES[record.source];
+  if (!file) return;
+
+  try {
+    const doc = await readDocument(file);
+    const target = doc.records.find((item) => String(item.pid) === String(record.pid));
+    if (!target) return;
+    target.status = 'unavailable';
+    await writeRecords(file, doc.records, doc.meta);
+    console.log(`[失效] ${record.pid} 已标为 unavailable（${record.source}）`);
+  } catch (err) {
+    console.error(`[失效] ${record.pid} 写盘失败：${err.message}`);
+  }
+}
+
+/* ── 收藏同步（前端） ──────────────────────────────────────
+ * 跑的就是 cli.mjs 那套：buildChannels → syncKind → syncTagsForChannel。
+ * 抽到 src/channels.mjs 之后两边共用一份，命令行和界面不会各跑各的口径。
+ *
+ * 这是**批量**任务，走普通通道（fast:false）：别因为「用户点了按钮」就当成快速请求，
+ * 一次同步是几十上百个请求，图快只会换来封号。
+ */
+const syncJob = {
+  running: false,
+  stopRequested: false,
+  full: false,
+  dryRun: false,
+  startedAt: 0,
+  finishedAt: 0,
+  current: '',
+  channels: [],
+  page: 0,
+  fetched: 0,
+  serverTotal: 0,
+  added: 0,
+  removed: 0,
+  changed: 0,
+  results: [],
+  log: [],
+  error: '',
+};
+
+class SyncStopRequested extends Error {
+  constructor() {
+    super('同步已停止');
+    this.name = 'SyncStopRequested';
+  }
+}
+
+function syncSnapshot() {
+  return {
+    ...syncJob,
+    channels: [...syncJob.channels],
+    results: [...syncJob.results],
+    log: syncJob.log.slice(-10),
+  };
+}
+
+function syncLog(text) {
+  syncJob.log.push(text);
+  if (syncJob.log.length > 200) syncJob.log.shift();
+}
+
+async function runSyncJob(channels, { full, dryRun }) {
+  try {
+    // 开跑前再看一眼禁令：排队期间命令行可能刚写下「过度访问警告」
+    await state.guard.assertAllowed();
+
+    for (const entry of channels) {
+      if (syncJob.stopRequested) break;
+
+      syncJob.current = entry.label;
+      syncJob.page = 0;
+      syncJob.fetched = 0;
+      syncJob.serverTotal = 0;
+      syncLog(`开始 ${entry.label}`);
+
+      const filePath = path.resolve(ROOT, entry.file);
+      const result = await syncKind(state.client, {
+        kind: entry.kind,
+        visibility: entry.visibility,
+        label: entry.label,
+        filePath,
+        limit: Number(state.config.pageSize?.[entry.kind] ?? 100),
+        full,
+        dryRun,
+        maxPages: Number(state.config.maxPagesPerRun ?? 0),
+        onProgress: async (event) => {
+          syncJob.page = event.page;
+          syncJob.fetched = event.fetchedSoFar;
+          syncJob.serverTotal = event.serverTotal;
+          // 每翻一页就是一次请求，照命令行的做法记账
+          await state.guard.bump({ requests: 1 });
+          if (syncJob.stopRequested) throw new SyncStopRequested();
+        },
+      });
+
+      const added = result.added.length;
+      const removed = result.removed.length;
+      const changed = result.changed.length;
+      syncJob.added += added;
+      syncJob.removed += removed;
+      syncJob.changed += changed;
+      syncJob.results.push({ label: entry.label, added, removed, changed, total: result.total });
+      syncLog(`${entry.label}：新增 ${added}、移除 ${removed}、变更 ${changed}`);
+
+      // 标签补抓：dry-run 不写文件，跳过；关掉的话照命令行的开关走
+      if (state.config.bookmarkTags?.enabled && !dryRun && !syncJob.stopRequested) {
+        await syncTagsForChannel(state.client, {
+          entry,
+          config: state.config,
+          filePath,
+          full,
+          rebuildTags: false,
+          sourceTotal: result.total,
+          result,
+          guard: state.guard,
+          log: syncLog,
+        });
+      }
+    }
+  } catch (err) {
+    if (err?.name === 'SyncStopRequested') {
+      syncLog('已按请求停止');
+    } else if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
+      syncJob.error = err.message;
+      syncLog(`守卫拦下：${err.message}`);
+    } else {
+      syncJob.error = err.message;
+      syncLog(`出错：${err.message}`);
+    }
+  } finally {
+    // 同步只改磁盘 JSON，内存里还是启动时那一份 —— 不重载就会出现「同步了却看不到」
+    if (!dryRun) {
+      try {
+        await loadRecords();
+        await refreshIndex();
+        syncLog(`已重载 ${state.records.length} 条记录`);
+      } catch (err) {
+        syncLog(`重载失败：${err.message}`);
+      }
+    }
+    syncJob.running = false;
+    syncJob.finishedAt = Date.now();
+    syncJob.current = '';
+  }
 }
 
 /**
@@ -816,6 +1141,15 @@ async function queueWorker() {
         await bumpQuota({ files: summary?.files, bytes: summary?.finalBytes });
       }
     } catch (err) {
+      // 作品已经没了：标进数据文件，之后不再入队、不再重试。
+      // 这和「这次下载失败」是两件事，不能混在 failed 里让人反复点重试。
+      if (err?.unavailable) {
+        const record = state.records.find((item) => String(item.pid) === String(task.pid));
+        if (record) await markRecordUnavailable(record);
+        if (task.page !== undefined) task.reject(err);
+        continue;
+      }
+
       if (task.page !== undefined) {
         task.reject(err);
         queue.failed.set(`${task.pid} 第 ${task.page + 1} 页`, err.message);
@@ -1304,6 +1638,11 @@ function pageStats(record) {
   return { total, have };
 }
 
+/** 本地有没有可看的东西（任一页 / 正文 / 动图 zip）。查询里的 is:dead-* 用它分档。 */
+function hasMedia(record) {
+  return pageStats(record).have > 0;
+}
+
 function isComplete(record) {
   const stats = pageStats(record);
   return stats.have >= stats.total;
@@ -1428,20 +1767,22 @@ async function handleApi(req, res, url) {
 
     // 标签组：搜索词命中组员时展开成同义词的 OR
     const groups = state.tagGroups ? state.tagGroups.list() : [];
+    // is:dead-* 需要知道「本地有没有可看的文件」「还有没有真的元数据」，查询层不猜，由这里给
+    const matchCtx = { hasMedia, hasMeta: hasUsableMeta };
 
     if (queryText) {
       const ast = compileQuery(queryText, { groups });
-      if (ast) list = list.filter((r) => matchQuery(ast, r));
+      if (ast) list = list.filter((r) => matchQuery(ast, r, matchCtx));
     }
 
     if (filterText) {
       const filterAst = compileQuery(filterText, { groups });
-      if (filterAst) list = list.filter((r) => matchQuery(filterAst, r));
+      if (filterAst) list = list.filter((r) => matchQuery(filterAst, r, matchCtx));
     }
 
     if (ratingText) {
       const ratingAst = compileQuery(ratingText, { groups });
-      if (ratingAst) list = list.filter((r) => matchQuery(ratingAst, r));
+      if (ratingAst) list = list.filter((r) => matchQuery(ratingAst, r, matchCtx));
     }
 
     if (tag) list = list.filter((r) => (r.bookmark_tags ?? []).includes(tag));
@@ -1489,6 +1830,75 @@ async function handleApi(req, res, url) {
       .map((item) => ({ ...item, sources: [...item.sources] }));
 
     return sendJson(res, 200, { total: authors.length, authors });
+  }
+
+  /* ── 后端配置 ──────────────────────────────────────────────
+   * GET  返回 { config, fields }，面板照着 fields 渲染，不硬编码表单。
+   * POST 接受 { patch: { 'pacer.pauseChance': 0.02 } }，逐项校验后原子写回 config.json。
+   *
+   * 跨站风险：服务只监听 127.0.0.1，且这是 application/json 的 POST（会触发预检），
+   * 我们的响应不带 CORS 头，所以别处的网页发不过来。
+   */
+  if (url === '/api/config' || url.startsWith('/api/config?')) {
+    if (req.method !== 'POST') {
+      return sendJson(res, 200, { config: state.config, fields: CONFIG_FIELDS });
+    }
+
+    const body = await readBody(req);
+    const patch = body?.patch && typeof body.patch === 'object' ? body.patch : null;
+    if (!patch) return sendJson(res, 400, { error: '缺少 patch' });
+
+    // 以磁盘上的现文件为底，保留 _说明 之类的未知字段（用户手写的注释不能被面板吞掉）
+    let current = {};
+    try {
+      current = JSON.parse(await fsp.readFile(CONFIG_PATH, 'utf8'));
+    } catch {
+      current = {};
+    }
+
+    const next = structuredClone(current);
+    const touched = [];
+    const livePacer = {};
+    const liveGuard = {};
+
+    try {
+      for (const [dotted, raw] of Object.entries(patch)) {
+        const field = CONFIG_FIELDS.find((item) => item.path === dotted);
+        if (!field) return sendJson(res, 400, { error: `未知配置项：${dotted}` });
+
+        const value = coerceConfigValue(field, raw);
+        configSet(next, dotted, value);
+        touched.push(field);
+
+        if (dotted.startsWith('pacer.')) livePacer[dotted.slice('pacer.'.length)] = value;
+        if (dotted.startsWith('guard.')) liveGuard[dotted.slice('guard.'.length)] = value;
+      }
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    await writeConfigFile(next);
+    state.config = next; // 运行时读 state.config 的地方（AVIF 质量、代理）立刻跟上
+
+    const applied = [];
+    if (Object.keys(livePacer).length > 0 && state.pacer) {
+      state.pacer.applySettings(livePacer);
+      applied.push('节奏');
+    }
+    if (Object.keys(liveGuard).length > 0 && state.guard?.settings) {
+      Object.assign(state.guard.settings, liveGuard);
+      applied.push('守卫');
+    }
+    if (touched.some((field) => field.path === 'download.avifQuality' || field.path === 'download.keepOriginal')) {
+      applied.push('下载');
+    }
+
+    return sendJson(res, 200, {
+      config: next,
+      applied,
+      needsRestart: touched.filter((field) => field.effect === 'restart').map((field) => field.label),
+      nextRun: touched.filter((field) => field.effect === 'cli').map((field) => field.label),
+    });
   }
 
   if (url.startsWith('/api/state')) {
@@ -1978,6 +2388,59 @@ async function handleApi(req, res, url) {
 
   // 统计：给下载管理器用的总览。作品数和页数各算一套 ——
   // 「已下载 120 个作品」和「已下载 300 / 4200 页」是两回事，后者才反映真实进度。
+  if (url === '/api/sync/start' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (syncJob.running) return sendJson(res, 409, { error: '同步已经在跑了' });
+
+    const channels = buildChannels(state.config, {
+      novelOnly: Boolean(body.novelOnly),
+      illustOnly: Boolean(body.illustOnly),
+      publicOnly: Boolean(body.publicOnly),
+      privateOnly: Boolean(body.privateOnly),
+    });
+    if (channels.length === 0) return sendJson(res, 400, { error: '没有需要同步的收藏类型' });
+
+    const full = Boolean(body.full);
+    const dryRun = Boolean(body.dryRun);
+
+    try {
+      await state.guard.assertAllowed();
+    } catch (err) {
+      return sendJson(res, 409, { error: err.message });
+    }
+
+    Object.assign(syncJob, {
+      running: true,
+      stopRequested: false,
+      full,
+      dryRun,
+      startedAt: Date.now(),
+      finishedAt: 0,
+      current: '',
+      channels: channels.map((channel) => channel.label),
+      page: 0,
+      fetched: 0,
+      serverTotal: 0,
+      added: 0,
+      removed: 0,
+      changed: 0,
+      results: [],
+      log: [],
+      error: '',
+    });
+
+    // 不等它跑完：同步可能十几分钟，接口立刻回，前端轮询 /api/stats 看进度
+    void runSyncJob(channels, { full, dryRun });
+    return sendJson(res, 202, { sync: syncSnapshot() });
+  }
+
+  if (url === '/api/sync/stop' && req.method === 'POST') {
+    if (!syncJob.running) return sendJson(res, 200, { sync: syncSnapshot() });
+    syncJob.stopRequested = true;
+    syncLog('收到停止请求，等这一页走完');
+    return sendJson(res, 200, { sync: syncSnapshot() });
+  }
+
   if (url.startsWith('/api/stats')) {
     // 命令行那边可能刚写了禁令，先把磁盘状态同步进来
     if (state.guard) await state.guard.refresh();
@@ -2038,6 +2501,8 @@ async function handleApi(req, res, url) {
       downloaded: state.imageIndex.size,
       guard: state.guard ? state.guard.status() : null,
       convert: convertSnapshot(),
+      sync: syncSnapshot(),
+      unavailable: [...state.unavailable],
       pages: { total: allPagesTotal, done: allPagesDone, missing: allPagesTotal - allPagesDone },
     });
   }
