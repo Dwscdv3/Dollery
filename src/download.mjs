@@ -313,11 +313,12 @@ export async function downloadSinglePage(client, options) {
     proxy,
     quality = 50,
     keepOriginal = false,
-    // 用户正盯着这一页看，所以这次请求不等队列的随机休息（其它请求照等）
+    // 用户正盯着这一页看，所以这次请求走快速车道：不排后台队列、也不等随机休息
     bypassPacer = false,
+    fast = false,
   } = options;
 
-  const pages = await client.ajax(`/ajax/illust/${pid}/pages`, { lang: 'zh' }, { bypassPacer });
+  const pages = await client.ajax(`/ajax/illust/${pid}/pages`, { lang: 'zh' }, { bypassPacer, fast });
   if (!Array.isArray(pages) || !pages[page]) {
     throw new DownloadError(`第 ${page} 页不存在（共 ${Array.isArray(pages) ? pages.length : 0} 页）`);
   }
@@ -336,7 +337,7 @@ export async function downloadSinglePage(client, options) {
         timeoutMs: 180000,
         headers: { Referer: REFERER, 'User-Agent': USER_AGENT, Accept: 'image/*,*/*' },
       }),
-    { bypassPacer },
+    { bypassPacer, fast },
   );
   if (res.status !== 200) throw new DownloadError(`HTTP ${res.status}`);
 

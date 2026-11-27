@@ -19,7 +19,18 @@ import { URL } from 'node:url';
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * 串行限速队列。
+ * 串行限速队列（两条车道）。
+ *
+ * 车道划分的动机很具体：后台下载正卡在 pacer 的随机长休息里时（可能几十分钟），
+ * 用户点一下收藏、翻一页大图，不该跟着一起等。
+ *
+ *   · 后台车道：所有任务串成一条链，按 intervalMs 排队，长得像以前那样。
+ *   · 快速车道：用户自己发起的那一次（点保存、翻大图、打开详情）单独一条链，
+ *     不排后台那条，所以永远不等后台、也不等长休息；但用户请求之间仍然串行，
+ *     连点十下不会并发十个请求。
+ *
+ * 两条车道之间仍会重叠（后台那个已经在飞了，不会被打断），这是有意的：
+ * 打断一个已发出的请求拿不到任何好处，只会留下半截状态。
  *
  * run() 返回的 Promise 在任务真正执行后兑现；队列内部用 `.then(() => {}, () => {})`
  * 吞掉异常，保证一个任务失败不会把后续任务一起带走。
@@ -40,34 +51,39 @@ export class RateLimiter {
     this.nextAllowedAt = 0;
     this.fastAllowedAt = 0;
     this.tail = Promise.resolve();
+    this.fastTail = Promise.resolve();
     this.executed = 0;
   }
 
   /**
    * @param {() => Promise<any>} task
    * @param {{ bypassPacer?: boolean, fast?: boolean }} [options]
-   *   bypassPacer: 用户手动触发的那一次，不等随机长休息
-   *   fast: 走快速通道 —— 用户点了保存就盯着界面等，按 2 秒排队会以为卡死了。
-   *         默认间隔 0（不额外等待），但仍然是串行执行的；发完之后普通请求
-   *         照样按完整间隔排队，所以后台的下载节奏不会被带快。
+   *   bypassPacer: 只这一次不等随机长休息（仍排后台链）
+   *   fast: 走快速车道 —— 用户点了保存就盯着界面等。不排后台链、也不等长休息；
+   *         用户请求之间仍然串行，间隔是 fastIntervalMs（默认 0）。
+   *         发完之后 nextAllowedAt 照样往后推一个完整间隔，所以后台节奏不会被带快。
+   *         fast 隐含 bypassPacer：手动那一下不该被休息挡住。
    */
   run(task, { bypassPacer = false, fast = false } = {}) {
+    return fast ? this.runFast(task) : this.runQueued(task, { bypassPacer });
+  }
+
+  /**
+   * 后台车道：一条链，前面的任务没完就排着。
+   *
+   * @param {() => Promise<any>} task
+   * @param {{ bypassPacer?: boolean }} [options] bypassPacer: 只这一次不等随机长休息
+   */
+  runQueued(task, { bypassPacer = false } = {}) {
     const result = this.tail.then(async () => {
-      // 普通请求要看两条闸门（普通队列和快速通道都可能刚用过），
-      // 快速请求只等自己那条更短的。
-      const gate = fast
-        ? this.fastAllowedAt
-        : Math.max(this.nextAllowedAt, this.fastAllowedAt);
-      const wait = gate - Date.now();
+      // 两侧的闸门都要看：普通车道和快速车道都可能刚用过
+      const wait = Math.max(this.nextAllowedAt, this.fastAllowedAt) - Date.now();
       if (wait > 0) await sleep(wait);
       // 粗粒度休息在这里等着：整条串行链都卡住，所以队列会真的停下来，
       // 而不是一边「休息」一边继续发请求。
       if (this.pacer) await this.pacer.gate({ bypass: bypassPacer });
       // 抖动是为了避免固定频率的请求特征，兼防止多个进程恰好同频。
-      const stamp = Date.now();
-      this.nextAllowedAt = stamp + this.minIntervalMs + Math.random() * this.jitterMs;
-      this.fastAllowedAt = stamp + this.fastIntervalMs;
-      this.executed += 1;
+      this.stamp();
       return task();
     });
     this.tail = result.then(
@@ -75,6 +91,42 @@ export class RateLimiter {
       () => {},
     );
     return result;
+  }
+
+  /**
+   * 快速车道：用户正盯着结果的那一次。
+   *
+   * 不排后台链是关键 —— 否则后台在长休息里，用户点一下要等半小时。
+   * 但用户请求之间仍然串行，间隔由 fastIntervalMs 控制（默认 0）。
+   * pacer 一律按 bypass 处理：手动那一下不停、也不掷骰子，但照常计数。
+   *
+   * @param {() => Promise<any>} task
+   */
+  runFast(task) {
+    const result = this.fastTail.then(async () => {
+      const wait = this.fastAllowedAt - Date.now();
+      if (wait > 0) await sleep(wait);
+      if (this.pacer) await this.pacer.gate({ bypass: true });
+      this.stamp();
+      return task();
+    });
+    this.fastTail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  /**
+   * 每次真正发出请求前记一次账。两条车道共用同一份时间戳 ——
+   * 用户那一下同样要把后台往后推一个完整间隔，否则「点一下保存」之后
+   * 后台可能立刻接着发，等于自己给自己叠请求。
+   */
+  stamp() {
+    const now = Date.now();
+    this.nextAllowedAt = now + this.minIntervalMs + Math.random() * this.jitterMs;
+    this.fastAllowedAt = now + this.fastIntervalMs;
+    this.executed += 1;
   }
 }
 

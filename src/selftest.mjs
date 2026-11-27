@@ -730,6 +730,25 @@ await test('快速通道默认完全不排队，但串行仍然成立', async ()
   assert.equal(maxConcurrent, 1, '快速通道也不能并发，必须一个接一个');
 });
 
+await test('快速通道不等后台的长休息', async () => {
+  // 后台任务一进去就命中休息（400ms），快速请求不该跟着等
+  const pacer = new RequestPacer({ pauseChance: 1, perRequestMs: 0, minPauseMs: 400, maxPauseMs: 400, shape: 1 });
+  const limiter = new RateLimiter(0, 0, pacer);
+
+  const background = limiter.run(async () => 'bg');
+  await new Promise((resolve) => setTimeout(resolve, 20)); // 让后台真的进到 gate 里
+
+  const started = Date.now();
+  const result = await limiter.run(async () => 'fast', { fast: true });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result, 'fast');
+  assert.ok(elapsed < 150, `快速请求不该等后台的长休息，实际 ${elapsed}ms`);
+
+  // 后台那条还在休息里，等它自己走完
+  assert.equal(await background, 'bg');
+});
+
 await test('快速通道：手动写操作不用等满普通间隔', async () => {
   const limiter = new RateLimiter(400, 0, null, 60);
 

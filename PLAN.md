@@ -5,7 +5,9 @@
 
 ## 进度
 
-- ✅ **第 1 / 3 / 4 / 5 条已实现**（2026-11-27，待视觉与交互验收，未提交）
+- ✅ **第 1 / 3 / 4 / 5 条已实现并验收**（2026-11-27，提交 `16ef7f5`，已推送）
+  - 已知细节：流行度标签的写法是「<标签名><数量>users入り」，绝大多数是**作品标签**，
+    所以开关要配合「含作品标签」才看得出效果（实测 illustPublic 作品标签命中 379 个，收藏标签只有 1 个）。
   - `viewer/index.html`：筛选框改成「输入框 + 设置按钮」一行；新增评分按钮行（容器由 JS 生成）、
     设置项容器（含作品标签 / 只看标签组 / 隐藏流行度）、顶栏「换一批」按钮；版本号 `app.js?v=45`、`style.css?v=31`。
   - `viewer/app.js`：`isTagHidden()` 统一挡掉评分标签与（可选）流行度标签；`renderRatingFilter()`；
@@ -13,7 +15,38 @@
     按钮有选中时把搜索框里的评分词剔除；`freshSeed()`；三个新设置项（`tagSettingsOpen` / `hidePopularTags` / `ratingFilter`）。
   - `viewer/style.css`：`.side-query-row` / `.side-query-btn` / `.rating-filter` / `.rating-chip`。
   - `viewer/server.mjs`：`/api/records` 支持 `r`（评分条件独立编译后 AND，和 `q` / `f` 同等待遇）。
-- ⏳ 未做：第 2、6、7、8、9、10、11 条。
+- ✅ **第 2 条已实现**（2026-11-27，待验收，未提交）
+  - `RateLimiter` 拆成两条车道：`runQueued()`（后台，串行一条链）和 `runFast()`（用户，单独一条链，
+    不排后台、pacer 一律 bypass）；用户请求之间仍然串行，间隔走 `fastIntervalMs`。
+  - `stamp()` 统一记账 —— 用户那一下同样把 `nextAllowedAt` 往后推一个完整间隔，
+    避免「点一下保存」之后后台立刻接着发。
+  - 查看器里小说详情、插画简介、头像、单页下载都改成 `fast: true`；批量下载 / 同步 / 迁移仍是 `fast: false`。
+  - 改标签（`/api/bookmark` → `editBookmark`）与改评分（`/api/bookmark/rating` → `setBookmarkRating`）
+    本来就在 fast 车道上，但改之前只免了 2 秒间隔、仍会排在后台链后面。现在真正不等后台；
+    `setBookmarkRating` 补了显式的 `fast` 透传，不再靠 `saveBookmarkToPixiv` 的默认值兜底。
+  - selftest 新增「快速通道不等后台的长休息」，52 项通过。
+- ⏳ 未做：第 6、7、8、9、10、11 条。
+
+## 12. 本地请求「塞车」：慢请求占满浏览器连接
+
+**现象**：后端有大量 pixiv 请求排队时，连本地已缓存的图也发不出来，界面像卡住。
+
+**已修的三个错位**（2026-11-27）
+1. `ensurePage()` 曾把「用户正在看的那一页」塞进后台队列（`enqueuePage`），
+   排在几百个批量任务、甚至一轮长休息后面。改成 `fetchPageNow()`：直接跑、走快速车道，
+   只保留「同一页合并」和额度记账。`enqueuePage` 已删除。
+2. `ensureAvatar()` 的图片下载没传 `fast`，一张可选头像能占着连接等长休息 —— 已补。
+3. **头像接口不再同步等 pixiv**：命中缓存直接给；未命中先回占位、后台抓。
+   占位响应改成 `no-store` —— 原先带 `max-age=3600`，一旦没取到，浏览器会把灰人缓存一小时，
+   之后真头像落盘了界面也不更新。
+4. （已确认无问题）缩略图命中缓存时不进 `withThumbSlot`，只有真要 `magick` 才占槽；
+   `fetchDescription()` 只在打开大图时调一次（`app.js:2634`），不是每张卡一个请求，所以简介不是堵点。
+
+**待定**
+- `/api/description/:pid` 未命中时同步等 pixiv（fast 车道，串行）。滚动时一屏十几张卡同时请求，
+  浏览器对同 origin 只有 6 个连接，被占满后 `/api/records` 和已缓存缩略图只能排队。
+  候选做法：① 未命中立即返回空 + 后台补抓 + 前端稍后重试；② 静态/图片换第二个端口，把连接池分开。
+- 队列 worker 里 `task.page !== undefined` 的分支已是死代码（单页不再入队），可择机清掉。
 
 ---
 

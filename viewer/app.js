@@ -562,8 +562,12 @@ function renderAuthors() {
  */
 const POPULAR_TAG_RE = /\d+\s*users入り$/i;
 
+/** 「请整理 users 标签」这类元标签：不带数量，但同样是噪音，跟着流行度开关一起藏。 */
+const POPULAR_META_RE = /^usersタグ整理推奨$/i;
+
 function isPopularTag(tag) {
-  return POPULAR_TAG_RE.test(String(tag ?? '').trim());
+  const text = String(tag ?? '').trim();
+  return POPULAR_TAG_RE.test(text) || POPULAR_META_RE.test(text);
 }
 
 function isTagHidden(tag) {

@@ -541,25 +541,45 @@ async function ensurePage(pid, page) {
   if (record.status === 'unavailable') return null;
   if (record.type === 'novel' || record.type === 'ugoira') return null;
 
-  return enqueuePage(key, page);
+  return fetchPageNow(key, page);
 }
 
-/** 入队一个单页任务；同一页的并发请求共享同一个 Promise，不会重复下载。 */
-function enqueuePage(pid, page) {
+/**
+ * 立刻下载用户正在看的那一页 —— **不进后台队列**。
+ *
+ * 走后台队列的话，这一页要排在几百个批量任务后面，还可能撞上一轮随机长休息；
+ * 而用户正盯着它，界面会一直转圈。所以单页请求直接跑，只保留两件事：
+ * 同一页的并发请求共享一个 Promise、以及额度记账（和队列 worker 里那份一致）。
+ */
+async function fetchPageNow(pid, page) {
   const jobKey = `${pid}#${page}`;
   const existing = queue.pageJobs.get(jobKey);
   if (existing) return existing;
 
-  const job = new Promise((resolve, reject) => {
-    queue.pending.unshift({ key: jobKey, pid, page, resolve, reject });
-    runQueue();
-  }).finally(() => queue.pageJobs.delete(jobKey));
+  const job = (async () => {
+    const { filePath, bytes } = await downloadPageNow(pid, page);
+    await bumpQuota({ files: 1, bytes });
+    return filePath;
+  })()
+    .catch((err) => {
+      // 守卫拦截意味着整条队列都该停，不能只当这一页失败
+      if (err?.name === 'GuardTripped' || err?.name === 'DailyLimitReached') {
+        stopQueueByGuard(err);
+      }
+      throw err;
+    })
+    .finally(() => queue.pageJobs.delete(jobKey));
 
   queue.pageJobs.set(jobKey, job);
   return job;
 }
 
-/** 真正下载一页：落盘 → 更新索引 → 生成缩略图。额度记账交给 worker 统一做。 */
+/**
+ * 真正下载一页：落盘 → 更新索引 → 生成缩略图。
+ *
+ * 调用方只有 fetchPageNow（用户正在看的那一页）。批量的整作品任务走 queueWorker 里的
+ * downloadByPid，两者共用 downloadSinglePage，但只有这里走快速车道。
+ */
 async function downloadPageNow(pid, page) {
   await downloadSinglePage(state.client, {
     pid,
@@ -571,6 +591,8 @@ async function downloadPageNow(pid, page) {
     quality: state.config?.download?.avifQuality ?? 50,
     // 用户就盯着这一页，不等随机休息；其它排队的任务照旧等着
     bypassPacer: true,
+    // 也不排后台队列：pacer 休息时点开大图不该跟着等
+    fast: true,
   });
 
   const entry = state.imageIndex.get(pid) ?? { pages: new Set(), ugoira: false };
@@ -698,7 +720,7 @@ function enqueue(pids, { mode = 'first', priority = false } = {}) {
 
   if (added > 0) {
     // 短作品优先：让用户尽快看到更多图，而不是被一个大合集堵住。
-    // 单页任务始终留在队首 —— 用户正盯着那一页，不能排到批量任务后面。
+    // （单页请求已经不走这条队列了，见 fetchPageNow）
     if (!priority) {
       const pages = queue.pending.filter((task) => task.page !== undefined);
       const works = queue.pending.filter((task) => task.page === undefined);
@@ -1044,7 +1066,8 @@ async function ensureNovel(pid) {
 
   // 正文和封面都可能单独缺失（老数据只有 txt），所以按需取详情
   if (needText || needCover) {
-    const body = await state.client.ajax(`/ajax/novel/${key}`, { lang: 'zh' });
+    // 打开小说阅读器是用户动作：走快速车道，pacer 休息时也立刻给
+    const body = await state.client.ajax(`/ajax/novel/${key}`, { lang: 'zh' }, { fast: true });
 
     if (needText) {
       const content = body.content ?? '';
@@ -1152,7 +1175,8 @@ async function ensureDescription(pid) {
   if (record.type === 'novel') return '';
   if (record.status === 'unavailable') return '';
 
-  const body = await state.client.ajax(`/ajax/illust/${key}`, { lang: 'zh' });
+  // 详情是按需拉的（卡片要显示简介时才取），用户动作，走快速车道
+  const body = await state.client.ajax(`/ajax/illust/${key}`, { lang: 'zh' }, { fast: true });
   const text = cleanDescription(body.illustComment ?? body.description ?? '');
 
   descCache.set(key, text);
@@ -1177,28 +1201,41 @@ function applyDescCache() {
 }
 
 /** 作者头像：按需拉一次，存到 .thumbs/avatar-{uid}.jpg 永久复用。 */
-async function ensureAvatar(uid) {
+/** 已落盘的头像路径；没有就返回 null（用户 id 不合法也返回 null）。 */
+function avatarPathOf(uid) {
   const key = String(uid);
   if (!/^\d+$/.test(key)) return null;
-
   const target = path.join(THUMB_DIR, `avatar-${key}.jpg`);
-  if (fs.existsSync(target)) return target;
+  return fs.existsSync(target) ? target : null;
+}
+
+async function ensureAvatar(uid) {
+  const cached = avatarPathOf(uid);
+  if (cached) return cached;
+
+  const key = String(uid);
+  if (!/^\d+$/.test(key)) return null;
+  const target = path.join(THUMB_DIR, `avatar-${key}.jpg`);
 
   const jobKey = `avatar:${key}`;
   if (state.thumbJobs.has(jobKey)) return state.thumbJobs.get(jobKey);
 
   const job = withThumbSlot(async () => {
-    const body = await state.client.ajax(`/ajax/user/${key}`, { lang: 'zh' });
+    // 头像只有用户把卡片滚到眼前时才取，属于用户动作，走快速车道
+    const body = await state.client.ajax(`/ajax/user/${key}`, { lang: 'zh' }, { fast: true });
     const url = body.imageBig ?? body.image;
     if (!url) return null;
 
-    const res = await state.imageLimiter.run(() =>
-      httpsGetWithRetry(url, {
-        proxy: state.config?.proxy,
-        binary: true,
-        timeoutMs: 30000,
-        headers: { Referer: 'https://www.pixiv.net/', 'User-Agent': 'Mozilla/5.0' },
-      }),
+    // 头像只是装饰：走快速车道，别让一张可选的小图占着浏览器连接等长休息
+    const res = await state.imageLimiter.run(
+      () =>
+        httpsGetWithRetry(url, {
+          proxy: state.config?.proxy,
+          binary: true,
+          timeoutMs: 30000,
+          headers: { Referer: 'https://www.pixiv.net/', 'User-Agent': 'Mozilla/5.0' },
+        }),
+      { fast: true },
     );
     if (res.status !== 200) return null;
 
@@ -1212,13 +1249,18 @@ async function ensureAvatar(uid) {
 }
 
 /** 拿不到头像时给个灰色人形占位，避免列表里出现破图。 */
-function serveFallbackAvatar(res) {
+function serveFallbackAvatar(res, { noStore = false } = {}) {
   const svg =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
     '<rect width="64" height="64" fill="#2b3038"/>' +
     '<circle cx="32" cy="25" r="11" fill="#4a5160"/>' +
     '<ellipse cx="32" cy="58" rx="19" ry="14" fill="#4a5160"/></svg>';
-  res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=3600' });
+  // 头像还没抓到时用 no-store：否则浏览器会把占位图缓存一小时，
+  // 之后即使真头像已经落盘，界面上还是那个灰人。
+  res.writeHead(200, {
+    'Content-Type': 'image/svg+xml',
+    'Cache-Control': noStore ? 'no-store' : 'public, max-age=3600',
+  });
   res.end(svg);
 }
 
@@ -1293,13 +1335,15 @@ async function handleApi(req, res, url) {
   // 作者头像
   if (url.startsWith('/api/avatar/')) {
     const uid = url.replace(/^\/api\/avatar\//, '').split('?')[0];
-    try {
-      const file = await ensureAvatar(uid);
-      if (file) return sendFile(res, file, 'image/jpeg', 'public, max-age=86400');
-    } catch {
-      /* 落到占位图 */
-    }
-    return serveFallbackAvatar(res);
+
+    // 命中缓存就立刻给。侧栏一屏可能有二十个作者，每个都同步等 pixiv 的话，
+    // 浏览器的 6 个连接会被这串慢请求占满，连本地已缓存的图都挤不进来。
+    const cached = avatarPathOf(uid);
+    if (cached) return sendFile(res, cached, 'image/jpeg', 'public, max-age=86400');
+
+    // 没缓存：先给占位，后台慢慢抓；下次渲染时自然就有了（占位响应不被缓存）
+    ensureAvatar(uid).catch(() => {});
+    return serveFallbackAvatar(res, { noStore: true });
   }
 
   // 简介：按需从详情接口补一条

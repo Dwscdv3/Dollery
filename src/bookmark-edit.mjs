@@ -326,7 +326,7 @@ async function commitBookmark({
  * 写入失败会抛出，本地文件保持原样。token 有缓存时只有一个请求；
  * 没有缓存（进程刚起）时才先读一次编辑页把 token 拿到。
  *
- * fast=true 是手动编辑的默认值（不额外等 2 秒，只等 pacer 的长休息）；
+ * fast=true 是手动编辑的默认值（走快速车道：不排后台队列，也不等 pacer 的长休息）；
  * 批量转换传 false，让每条都按正常间隔排进限速队列。
  */
 export async function editBookmark({
@@ -386,8 +386,9 @@ export async function setBookmarkRating({
   rating,
   source,
   drop = '',
+  fast = true,
 }) {
-  const before = await readEditorState(client, kind, pid, { fast: true });
+  const before = await readEditorState(client, kind, pid, { fast });
   if (!before) {
     throw new Error('读不到这个作品的编辑页（作品可能已失效，或 Pixiv 改了页面）');
   }
@@ -412,6 +413,7 @@ export async function setBookmarkRating({
     isPrivate: before.isPrivate,
     source,
     token: before.token,
+    fast,
   });
 
   return {
