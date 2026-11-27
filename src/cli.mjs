@@ -1,4 +1,22 @@
 #!/usr/bin/env node
+
+/*
+ * Copyright (C) 2026 静瑶 (Dwscdv3)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /**
  * 命令行入口。
  *
@@ -162,7 +180,7 @@ async function resolveCookie(config) {
 
 function printHelp() {
   const lines = [
-    'pixiv-export — 增量备份 Pixiv 收藏元数据',
+    '色廊 Dollery — Pixiv 收藏同步与下载',
     '',
     '用法:',
     '  node src/cli.mjs sync [选项]          同步收藏（默认增量）',

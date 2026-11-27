@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2026 静瑶 (Dwscdv3)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /**
  * 自测。只覆盖纯数据逻辑，不碰网络。
  *
@@ -102,7 +119,7 @@ function makeFakeServer(ids) {
   };
 }
 
-const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pixiv-export-test-'));
+const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'dollery-test-'));
 const tempFile = path.join(tempRoot, 'bookmarks.json');
 
 const baseOptions = {

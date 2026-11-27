@@ -6,7 +6,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================================
-echo   pixiv-export   DOWNLOAD
+echo   DOLLERY   DOWNLOAD
 echo ----------------------------------------------------------
 echo   Enter a bookmark id range, for example:
 echo       1-5        first five bookmarks

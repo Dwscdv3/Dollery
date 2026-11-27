@@ -6,7 +6,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================================
-echo   pixiv-export   QUICK SYNC  (new bookmarks only)
+echo   DOLLERY   QUICK SYNC  (new bookmarks only)
 echo ----------------------------------------------------------
 echo   Usually 10-20 seconds. Does NOT detect removals;
 echo   use sync-full.bat for that.

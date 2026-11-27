@@ -6,7 +6,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================================
-echo   pixiv-export   COLLECTION VIEWER
+echo   DOLLERY   COLLECTION VIEWER
 echo ----------------------------------------------------------
 echo   Starts a local server on 127.0.0.1 and opens it in an
 echo   Edge app window. Close that window to quit.

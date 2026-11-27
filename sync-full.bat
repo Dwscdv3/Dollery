@@ -6,7 +6,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ==========================================================
-echo   pixiv-export   FULL SYNC
+echo   DOLLERY   FULL SYNC
 echo ----------------------------------------------------------
 echo   Scans every bookmark page. Roughly 12 minutes total.
 echo   Public first, then private. Ctrl+C is safe:
