@@ -2498,3 +2498,184 @@ body.bm-open { overflow: hidden; }
   width: var(--thumb-w-hover);
   background: rgba(106, 169, 255, .7);
 }
+
+/* ── 后端配置弹窗 ──────────────────────────────────────────
+ * 表单由服务端的字段表驱动，这里的类只负责排版：
+ * 左边标签、右边控件，一行一项；分组用 tab 切。
+ */
+.cfg-open {
+  width: auto;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.cfg-dialog {
+  width: min(780px, calc(100vw - 48px));
+  max-height: min(84vh, 820px);
+}
+
+/* 标题、标签栏、正文统一对齐到 16px（原先标签栏和正文是 18px，与标题差 2px）。
+   标题下那条分割线去掉，只留标签栏底部这条 —— 否则两条线夹着一行 tab，看着是挤在一起的。 */
+.cfg-dialog .bm-head {
+  border-bottom: 0;
+}
+
+.cfg-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 0 16px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cfg-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 11px;
+  cursor: pointer;
+}
+
+.cfg-tab:hover { color: var(--text); background: rgba(255, 255, 255, .04); }
+.cfg-tab.on { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+
+.cfg-body {
+  padding: 14px 16px 12px;
+  overflow-y: auto;
+  min-height: 180px;
+}
+
+.cfg-group { display: none; }
+.cfg-group.on { display: block; }
+
+.cfg-row {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, .045);
+}
+
+.cfg-row:last-child { border-bottom: 0; }
+
+.cfg-label {
+  font-size: 12px;
+  color: var(--muted);
+  padding-top: 6px;
+  line-height: 1.35;
+}
+
+.cfg-label .cfg-effect {
+  display: block;
+  font-size: 11px;
+  color: var(--warn);
+  margin-top: 2px;
+}
+
+.cfg-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+}
+
+.cfg-input:focus { border-color: var(--accent); }
+.cfg-input.changed { border-color: var(--accent); }
+
+textarea.cfg-input {
+  min-height: 64px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.cfg-help {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--muted);
+  opacity: .8;
+  margin-top: -4px;
+}
+
+.cfg-flag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 5px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.cfg-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.cfg-status {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.cfg-status.ok { color: var(--accent); }
+.cfg-status.warn { color: var(--warn); }
+.cfg-status.err { color: var(--danger); }
+
+/* 未实现/已锁定的配置项：明确灰掉，别让人以为填了就生效 */
+.cfg-input:disabled,
+.cfg-flag input:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+/* ── 同步收藏：右栏的进度与结果行 ─────────────────────────── */
+.sync-meta {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  padding: 6px 12px 0;
+}
+
+.sync-meta[hidden] { display: none; }
+
+.sync-bar {
+  height: 3px;
+  margin: 6px 12px 0;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .07);
+  overflow: hidden;
+}
+
+.sync-bar[hidden] { display: none; }
+
+.sync-bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width .2s ease-out;
+}
+
+/* 失效 / 未下载的作品：大图区域留白 + 一句说明，右侧信息面板照常显示 */
+.lb-stage.lb-empty::after {
+  content: attr(data-note);
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: .02em;
+  pointer-events: none;
+}

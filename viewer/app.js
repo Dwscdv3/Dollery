@@ -23,7 +23,7 @@ const DEFAULT_SETTINGS = {
   tagSettingsOpen: false, // 标签面板的设置项（含作品标签 / 只看标签组 / 隐藏流行度）是否展开
   hidePopularTags: false, // 隐藏 100users入り、1000users入り 这类流行度标签
   ratingFilter: [], // 评分筛选：选中的分值（1~10），多选按 OR 处理
-  defaultFilter: '-is:unavailable', // 默认过滤器：与搜索 AND 连接，默认藏掉已失效的作品
+  defaultFilter: '-is:lost', // 默认只藏「失效且没有图」的；失效但图还在的照常显示
   filterEnabled: true, // 默认过滤器的总开关：关掉后条件保留但不参与查询
   filterOpen: false, // 默认过滤器输入框是否展开（纯 UI 状态，不影响过滤是否生效）
   leftOpen: false,
@@ -33,7 +33,11 @@ const DEFAULT_SETTINGS = {
 function loadSettings() {
   try {
     const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
-    return { ...DEFAULT_SETTINGS, ...raw };
+    const merged = { ...DEFAULT_SETTINGS, ...raw };
+    // 旧版默认过滤器是 -is:unavailable；现在只藏「失效且没有图」的，
+    // 存过旧默认值的人跟着升级一次（自己改过的值不动）。
+    if (merged.defaultFilter === '-is:unavailable') merged.defaultFilter = '-is:lost';
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -86,7 +90,10 @@ const PAGE_SIZE = 120;
 
 const els = {};
 for (const id of [
-  'tabs', 'search', 'sortMode', 'btnReshuffle', 'btnView', 'queueState', 'counter',
+  'tabs', 'search', 'sortMode', 'btnReshuffle', 'btnView', 'btnConfig', 'queueState', 'counter',
+  'cfgModal', 'cfgTabs', 'cfgBody', 'cfgClose', 'cfgReload', 'cfgSave', 'cfgStatus',
+  'syncStart', 'syncStop', 'syncMeta', 'syncBar', 'syncFill',
+  'syncModal', 'syncClose', 'syncCancel', 'syncGo', 'syncDryRun', 'syncNovels', 'syncPrivate',
   'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
   'searchSuggest', 'tagIncludeWrap', 'tagIncludeWork',
   'onlyGroupsWrap', 'onlyGroups', 'sideMenu',
@@ -2194,7 +2201,10 @@ function renderCardInner(card, record) {
 
   let badge = '';
   if (record.removed === 'yes') badge = '<span class="badge danger">已取消</span>';
-  else if (record.status === 'unavailable') badge = '<span class="badge warn">已失效</span>';
+  else if (record.status === 'unavailable') {
+    const level = deadLevelOf(record);
+    badge = `<span class="badge warn" title="作品在 pixiv 上已失效">${DEAD_LABEL[level] ?? '已失效'}</span>`;
+  }
   else if (record.localUgoira) badge = '<span class="badge">动图</span>';
   else if (isNovel) badge = '<span class="badge">小说</span>';
 
@@ -2270,8 +2280,8 @@ function renderCardInner(card, record) {
   card.innerHTML = `
     <div class="frame" style="padding-top:${ratioPadding(record).toFixed(2)}%">${frame}${badge}${pageBadge}${spinner}<button class="card-copy" type="button" title="复制作品链接 (L)" aria-label="复制作品链接">${COPY_ICON}</button></div>
     <div class="info">
-      <div class="title">${escapeHtml(record.title || '(无题)')}</div>
-      <div class="sub"><span class="author-name">${escapeHtml(record.author || '未知')}</span>${ratingBadge}</div>
+      <div class="title">${escapeHtml(displayTitle(record))}</div>
+      <div class="sub"><span class="author-name">${escapeHtml(displayAuthor(record))}</span>${ratingBadge}</div>
       ${tagHtml}
     </div>
   `;
@@ -2301,6 +2311,56 @@ function renderCardInner(card, record) {
     });
   }
 }
+
+/**
+ * 占位元数据：作品失效后 pixiv 会把标题/简介/作者一律换成 `-----`，
+ * 作者 id 换成 "0"，日期换成 1970-01-01。规则与服务端 src/placeholder.mjs 一致
+ * （浏览器里 import 不到那边的模块，只能各存一份，改的时候两边一起改）。
+ */
+const PLACEHOLDER_TEXT_RE = /^[-—–ー~_\s]*$/;
+
+function isPlaceholderText(value) {
+  const text = String(value ?? '').trim();
+  return text === '' || PLACEHOLDER_TEXT_RE.test(text);
+}
+
+function hasUsableMeta(record) {
+  if (!record) return false;
+  if (!isPlaceholderText(record.title)) return true;
+  if (!isPlaceholderText(record.description)) return true;
+  if (!isPlaceholderText(record.author)) return true;
+  if ((record.tags?.length ?? 0) > 0) return true;
+  if ((record.bookmark_tags?.length ?? 0) > 0) return true;
+  return false;
+}
+
+/** 标题：占位值一律显示成「(无标题)」，别把一排横杠摆到界面上。 */
+function displayTitle(record) {
+  return isPlaceholderText(record.title) ? '(无标题)' : record.title;
+}
+
+function displayAuthor(record) {
+  return isPlaceholderText(record.author) ? '未知' : record.author;
+}
+
+/**
+ * 失效作品的细分档位。
+ *
+ * 只影响显示与筛选，不改数据：真身永远是 `status: 'unavailable'`，
+ * 细分是从「有没有图」「有没有真正能看的元数据」推出来的 —— 不往 JSON 里塞派生字段，
+ * 免得某天图片补下来了、状态却还停在「无图」。
+ */
+function deadLevelOf(record) {
+  if (record.status !== 'unavailable') return 'alive';
+  if (record.hasImage) return 'dead-image';
+  return hasUsableMeta(record) ? 'dead-meta' : 'dead-bare';
+}
+
+const DEAD_LABEL = {
+  'dead-image': '失效·有图',
+  'dead-meta': '失效·无图',
+  'dead-bare': '失效·仅记录',
+};
 
 function refreshCard(card, record) {
   card._record = record;
@@ -2363,19 +2423,48 @@ function stopPolling() {
   pollTimer = null;
 }
 
+/** 服务端刚标成失效的作品：就地改状态，卡片和信息面板跟着更新，不用整页重载。 */
+function applyUnavailable(pids) {
+  if (!Array.isArray(pids) || pids.length === 0) return;
+
+  for (const pid of pids) {
+    const record = state.records.find((item) => String(item.pid) === String(pid));
+    if (!record || record.status === 'unavailable') continue;
+
+    record.status = 'unavailable';
+    const card = state.cardMap.get(String(record.pid));
+    if (card) refreshCard(card, record);
+    if (lb.record === record) renderInfoPanel(record);
+  }
+}
+
 async function pollQueue() {
   try {
     const snapshot = await api('/api/stats');
     applyQueueState(snapshot.queue);
     renderDownloadPanel(snapshot);
+    renderSync(snapshot.sync);
+    applyUnavailable(snapshot.unavailable);
 
     // 休息中也要继续轮询，否则横幅上的倒计时会停在原地不动
     const paused = Boolean(snapshot.queue.pacer?.paused);
     // 批量转换在跑时同样不能停轮询，否则顶部进度条会僵住
     const converting = Boolean(snapshot.convert?.running);
-    if (converting) startPolling();
+    const syncing = Boolean(snapshot.sync?.running);
+    if (converting || syncing) startPolling();
 
-    if (!snapshot.queue.running && inFlightCount(snapshot.queue) === 0 && !paused && !converting) {
+    // 同步刚结束：服务端已经把记录重载过，前端跟着拉一遍，别让界面停在旧数据上
+    if (syncWasRunning && !syncing) {
+      if (!snapshot.sync?.error && !snapshot.sync?.dryRun) {
+        loadState().then(() => {
+          reloadAll();
+          loadSidePanel();
+        });
+      }
+    }
+    syncWasRunning = syncing;
+
+    if (!snapshot.queue.running && inFlightCount(snapshot.queue) === 0 && !paused && !converting && !syncing) {
       idleTicks += 1;
       if (idleTicks >= 3) stopPolling();
     } else {
@@ -2624,14 +2713,19 @@ async function openLightbox(record, card) {
   lb.index = 0;
 
   await ensureDownloaded(record, card);
-  if (!record.hasImage) return;
+
+  // 没图也照样打开：失效作品还留着标题、作者、简介、标签，
+  // 直接 return 会把「点一下看看是什么」这件事彻底堵死。
+  const hasImage = Boolean(record.hasImage);
 
   showLightboxPage();
   els.lightbox.hidden = false;
   document.body.style.overflow = 'hidden';
 
-  prefetchPages(record);
-  fetchDescription(record);
+  if (hasImage) {
+    prefetchPages(record);
+    fetchDescription(record);
+  }
 }
 
 /** 列表接口的简介大多是空的，打开时按需向详情接口要一次，抓到就缓存在服务端。 */
@@ -2735,7 +2829,16 @@ function renderInfoPanel(record) {
   if (record.type === 'manga') chips.push('<span class="chip-tag type">漫画</span>');
   if (record.type === 'ugoira') chips.push('<span class="chip-tag type">动图</span>');
   if (record.removed === 'yes') chips.push('<span class="chip-tag">已取消收藏</span>');
-  else if (record.status === 'unavailable') chips.push('<span class="chip-tag">作品已失效</span>');
+  else if (record.status === 'unavailable') {
+    const level = deadLevelOf(record);
+    const note =
+      level === 'dead-image'
+        ? '作品已失效，但图片还在本地，可以照常看'
+        : level === 'dead-meta'
+          ? '作品已失效，图片没下载过，只剩标题与简介'
+          : '作品已失效，本地只剩一条记录';
+    chips.push(`<span class="chip-tag" title="${note}">${DEAD_LABEL[level] ?? '作品已失效'}</span>`);
+  }
   // 公开 / 私密是收藏本身的属性，放在这里比藏在来源标签页里直观
   if (/Private$/.test(record.source ?? '')) chips.push('<span class="chip-tag private">私密收藏</span>');
 
@@ -2748,7 +2851,7 @@ function renderInfoPanel(record) {
   const tags = record.tags ?? [];
 
   let html = `<h3 data-open="${escapeHtml(record.url ?? '')}" title="在 pixiv 打开">${escapeHtml(
-    record.title || '(无题)',
+    displayTitle(record),
   )}</h3>`;
 
   if (record.author) {
@@ -2811,7 +2914,7 @@ function renderInfoPanel(record) {
   }
 
   // 简介放在最底部，跟着面板一起滚动，不单独做成小滚动框
-  if (record.description) {
+  if (!isPlaceholderText(record.description)) {
     html += `<div class="section">作品简介</div><div class="desc">${escapeHtml(record.description)}</div>`;
   }
 
@@ -2861,18 +2964,42 @@ function showLightboxPage() {
   const totalPages = Math.max(1, Number(record.pages) || 1);
   const page = lb.index;
 
-  els.lbImage.onload = () => {
-    // 解码后才有 naturalWidth/clientWidth，fit 的基准尺寸这时才有效
-    if (lb.fitted) resetTransform();
-    else applyTransform();
-  };
-  els.lbImage.onerror = () => {
-    // 这一页取不回来（作品失效/网络问题），保持画面不动，翻页仍然可用
-  };
+  // 没有图（多半是失效作品）时把舞台清空、留一句说明，右侧信息面板照常渲染。
+  // 这样标题、作者、简介、标签都还在，只是看不了图。
+  const hasImage = Boolean(record.hasImage);
+  els.lbStage.classList.toggle('lb-empty', !hasImage);
+  const level = deadLevelOf(record);
+  els.lbStage.dataset.note =
+    level === 'dead-image'
+      ? ''
+      : level === 'dead-meta'
+        ? '作品已失效，图片未下载'
+        : level === 'dead-bare'
+          ? '作品已失效，本地只剩一条记录'
+          : record.removed === 'yes'
+            ? '已取消收藏，图片未下载'
+            : '这张图还没下载';
 
-  els.lbImage.src = `/api/full/${record.pid}/${page}?t=${Date.now()}`;
+  if (hasImage) {
+    els.lbImage.style.visibility = '';
+    els.lbImage.onload = () => {
+      // 解码后才有 naturalWidth/clientWidth，fit 的基准尺寸这时才有效
+      if (lb.fitted) resetTransform();
+      else applyTransform();
+    };
+    els.lbImage.onerror = () => {
+      // 这一页取不回来（作品失效/网络问题），保持画面不动，翻页仍然可用
+    };
+    els.lbImage.src = `/api/full/${record.pid}/${page}?t=${Date.now()}`;
+    renderPageStrip(record, totalPages, page);
+  } else {
+    els.lbImage.onload = null;
+    els.lbImage.onerror = null;
+    els.lbImage.removeAttribute('src');
+    els.lbImage.style.visibility = 'hidden';
+    els.lbPages.innerHTML = '';
+  }
 
-  renderPageStrip(record, totalPages, page);
   renderInfoPanel(record);
 
   els.lbPrev.disabled = lb.index === 0 && !hasPrevRecord();
@@ -3092,8 +3219,8 @@ async function openReader(record, card) {
   els.reader.hidden = false;
   document.body.style.overflow = 'hidden';
 
-  els.rdTitle.textContent = record.title || '(无题)';
-  els.rdAuthor.textContent = record.author || '未知作者';
+  els.rdTitle.textContent = displayTitle(record);
+  els.rdAuthor.textContent = displayAuthor(record);
   renderReaderTags(record);
   els.rdLink.href = record.url || '#';
   els.rdCoverBox.innerHTML = '<span>加载中…</span>';
@@ -3356,7 +3483,7 @@ async function openBookmarkEditor(record) {
   bm.filter = '';
 
   els.bmSub.textContent = `pid ${record.pid}`;
-  els.bmWorkTitle.textContent = record.title || '(无题)';
+  els.bmWorkTitle.textContent = displayTitle(record);
   els.bmWorkAuthor.textContent = record.author ? `by ${record.author}` : '';
 
   const thumb = thumbForBm(record);
@@ -3615,6 +3742,8 @@ els.bmPick.addEventListener('keydown', (event) => {
 
 async function ensureDownloaded(record, card) {
   if (record.hasImage) return true;
+  // 已失效 / 已取消收藏的作品不要再发下载请求了：进去看元数据就行
+  if (record.status === 'unavailable' || record.removed === 'yes') return false;
   if (record.error) {
     return false;
   }
@@ -3851,7 +3980,10 @@ const FIELD_GROUPS = [
     items: [
       ['pages:>1', '多页'],
       ['pages:>10', '10 页以上'],
-      ['is:unavailable', '已失效'],
+      ['is:unavailable', '已失效（全部）'],
+      ['is:dead-image', '已失效·有图'],
+      ['is:dead-meta', '已失效·无图有数据'],
+      ['is:dead-bare', '已失效·只有记录'],
       ['NOT is:removed', '仍在收藏'],
     ],
   },
@@ -4182,6 +4314,334 @@ async function loadState() {
   }
   renderTabs();
 }
+
+// ---------- 收藏同步 ----------
+/**
+ * 同步跑在服务端（和命令行共用 src/channels.mjs），这里只管三件事：
+ * 选项、进度、结束后的刷新。进度来自 /api/stats 里的 sync 快照，不解析日志。
+ */
+let syncWasRunning = false;
+
+function renderSync(sync) {
+  if (!sync) return;
+
+  const running = Boolean(sync.running);
+  els.syncStart.disabled = running;
+  els.syncStop.disabled = !running;
+  els.syncMeta.hidden = !running && !sync.finishedAt;
+  els.syncBar.hidden = !running;
+
+  if (running) {
+    const percent =
+      sync.serverTotal > 0 ? Math.min(100, Math.round((sync.fetched / sync.serverTotal) * 100)) : 0;
+    els.syncFill.style.width = `${percent}%`;
+
+    const pages = sync.serverTotal > 0 ? `${sync.fetched}/${sync.serverTotal}` : `${sync.fetched}`;
+    els.syncMeta.textContent =
+      `${sync.dryRun ? '演练中' : '同步中'} · ${sync.current || '准备中'} · ` +
+      `第 ${sync.page} 页 · ${pages} · 新增 ${sync.added}`;
+    return;
+  }
+
+  if (sync.error) {
+    els.syncMeta.textContent = `同步失败：${sync.error}`;
+  } else if (sync.dryRun) {
+    els.syncMeta.textContent = `演练结束：将新增 ${sync.added}、移除 ${sync.removed}、变更 ${sync.changed}`;
+  } else {
+    els.syncMeta.textContent = `同步完成：新增 ${sync.added}、移除 ${sync.removed}、变更 ${sync.changed}`;
+  }
+}
+
+async function startSync() {
+  const mode = els.syncModal.querySelector('input[name="syncMode"]:checked')?.value ?? 'inc';
+  const dryRun = els.syncDryRun.checked;
+
+  els.syncGo.disabled = true;
+  try {
+    await api('/api/sync/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        full: mode === 'full',
+        dryRun,
+        illustOnly: !els.syncNovels.checked,
+        publicOnly: !els.syncPrivate.checked,
+      }),
+    });
+
+    els.syncModal.hidden = true;
+    toast(dryRun ? '开始演练：只统计变化，不写文件' : '开始同步');
+    startPolling();
+  } catch (err) {
+    toast(`同步没启动：${err.message}`, 'err');
+  } finally {
+    els.syncGo.disabled = false;
+  }
+}
+
+els.syncStart.addEventListener('click', () => {
+  els.syncModal.hidden = false;
+});
+
+els.syncClose.addEventListener('click', () => {
+  els.syncModal.hidden = true;
+});
+
+els.syncCancel.addEventListener('click', () => {
+  els.syncModal.hidden = true;
+});
+
+els.syncGo.addEventListener('click', () => {
+  startSync();
+});
+
+els.syncStop.addEventListener('click', async () => {
+  try {
+    await api('/api/sync/stop', { method: 'POST' });
+    toast('已请求停止，等这一页走完');
+  } catch {
+    /* 停止失败也不必打断界面 */
+  }
+});
+
+els.syncModal.addEventListener('click', (event) => {
+  if (event.target === els.syncModal) els.syncModal.hidden = true;
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !els.syncModal.hidden) els.syncModal.hidden = true;
+});
+
+// ---------- 后端配置（config.json） ----------
+/**
+ * 表单完全由服务端的字段表驱动：GET /api/config 返回 { config, fields }，
+ * 这里只按 group 分 tab、按 type 生成控件。以后接 AI 翻译，服务端字段表里加几行，
+ * 面板自动长出来，前端不用改。
+ *
+ * 编辑中的值放在 draft 里，切 tab 不丢；保存成功后清空 draft、用返回值重建。
+ */
+const configUi = {
+  fields: [],
+  config: {},
+  original: new Map(),
+  draft: new Map(),
+  group: '',
+};
+
+function configValueAt(dotted) {
+  return dotted
+    .split('.')
+    .reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), configUi.config);
+}
+
+/** 没有显式配置时，界面先显示默认值的样子（不写回文件，除非你改它）。 */
+function configBaseline(field) {
+  const value = configValueAt(field.path);
+  if (field.type === 'bool') return value === undefined ? Boolean(field.def) : Boolean(value);
+  return value === undefined ? '' : String(value);
+}
+
+function configControlHtml(field) {
+  const path = escapeHtml(field.path);
+  const current = configUi.draft.has(field.path)
+    ? configUi.draft.get(field.path)
+    : configBaseline(field);
+
+  if (field.type === 'bool') {
+    return `<label class="cfg-flag"><input type="checkbox" data-path="${path}"${current ? ' checked' : ''}> 启用</label>`;
+  }
+
+  if (field.type === 'select') {
+    const options = (field.options ?? [])
+      .map(
+        (option) =>
+          `<option value="${escapeHtml(option)}"${String(current) === option ? ' selected' : ''}>` +
+          `${escapeHtml(option)}</option>`,
+      )
+      .join('');
+    return `<select class="cfg-input" data-path="${path}">${options}</select>`;
+  }
+
+  if (field.type === 'text') {
+    return (
+      `<textarea class="cfg-input" data-path="${path}" spellcheck="false" autocomplete="off" ` +
+      `placeholder="${escapeHtml(String(field.def ?? ''))}">${escapeHtml(String(current))}</textarea>`
+    );
+  }
+
+  const numeric = field.type === 'int' || field.type === 'float';
+  const attrs = [
+    `type="${numeric ? 'number' : 'text'}"`,
+    'class="cfg-input"',
+    `data-path="${path}"`,
+    `value="${escapeHtml(String(current))}"`,
+    `placeholder="${escapeHtml(String(field.def ?? ''))}"`,
+    'autocomplete="off"',
+    'spellcheck="false"',
+  ];
+  if (field.min !== undefined) attrs.push(`min="${field.min}"`);
+  if (field.max !== undefined) attrs.push(`max="${field.max}"`);
+  if (field.step !== undefined) attrs.push(`step="${field.step}"`);
+  return `<input ${attrs.join(' ')}>`;
+}
+
+function renderConfig() {
+  const groups = [];
+  for (const field of configUi.fields) {
+    if (!groups.includes(field.group)) groups.push(field.group);
+  }
+  if (!configUi.group || !groups.includes(configUi.group)) configUi.group = groups[0] ?? '';
+
+  els.cfgTabs.innerHTML = groups
+    .map(
+      (group) =>
+        `<button type="button" role="tab" class="cfg-tab${group === configUi.group ? ' on' : ''}"` +
+        ` data-group="${escapeHtml(group)}">${escapeHtml(group)}</button>`,
+    )
+    .join('');
+
+  els.cfgBody.innerHTML = groups
+    .map((group) => {
+      const rows = configUi.fields
+        .filter((field) => field.group === group)
+        .map((field) => {
+          const hint = field.unavailable
+            ? '<span class="cfg-effect">功能未实现</span>'
+            : field.effect === 'restart'
+              ? '<span class="cfg-effect">需重启</span>'
+              : field.effect === 'cli'
+                ? '<span class="cfg-effect" title="查看器还没接管这部分，现在只有命令行读它；把同步搬进界面之后就会变成即时生效">暂未接入</span>'
+                : '';
+          const help = field.help ? `<div class="cfg-help">${escapeHtml(field.help)}</div>` : '';
+          return (
+            `<div class="cfg-row"><div class="cfg-label">${escapeHtml(field.label)}${hint}</div>` +
+            `<div>${configControlHtml(field)}</div>${help}</div>`
+          );
+        })
+        .join('');
+      return `<div class="cfg-group${group === configUi.group ? ' on' : ''}">${rows}</div>`;
+    })
+    .join('');
+
+  // 未实现的那几项（AI）留着占位但锁住，免得让人以为填了就会生效
+  for (const field of configUi.fields) {
+    if (!field.unavailable) continue;
+    const control = els.cfgBody.querySelector(`[data-path="${CSS.escape(field.path)}"]`);
+    if (control) control.disabled = true;
+  }
+}
+
+function setConfigStatus(text, tone = '') {
+  els.cfgStatus.textContent = text;
+  els.cfgStatus.className = `cfg-status${tone ? ` ${tone}` : ''}`;
+}
+
+async function openConfig() {
+  els.cfgModal.hidden = false;
+  els.cfgBody.innerHTML = '';
+  setConfigStatus('读取中…');
+
+  try {
+    const data = await api('/api/config');
+    configUi.fields = data.fields ?? [];
+    configUi.config = data.config ?? {};
+    configUi.draft.clear();
+    configUi.original = new Map(configUi.fields.map((field) => [field.path, configBaseline(field)]));
+    configUi.group = '';
+    renderConfig();
+    setConfigStatus('');
+  } catch (err) {
+    setConfigStatus(`读取失败：${err.message}`, 'err');
+  }
+}
+
+function collectConfigPatch() {
+  const patch = {};
+  for (const [path, raw] of configUi.draft) {
+    const field = configUi.fields.find((item) => item.path === path);
+    if (!field) continue;
+    if (raw === configUi.original.get(path)) continue;
+    // 数字输入框被清空时当作「没改」，不要拿空串去撞服务端校验
+    if ((field.type === 'int' || field.type === 'float') && String(raw).trim() === '') continue;
+    patch[path] = raw;
+  }
+  return patch;
+}
+
+async function saveConfig() {
+  const patch = collectConfigPatch();
+  if (Object.keys(patch).length === 0) {
+    setConfigStatus('没有改动');
+    return;
+  }
+
+  els.cfgSave.disabled = true;
+  setConfigStatus('保存中…');
+
+  try {
+    const data = await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patch }),
+    });
+
+    configUi.config = data.config ?? configUi.config;
+    configUi.draft.clear();
+    configUi.original = new Map(configUi.fields.map((field) => [field.path, configBaseline(field)]));
+    renderConfig();
+
+    const parts = [];
+    if (data.applied?.length) parts.push(`已生效：${data.applied.join('、')}`);
+    if (data.nextRun?.length) parts.push(`暂未接入界面（命令行在用）：${data.nextRun.join('、')}`);
+    if (data.needsRestart?.length) parts.push(`需重启查看器：${data.needsRestart.join('、')}`);
+    setConfigStatus(parts.join('；') || '已保存', data.needsRestart?.length ? 'warn' : 'ok');
+  } catch (err) {
+    setConfigStatus(`保存失败：${err.message}`, 'err');
+  } finally {
+    els.cfgSave.disabled = false;
+  }
+}
+
+els.btnConfig.addEventListener('click', () => {
+  openConfig();
+});
+
+els.cfgClose.addEventListener('click', () => {
+  els.cfgModal.hidden = true;
+});
+
+els.cfgReload.addEventListener('click', () => {
+  openConfig();
+});
+
+els.cfgSave.addEventListener('click', () => {
+  saveConfig();
+});
+
+els.cfgTabs.addEventListener('click', (event) => {
+  const tab = event.target.closest('.cfg-tab');
+  if (!tab) return;
+  configUi.group = tab.dataset.group ?? '';
+  renderConfig();
+});
+
+els.cfgBody.addEventListener('input', (event) => {
+  const control = event.target.closest('[data-path]');
+  if (!control) return;
+  const field = configUi.fields.find((item) => item.path === control.dataset.path);
+  if (!field) return;
+  configUi.draft.set(field.path, field.type === 'bool' ? control.checked : control.value);
+  control.classList.toggle('changed', true);
+});
+
+els.cfgModal.addEventListener('click', (event) => {
+  // 点遮罩关掉，点面板本身不关
+  if (event.target === els.cfgModal) els.cfgModal.hidden = true;
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !els.cfgModal.hidden) els.cfgModal.hidden = true;
+});
 
 (async function init() {
   applySettings();

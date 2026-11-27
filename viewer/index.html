@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>色廊 · Dollery</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=32">
+<link rel="stylesheet" href="style.css?v=36">
 </head>
 <body>
 
@@ -36,6 +36,7 @@
     </select>
     <button id="btnReshuffle" class="icon-btn" title="换一批（重新抽取随机种子）" hidden>⟳</button>
     <button id="btnView" class="icon-btn" title="视图设置">⚙</button>
+    <button id="btnConfig" class="icon-btn cfg-open" title="后端配置（config.json）">配置</button>
   </div>
 
   <div class="meta">
@@ -48,7 +49,7 @@
 
 <div class="filter-row" id="filterBox" hidden>
   <div class="filter-row-inner">
-    <input id="defaultFilter" type="search" placeholder="默认过滤…（与搜索 AND，留空即不过滤，例如 -is:unavailable）" autocomplete="off" spellcheck="false">
+    <input id="defaultFilter" type="search" placeholder="默认过滤…（与搜索 AND，留空即不过滤，例如 -is:lost）" autocomplete="off" spellcheck="false">
     <div class="search-suggest" id="filterSuggest" hidden></div>
   </div>
 </div>
@@ -112,6 +113,12 @@
     <div class="dl-summary" id="dlSummary"></div>
     <div class="dl-bar"><div class="dl-bar-fill" id="dlBar"></div></div>
     <div class="dl-meta" id="dlMeta">—</div>
+    <div class="dl-actions">
+      <button id="syncStart" class="primary" title="从 pixiv 同步收藏（增量或全量）">同步收藏</button>
+      <button id="syncStop" type="button" disabled>停止</button>
+    </div>
+    <div class="sync-meta" id="syncMeta" hidden></div>
+    <div class="sync-bar" id="syncBar" hidden><div class="sync-bar-fill" id="syncFill"></div></div>
     <div class="dl-actions">
       <button id="dlAll" class="primary">全部下载</button>
       <button id="dlFirst" title="每个作品只下载第一页，已有任意一页的作品跳过">只下首页</button>
@@ -349,9 +356,62 @@
   </div>
 </div>
 
+<div id="syncModal" class="bm-modal" hidden>
+  <div class="bm-dialog" role="dialog" aria-modal="true" aria-labelledby="syncTitle">
+    <header class="bm-head">
+      <h2 id="syncTitle">同步收藏</h2>
+      <span class="bm-sub" id="syncSub">从 pixiv 拉取最新的收藏列表</span>
+      <button id="syncClose" class="bm-x" type="button" title="关闭 (Esc)">✕</button>
+    </header>
+    <div class="bm-body">
+      <section class="bm-field">
+        <div class="bm-label"><span>模式</span></div>
+        <label class="cfg-flag"><input type="radio" name="syncMode" value="inc" checked> 增量（只翻到上次同步的位置）</label>
+        <label class="cfg-flag"><input type="radio" name="syncMode" value="full"> 全量（重扫所有页，会慢很多）</label>
+        <p class="bm-note">增量每页约 2 秒；全量四条通道加起来可能十几分钟。</p>
+      </section>
+      <section class="bm-field">
+        <div class="bm-label"><span>范围</span></div>
+        <label class="cfg-flag"><input type="checkbox" id="syncNovels" checked> 包含小说</label>
+        <label class="cfg-flag"><input type="checkbox" id="syncPrivate" checked> 包含私密收藏</label>
+      </section>
+      <section class="bm-field">
+        <div class="bm-label"><span>先演练</span></div>
+        <label class="cfg-flag"><input type="checkbox" id="syncDryRun" checked> 只算「会新增 / 移除 / 变更多少」，不写文件</label>
+        <p class="bm-note">第一次建议先演练一遍，看清楚变化量再真正写入。</p>
+      </section>
+    </div>
+    <footer class="bm-foot">
+      <div class="bm-actions">
+        <button id="syncCancel" class="bm-btn" type="button">取消</button>
+        <button id="syncGo" class="bm-btn bm-primary" type="button">开始同步</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<div id="cfgModal" class="bm-modal" hidden>
+  <div class="bm-dialog cfg-dialog" role="dialog" aria-modal="true" aria-labelledby="cfgTitle">
+    <header class="bm-head">
+      <h2 id="cfgTitle">后端配置</h2>
+      <span class="bm-sub" id="cfgSub">保存到 config.json</span>
+      <button id="cfgClose" class="bm-x" type="button" title="关闭 (Esc)">✕</button>
+    </header>
+    <div class="cfg-tabs" id="cfgTabs" role="tablist"></div>
+    <div class="bm-body cfg-body" id="cfgBody"></div>
+    <footer class="bm-foot">
+      <div class="cfg-actions">
+        <span id="cfgStatus" class="cfg-status"></span>
+        <button id="cfgReload" class="bm-btn" type="button">重新读取</button>
+        <button id="cfgSave" class="bm-btn bm-primary" type="button">保存</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
 <div id="toast" class="toast" hidden></div>
 
-<script src="app.js?v=47"></script>
+<script src="app.js?v=53"></script>
 <script src="edge-scroll.js?v=3"></script>
 </body>
 </html>
