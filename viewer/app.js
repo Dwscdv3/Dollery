@@ -20,6 +20,9 @@ const DEFAULT_SETTINGS = {
   overlayInfo: false, // 标题 / 作者 / 标签叠在图片上，而不是图片外
   tagIncludeWork: false, // 标签面板是否把作品本身的标签也算进来
   onlyGroups: false, // 标签面板是否只列标签组
+  tagSettingsOpen: false, // 标签面板的设置项（含作品标签 / 只看标签组 / 隐藏流行度）是否展开
+  hidePopularTags: false, // 隐藏 100users入り、1000users入り 这类流行度标签
+  ratingFilter: [], // 评分筛选：选中的分值（1~10），多选按 OR 处理
   defaultFilter: '-is:unavailable', // 默认过滤器：与搜索 AND 连接，默认藏掉已失效的作品
   filterEnabled: true, // 默认过滤器的总开关：关掉后条件保留但不参与查询
   filterOpen: false, // 默认过滤器输入框是否展开（纯 UI 状态，不影响过滤是否生效）
@@ -48,6 +51,11 @@ let settings = loadSettings();
 
 // ---------- 状态 ----------
 
+/** 随机种子：0 会被服务端当成「没传」，所以从 1 起步。 */
+function freshSeed() {
+  return Math.floor(Math.random() * 1e9) + 1;
+}
+
 const state = {
   sources: [],
   current: null,
@@ -58,7 +66,7 @@ const state = {
   query: '',
   tag: '',
   authorId: '',
-  seed: Math.floor(Math.random() * 1e9),
+  seed: freshSeed(),
   submitted: new Set(),
   cardMap: new Map(),
   observer: null,
@@ -78,10 +86,11 @@ const PAGE_SIZE = 120;
 
 const els = {};
 for (const id of [
-  'tabs', 'search', 'sortMode', 'btnView', 'queueState', 'counter',
+  'tabs', 'search', 'sortMode', 'btnReshuffle', 'btnView', 'queueState', 'counter',
   'reload', 'sideLeft', 'sideTabs', 'sideQuery', 'sideList', 'btnLeft', 'btnRight',
   'searchSuggest', 'tagIncludeWrap', 'tagIncludeWork',
   'onlyGroupsWrap', 'onlyGroups', 'sideMenu',
+  'tagSettingsToggle', 'tagSettings', 'ratingFilter', 'hidePopularWrap', 'hidePopularTags',
   'convertBanner', 'convertText', 'convertFill', 'convertStop', 'pacerFill',
   'tgModal', 'tgTitle', 'tgSub', 'tgClose', 'tgCount', 'tgMembers', 'tgHint',
   'tgSearch', 'tgCandidates', 'tgDissolve', 'tgCancel', 'tgSave',
@@ -287,6 +296,8 @@ function applySettings({ rerender = true } = {}) {
   document.documentElement.style.setProperty('--card-w', `${settings.cardWidth}px`);
 
   els.sortMode.value = settings.sort;
+  // 「换一批」只在随机排序下有意义
+  els.btnReshuffle.hidden = settings.sort !== 'random';
   for (const btn of els.optRatio.querySelectorAll('button')) {
     btn.classList.toggle('on', btn.dataset.v === settings.ratio);
   }
@@ -355,11 +366,11 @@ async function loadSidePanel() {
   const source = state.current;
 
   renderSideTabs();
-  const isTags = panel === 'tags';
-  els.tagIncludeWrap.hidden = !isTags;
-  els.onlyGroupsWrap.hidden = !isTags;
   els.tagIncludeWork.checked = settings.tagIncludeWork;
   els.onlyGroups.checked = settings.onlyGroups;
+  els.hidePopularTags.checked = settings.hidePopularTags;
+  renderRatingFilter();
+  applyTagPanelVisibility();
 
   // 换面板 / 换来源时回到顶部，旧的高度缓存保留（按 key 命中，不会串行）
   sidebarView.items = [];
@@ -536,13 +547,72 @@ function renderAuthors() {
   );
 }
 
+/* ── 标签面板的显示过滤 ──────────────────────────────────
+ * 两类标签不再出现在列表里：
+ *   · 评分标签（n/10）—— 改由筛选框下方那排数字按钮承担，列表里再列一遍只是占地方；
+ *   · 流行度标签（100users入り 之类）—— 可选隐藏。它们记录的是「这张图在站上有多火」，
+ *     不是作品内容，翻标签找人时基本没用。
+ *
+ * 组的去重计数（union）不跟着扣：它统计的是「组内所有成员的作品合集」，
+ * 隐藏某个成员只影响列表行，不改组本身的数目。
+ *
+ * 流行度标签的实际写法是「<标签名><数量>users入り」，前面经常还挂着作品标签：
+ *   500users入り / 1000users入り / 10000users入り / 原神5000users入り
+ * 所以只锚尾，不锚头 —— 早先写成 `^\d+users入り$` 时一个都匹配不上。
+ */
+const POPULAR_TAG_RE = /\d+\s*users入り$/i;
+
+function isPopularTag(tag) {
+  return POPULAR_TAG_RE.test(String(tag ?? '').trim());
+}
+
+function isTagHidden(tag) {
+  if (ratingValueOfTag(tag)) return true;
+  return Boolean(settings.hidePopularTags) && isPopularTag(tag);
+}
+
+/** 评分按钮行：1~10 十个按钮，点一下切换选中，多选按 OR 处理。 */
+function renderRatingFilter() {
+  const chosen = new Set(
+    (Array.isArray(settings.ratingFilter) ? settings.ratingFilter : []).map(Number),
+  );
+
+  let html = '';
+  for (let value = 1; value <= 10; value += 1) {
+    const on = chosen.has(value);
+    html +=
+      `<button type="button" class="rating-chip${on ? ' on' : ''}" data-rating="${value}"` +
+      ` aria-pressed="${on ? 'true' : 'false'}" style="--rc:${ratingColor(value)}"` +
+      ` title="${value}/10${on ? '（再点取消）' : ''}">${value}</button>`;
+  }
+
+  els.ratingFilter.innerHTML = html;
+}
+
+/** 随面板切换 / 设置项开关显隐的那几个控件，统一在这里算一遍，免得散落各处。 */
+function applyTagPanelVisibility() {
+  const isTags = state.sidePanel === 'tags';
+  const open = Boolean(settings.tagSettingsOpen);
+
+  els.tagSettingsToggle.hidden = !isTags;
+  els.tagSettingsToggle.classList.toggle('on', open);
+  els.tagSettingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+
+  els.ratingFilter.hidden = !isTags;
+  els.tagSettings.hidden = !isTags || !open;
+
+  els.tagIncludeWrap.hidden = !isTags || !open;
+  els.onlyGroupsWrap.hidden = !isTags || !open;
+  els.hidePopularWrap.hidden = !isTags || !open;
+}
+
 function renderTags() {
   const filter = state.sideQuery.trim().toLowerCase();
   const filtering = filter.length > 0;
 
   // 筛选时退回扁平列表：点到哪个标签一目了然，也免得卡片在搜索过程中忽开忽合
   if (filtering && !settings.onlyGroups) {
-    const list = state.tags.filter((t) => t.tag.toLowerCase().includes(filter));
+    const list = state.tags.filter((t) => !isTagHidden(t.tag) && t.tag.toLowerCase().includes(filter));
     setSidebarItems(
       list.map((t) => ({
         kind: 'tag',
@@ -563,7 +633,7 @@ function renderTags() {
       (group) =>
         !filtering ||
         group.representative.toLowerCase().includes(filter) ||
-        group.tags.some((tag) => tag.toLowerCase().includes(filter)),
+        group.tags.some((tag) => !isTagHidden(tag) && tag.toLowerCase().includes(filter)),
     )
     .sort(
       (a, b) =>
@@ -571,17 +641,22 @@ function renderTags() {
     );
 
   // 组里的标签不再单独出现在扁平列表里，全部收进组卡片
-  const tags = settings.onlyGroups ? [] : state.tags.filter((tag) => !tag.groupId);
+  const tags = settings.onlyGroups ? [] : state.tags.filter((tag) => !tag.groupId && !isTagHidden(tag.tag));
 
   const entries = [];
 
   for (const group of groups) {
+    // 成员全被隐藏的组不入列表：虚拟列表按 estimate 估算高度，
+    // 留一个渲染为空串的项会让滚动位置算错
+    const visibleMembers = group.members.filter((member) => !isTagHidden(member.tag));
+    if (visibleMembers.length === 0) continue;
+
     const expanded = filtering || state.expandedGroups.has(group.id);
     entries.push({
       kind: 'group',
       sort: group.union,
       key: `g:${group.id}:${expanded ? 1 : 0}`,
-      estimate: expanded ? 46 + group.tags.length * 28 : 40,
+      estimate: expanded ? 46 + visibleMembers.length * 28 : 40,
       data: { group, expanded, filtering },
     });
   }
@@ -628,9 +703,14 @@ function tagRowHtml(t, showGroupBadge) {
  * 标题和折叠按钮是两个独立控件：点标题 = 按整组筛选，点左侧三角 = 展开/折叠。
  */
 function groupCardHtml(group, expanded, filtering) {
+  // 被隐藏的成员（评分 / 流行度）不列出来；整组都藏光了就连卡片一起不显示，
+  // 否则会留下一个展开后空空的壳
   const members = group.members
+    .filter((member) => !isTagHidden(member.tag))
     .slice()
     .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag, 'zh'));
+
+  if (members.length === 0) return '';
 
   const body = expanded
     ? `<div class="tag-group-members">${members
@@ -685,6 +765,35 @@ els.onlyGroups.addEventListener('change', () => {
   settings.onlyGroups = els.onlyGroups.checked;
   saveSettings();
   renderTags();
+});
+
+els.hidePopularTags.addEventListener('change', () => {
+  settings.hidePopularTags = els.hidePopularTags.checked;
+  saveSettings();
+  renderTags();
+});
+
+els.tagSettingsToggle.addEventListener('click', () => {
+  settings.tagSettingsOpen = !settings.tagSettingsOpen;
+  saveSettings();
+  applyTagPanelVisibility();
+});
+
+els.ratingFilter.addEventListener('click', (event) => {
+  const chip = event.target.closest('.rating-chip');
+  if (!chip) return;
+
+  const value = Number(chip.dataset.rating);
+  const chosen = new Set(
+    (Array.isArray(settings.ratingFilter) ? settings.ratingFilter : []).map(Number),
+  );
+  if (chosen.has(value)) chosen.delete(value);
+  else chosen.add(value);
+
+  settings.ratingFilter = [...chosen].sort((a, b) => a - b);
+  saveSettings();
+  renderRatingFilter();
+  reloadAll();
 });
 
 els.sideTabs.addEventListener('click', (event) => {
@@ -1231,6 +1340,26 @@ els.sideQuery.addEventListener('input', () => {
 
 // ---------- 列表 ----------
 
+/** 搜索框里以评分词结尾/开头的条件：数字按钮启用时，这些词要被忽略（按钮优先）。 */
+function stripRatingTerms(text) {
+  const parts = String(text ?? '')
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) return '';
+  return parts.filter((part) => ratingValueOfTag(part.replace(/^-/, '')) === 0).join(' ');
+}
+
+/** 数字按钮拼出来的评分条件；没选中就是空串。 */
+function ratingQueryText() {
+  const values = (Array.isArray(settings.ratingFilter) ? settings.ratingFilter : [])
+    .map(Number)
+    .filter((value) => Number.isInteger(value) && value >= 1 && value <= 10)
+    .sort((a, b) => a - b);
+
+  if (values.length === 0) return '';
+  return values.length === 1 ? `${values[0]}/10` : `(${values.map((value) => `${value}/10`).join(' OR ')})`;
+}
+
 function buildQuery(offset) {
   const params = new URLSearchParams({
     source: state.current,
@@ -1238,11 +1367,16 @@ function buildQuery(offset) {
     limit: String(PAGE_SIZE),
     sort: settings.sort,
   });
-  if (state.query) params.set('q', state.query);
+  // 评分按钮和搜索框里的评分词是同一个筛选维度：按钮有选中时以按钮为准，
+  // 否则「7 + 搜索框里写着 9/10」会直接筛成空集。
+  const rating = ratingQueryText();
+  const queryText = rating ? stripRatingTerms(state.query) : state.query;
+  if (queryText) params.set('q', queryText);
   // 默认过滤器和搜索分开传，服务端用 AND 组合 —— 拼成一个字符串的话
-  // 用户写的 `a OR b` 会被外层 AND 抢走优先级。
+  // 用户写的 `a OR b` 会被外层 AND 抢走优先级。评分条件同理，单独走 r。
   const defaultFilter = settings.filterEnabled ? String(settings.defaultFilter ?? '').trim() : '';
   if (defaultFilter) params.set('f', defaultFilter);
+  if (rating) params.set('r', rating);
   if (state.tag) params.set('tag', state.tag);
   if (state.authorId) params.set('author_id', state.authorId);
   if (settings.sort === 'random') params.set('seed', String(state.seed));
@@ -3814,9 +3948,16 @@ document.addEventListener('click', (event) => {
 
 els.sortMode.addEventListener('change', () => {
   settings.sort = els.sortMode.value;
-  if (settings.sort === 'random') state.seed = Math.floor(Math.random() * 1e9);
+  if (settings.sort === 'random') state.seed = freshSeed();
+  els.btnReshuffle.hidden = settings.sort !== 'random';
   saveSettings();
   reloadAll();
+});
+
+els.btnReshuffle.addEventListener('click', () => {
+  state.seed = freshSeed();
+  reloadAll();
+  toast('已换一批');
 });
 
 els.btnView.addEventListener('click', (event) => {

@@ -796,6 +796,22 @@ await test('搜索：不完全相等不展开，字段词不受组影响', () =>
   assert.equal(matchQuery(compileQuery('type:illust', { groups }), { type: 'illust' }), true);
 });
 
+await test('评分筛选：前端拼出来的 (7/10 OR 9/10) 能编译并命中', () => {
+  const seven = { title: '', author: '', pid: '1', tags: [], bookmark_tags: ['7/10', 'x'] };
+  const nine = { title: '', author: '', pid: '2', tags: [], bookmark_tags: ['9/10'] };
+  const eight = { title: '', author: '', pid: '3', tags: [], bookmark_tags: ['8/10'] };
+
+  const multi = compileQuery('(7/10 OR 9/10)');
+  assert.equal(matchQuery(multi, seven), true);
+  assert.equal(matchQuery(multi, nine), true);
+  assert.equal(matchQuery(multi, eight), false, '没选的分不该命中');
+
+  // 单选时前端只发 `7/10`，不带括号
+  const single = compileQuery('7/10');
+  assert.equal(matchQuery(single, seven), true);
+  assert.equal(matchQuery(single, nine), false);
+});
+
 await test('迁移计划：只换组内成员，保留其它标签', () => {
   const items = planTagConversion({
     records: [

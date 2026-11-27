@@ -486,6 +486,78 @@ body {
 
 .side-query:focus { border-color: var(--accent); }
 
+/* 筛选框 + 设置按钮同一行：输入框吃掉剩余宽度，按钮固定 26px */
+.side-query-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px;
+}
+
+.side-query-row .side-query {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+.side-query-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.side-query-btn:hover { color: var(--text); }
+.side-query-btn.on { color: var(--accent); border-color: var(--accent); }
+.side-query-btn[hidden] { display: none; }
+
+/* 评分按钮行：固定在筛选框下方，不随标签列表滚动。
+ * 10 个按钮平分一行（侧栏 250px，固定宽度会挤到换行），窄屏下压缩但不断行 */
+.rating-filter {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 3px;
+  margin: 0 8px 8px;
+}
+
+.rating-filter[hidden] { display: none; }
+
+.rating-chip {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 22px;
+  padding: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.rating-chip:hover { color: var(--text); border-color: var(--muted); }
+
+/* 选中态用评分本身的颜色，和卡片上的星星、标签是同一套色 */
+.rating-chip.on {
+  color: #12151a;
+  background: var(--rc, var(--accent));
+  border-color: var(--rc, var(--accent));
+  font-weight: 600;
+}
+
+.tag-settings[hidden] { display: none; }
+
 .side-list {
   flex: 1 1 auto;
   overflow-y: auto;

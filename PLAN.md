@@ -3,6 +3,18 @@
 记录于 2026-11-27。这是 backlog，不是承诺；开工前先核对代码现状
 （下面提到的行号会随改动漂移，按函数名/选择器找更靠谱）。
 
+## 进度
+
+- ✅ **第 1 / 3 / 4 / 5 条已实现**（2026-11-27，待视觉与交互验收，未提交）
+  - `viewer/index.html`：筛选框改成「输入框 + 设置按钮」一行；新增评分按钮行（容器由 JS 生成）、
+    设置项容器（含作品标签 / 只看标签组 / 隐藏流行度）、顶栏「换一批」按钮；版本号 `app.js?v=45`、`style.css?v=31`。
+  - `viewer/app.js`：`isTagHidden()` 统一挡掉评分标签与（可选）流行度标签；`renderRatingFilter()`；
+    `applyTagPanelVisibility()`；`buildQuery()` 新增评分条件走 `r` 参数，并实现了「按钮优先」——
+    按钮有选中时把搜索框里的评分词剔除；`freshSeed()`；三个新设置项（`tagSettingsOpen` / `hidePopularTags` / `ratingFilter`）。
+  - `viewer/style.css`：`.side-query-row` / `.side-query-btn` / `.rating-filter` / `.rating-chip`。
+  - `viewer/server.mjs`：`/api/records` 支持 `r`（评分条件独立编译后 AND，和 `q` / `f` 同等待遇）。
+- ⏳ 未做：第 2、6、7、8、9、10、11 条。
+
 ---
 
 ## 1. 随机顺序可以重新摇一次

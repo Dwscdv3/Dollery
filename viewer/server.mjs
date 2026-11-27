@@ -1350,6 +1350,9 @@ async function handleApi(req, res, url) {
     const queryText = (params.get('q') ?? '').trim();
     // 默认过滤器（f）：与 q 各自编译后 AND，避免 `a OR b` 被外层 AND 改掉优先级
     const filterText = (params.get('f') ?? '').trim();
+    // 评分筛选（r）：前端数字按钮拼出来的 `7/10` 或 `(7/10 OR 9/10)`。
+    // 同样独立编译再 AND —— 塞进 q 的话，用户写的 `a OR b` 会把它的优先级吃掉
+    const ratingText = (params.get('r') ?? '').trim();
     const tag = (params.get('tag') ?? '').trim();
     const authorId = (params.get('author_id') ?? '').trim();
     const missingOnly = params.get('missing') === '1';
@@ -1373,6 +1376,11 @@ async function handleApi(req, res, url) {
     if (filterText) {
       const filterAst = compileQuery(filterText, { groups });
       if (filterAst) list = list.filter((r) => matchQuery(filterAst, r));
+    }
+
+    if (ratingText) {
+      const ratingAst = compileQuery(ratingText, { groups });
+      if (ratingAst) list = list.filter((r) => matchQuery(ratingAst, r));
     }
 
     if (tag) list = list.filter((r) => (r.bookmark_tags ?? []).includes(tag));

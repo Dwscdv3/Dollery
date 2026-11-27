@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>色廊 · Dollery</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=30">
+<link rel="stylesheet" href="style.css?v=32">
 </head>
 <body>
 
@@ -34,6 +34,7 @@
       <option value="desc">最新收藏在前</option>
       <option value="random">随机顺序</option>
     </select>
+    <button id="btnReshuffle" class="icon-btn" title="换一批（重新抽取随机种子）" hidden>⟳</button>
     <button id="btnView" class="icon-btn" title="视图设置">⚙</button>
   </div>
 
@@ -78,15 +79,26 @@
       <button data-panel="authors" class="active">作者</button>
       <button data-panel="tags">标签</button>
     </div>
-    <input id="sideQuery" class="side-query" placeholder="筛选…" autocomplete="off" spellcheck="false">
-    <label class="side-toggle" id="tagIncludeWrap" hidden title="把作者给作品打的标签也算进来（同一作品上的同名标签只算一次）">
-      <span class="switch"><input type="checkbox" id="tagIncludeWork"><span class="track"></span></span>
-      <span class="switch-text">含作品标签</span>
-    </label>
-    <label class="side-toggle" id="onlyGroupsWrap" hidden title="只列出已建立的标签组，方便集中管理">
-      <span class="switch"><input type="checkbox" id="onlyGroups"><span class="track"></span></span>
-      <span class="switch-text">只看标签组</span>
-    </label>
+    <div class="side-query-row">
+      <input id="sideQuery" class="side-query" placeholder="筛选…" autocomplete="off" spellcheck="false">
+      <button id="tagSettingsToggle" class="side-query-btn" type="button" hidden
+              title="显示 / 隐藏设置项" aria-expanded="false" aria-label="标签面板设置项">⚙</button>
+    </div>
+    <div class="rating-filter" id="ratingFilter" hidden role="group" aria-label="按评分筛选（可多选）"></div>
+    <div class="tag-settings" id="tagSettings">
+      <label class="side-toggle" id="tagIncludeWrap" hidden title="把作者给作品打的标签也算进来（同一作品上的同名标签只算一次）">
+        <span class="switch"><input type="checkbox" id="tagIncludeWork"><span class="track"></span></span>
+        <span class="switch-text">含作品标签</span>
+      </label>
+      <label class="side-toggle" id="onlyGroupsWrap" hidden title="只列出已建立的标签组，方便集中管理">
+        <span class="switch"><input type="checkbox" id="onlyGroups"><span class="track"></span></span>
+        <span class="switch-text">只看标签组</span>
+      </label>
+      <label class="side-toggle" id="hidePopularWrap" hidden title="隐藏 100users入り、原神5000users入り 这类记录流行度的标签。它们多数是作品标签，要同时打开「含作品标签」才看得到效果">
+        <span class="switch"><input type="checkbox" id="hidePopularTags"><span class="track"></span></span>
+        <span class="switch-text">隐藏流行度标签</span>
+      </label>
+    </div>
     <div class="side-list" id="sideList"></div>
   </aside>
 
@@ -339,7 +351,7 @@
 
 <div id="toast" class="toast" hidden></div>
 
-<script src="app.js?v=44"></script>
+<script src="app.js?v=46"></script>
 <script src="edge-scroll.js?v=3"></script>
 </body>
 </html>
